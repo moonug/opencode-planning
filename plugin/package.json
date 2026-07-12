@@ -1,0 +1,17 @@
+{
+  "name": "opencode-plan-review",
+  "version": "0.1.0",
+  "description": "opencode plugin: review plans in $EDITOR, return diff to the model",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "typescript": "*"
+  }
+}

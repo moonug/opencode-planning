@@ -1,6 +1,23 @@
 # opencode-plan-review
 
-Mirror of the [Claude Code `planning` plugin](../../.claude/plugins/marketplaces/umputun-cc-thingz/plugins/planning/) for [opencode](https://opencode.ai): after the model produces a structured plan, open it in `$EDITOR` via a terminal overlay (tmux / kitty / wezterm), compute a unified diff of the user's edits, and return the diff as feedback for the model to revise the plan.
+## Origin
+
+Adapted from the Claude Code `planning` plugin in [`umputun/cc-thingz`](https://github.com/umputun/cc-thingz) (MIT, by [Umputun](https://github.com/umputun)). The original plugin targets Claude Code via a `PreToolUse` hook on `ExitPlanMode`; this project targets [opencode](https://opencode.ai) via a custom tool + slash command, since opencode has no equivalent "exit plan mode" hook.
+
+Heavy reuse from the original:
+- `editor-overlay cascade` (tmux → kitty → wezterm) and `sentinel-file pattern` ported to `bin/plan-review.py` with minor adjustments for ssh/vim fallback and code/cursor `-w` auto-append.
+- `unified-diff-via-difflib` and the `tempfile.NamedTemporaryFile(delete=False) + finally unlink` lifecycle ported verbatim.
+- `--test` self-check inline unit-test runner.
+
+Differences from the original:
+- No `PreToolUse` / `permissionDecision: "deny"` output. Opencode uses tool-result strings for feedback, not hook-protocol JSON.
+- Adds self-install of `commands/plan-review.md` (opencode requires markdown files in its commands dir).
+- Adds `session.prompt({ agent: "build" })` auto-exit on empty diff (plannotator trick), since opencode has no UI "approve plan" button for custom tools.
+- Adds ANSI color (with `NO_COLOR` respect) and `--no-color` flag.
+
+## What it does
+
+After the model produces a structured plan, open it in `$EDITOR` via a terminal overlay (tmux / kitty / wezterm), compute a unified diff of the user's edits, and return the diff as feedback for the model to revise the plan.
 
 Works on plain ssh / vim too — no overlay terminal required.
 

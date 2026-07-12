@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """plan-review.py - opencode plan annotation helper.
 
+adapted from the planning plugin in https://github.com/umputun/cc-thingz (MIT).
+the editor-overlay cascade, sentinel-file pattern, difflib-based diff, and
+temp-file lifecycle ported verbatim; the PreToolUse JSON protocol was removed
+because opencode has no equivalent hook.
+
 opens plan markdown in $EDITOR via terminal overlay (tmux / kitty / wezterm)
 or blocking spawn (plain ssh terminal), waits for the user to edit, computes
 a unified diff, prints it to stdout. opencode plugin reads stdout as the

@@ -1,5 +1,11 @@
 # Architecture
 
+## Origin
+
+Direct adaptation of the Claude Code `planning` plugin in [`umputun/cc-thingz`](https://github.com/umputun/cc-thingz) (MIT). Original targets Claude Code via a `PreToolUse` hook on `ExitPlanMode`; this targets opencode via a custom tool because opencode has no such hook.
+
+See README "Origin" section for the full credit + delta list.
+
 ## Why two layers (TS plugin + Python helper)?
 
 The Claude Code `planning` plugin is a 370-line Python script that owns the editor-overlay logic. That logic — tmux popup command, sentinel-file pattern for kitty/wezterm, unified diff via `difflib`, temp-file lifecycle — is non-trivial and has nothing to do with opencode's plugin API.

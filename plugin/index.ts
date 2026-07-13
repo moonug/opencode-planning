@@ -304,7 +304,14 @@ Do NOT:
 - Skip this step even if you think the plan is final.
 
 Do NOT proceed to implementation, do not write code, do not run commands, do not call other tools, until plan_review returns "no changes" (empty diff = user approved). If it returns a unified diff, revise the plan and call plan_review again.
+
+ENFORCEMENT (added by plan-review plugin):
+- \`plan_review\` IS in your available tools right now. Call it directly — do not narrate that you "would call" it.
+- Your reply after drafting the plan must be EXACTLY ONE tool call to plan_review. No prose, no markdown summary outside the tool args, no questions.
+- If you write the plan as a plain text response instead, the user will see no plan-review prompt, the editor will not open, and you have failed this contract. The user has to nudge you manually and that wastes a turn.
+- If plan_review is not in your toolset for any reason, fall back to running \`bin/plan-review.py --plan-text "<markdown>"\` via the bash tool and treat its stdout as feedback.
 `)
+      await log(client, "debug", `plan-review: system prompt injected (${output.system.length} blocks total, ${output.system[output.system.length - 1]!.length} chars appended)`).catch(() => {})
     },
 
     event: async ({ event }) => {

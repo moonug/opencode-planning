@@ -193,4 +193,31 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[7] exitPlanMode refuses when target undefined: ok")
 }
 
+// 8. experimental.chat.system.transform appends ENFORCEMENT block
+{
+  const logs: any[] = []
+  const testHooks = await mod.default({
+    client: { app: { log: async (opts: any) => { logs.push(opts) } }, session: { prompt: async () => {} } } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const out: any = { system: ["base prompt about file editing"] }
+  await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" } }, out)
+  const joined = out.system.join("\n")
+  if (!joined.includes("ENFORCEMENT")) throw new Error("ENFORCEMENT block missing")
+  if (!joined.includes("plan_review")) throw new Error("plan_review mention missing")
+  if (!joined.includes("bash tool")) throw new Error("bash fallback hint missing")
+  if (!logs.some((l: any) => l.body?.level === "debug" && l.body?.message?.includes("system prompt injected"))) {
+    throw new Error("diagnostic log missing")
+  }
+  // must skip subagent agents
+  const subOut: any = { system: ["subagent system prompt"] }
+  await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" } }, subOut)
+  if (subOut.system.join("\n").includes("ENFORCEMENT")) throw new Error("ENFORCEMENT should not be added for subagent")
+  console.log("[8] system prompt transform with ENFORCEMENT: ok")
+}
+
 console.log("[OK] all smoke checks passed")

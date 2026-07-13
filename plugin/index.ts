@@ -123,13 +123,6 @@ async function getSessionRuntimeModel(v2: any, sessionID: string): Promise<Model
   return undefined
 }
 
-async function applyBuildModel(v2: any, sessionID: string, target: ModelRef): Promise<void> {
-  await v2.session.switchModel({
-    sessionID,
-    model: { id: target.modelID, providerID: target.providerID },
-  })
-}
-
 async function setBuildOverride(v2: any, sessionID: string, modelStr: string): Promise<void> {
   let existing: Record<string, unknown> = {}
   try {
@@ -152,8 +145,12 @@ async function exitPlanMode(
 ): Promise<void> {
   if (!sessionID) return
 
-  const [metadata, agentCfg, globalCfg] = await Promise.all([
-    withTimeout(getOverrideFromMetadata(v2 ?? noV2(), sessionID), 2000, undefined),
+  // read /set-build-model override from session metadata (only source that
+  // needs v2 SDK). Everything else works without v2.
+  const metadata = v2
+    ? await withTimeout(getOverrideFromMetadata(v2, sessionID), 2000, undefined)
+    : undefined
+  const [agentCfg, globalCfg] = await Promise.all([
     withTimeout(getBuildAgentModel(client), 2000, undefined),
     withTimeout(getGlobalModel(client), 2000, undefined),
   ])
@@ -187,53 +184,32 @@ async function exitPlanMode(
     return
   }
 
-  const errors: string[] = []
-
-  if (v2) {
-    try {
-      await withTimeout(v2.session.switchAgent({ sessionID, agent: "build" }), 2000, undefined)
-    } catch (err) {
-      errors.push(`switchAgent failed: ${(err as Error).message}`)
-    }
-    if (target) {
-      try {
-        await withTimeout(applyBuildModel(v2, sessionID, target), 2000, undefined)
-      } catch (err) {
-        errors.push(`switchModel failed: ${(err as Error).message}`)
-      }
-    }
-  } else {
-    errors.push("v2 SDK unavailable — auto-switch disabled. Use /agent build + /model manually.")
-  }
-
-  const statusText = errors.length
-    ? `\n\n⚠ Build agent switch had errors:\n${errors.map(e => `  - ${e}`).join("\n")}\nYou can switch manually via /agent build and /model <provider>/<model>.`
-    : ""
-
+  // inline v1 SDK override: pass model+agent in body so the next provider
+  // turn uses them. Works without v2 SDK and without persistent switchModel.
+  // This matches what opencode CLI does internally
+  // (~/projects/opencode/packages/opencode/src/cli/cmd/run.ts: client.session.prompt({ sessionID, agent, model, ... })).
   await log(
     client,
     "info",
-    `auto-exit to build. model=${target.providerID}/${target.modelID} source=${source} errors=${errors.length}`,
+    `auto-exit to build. model=${target.providerID}/${target.modelID} source=${source}`,
   ).catch(() => {})
 
   try {
     await client.session.prompt({
       path: { id: sessionID },
       body: {
+        agent: "build",
+        model: { providerID: target.providerID, modelID: target.modelID },
         noReply: true,
         parts: [{
           type: "text",
-          text: `Plan approved. ${summary} Build model: ${target.providerID}/${target.modelID} (source: ${source}).${statusText} Proceed with implementation.`,
+          text: `Plan approved. ${summary} Build model: ${target.providerID}/${target.modelID} (source: ${source}). Proceed with implementation.`,
         }],
       },
     })
   } catch (err) {
     await log(client, "error", `failed to send build-exit prompt: ${(err as Error).message}`).catch(() => {})
   }
-}
-
-function noV2(): any {
-  return { session: { get: async () => { throw new Error("v2 unavailable") } } }
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {

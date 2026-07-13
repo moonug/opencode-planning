@@ -193,6 +193,61 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[7] exitPlanMode refuses when target undefined: ok")
 }
 
+// 7b. exitPlanMode happy path with resolved target — sends inline model+agent
+//     override in client.session.prompt body (v1 SDK shorthand, no v2 needed).
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  // populate build event memory by sending a build event through event hook
+  await testHooks.event({
+    event: {
+      type: "session.updated.1",
+      data: {
+        sessionID: "ses_happy",
+        info: { id: "ses_happy", agent: "build", model: { providerID: "ya-glm", id: "glm" } },
+      },
+    },
+  } as any)
+  prompts.length = 0  // clear session.created prompt that might fire
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "plan-review", arguments: "/tmp/nonexistent.md", sessionID: "ses_happy" },
+    },
+  } as any).catch(() => {})
+  // drive exitPlanMode via plan_review tool execute with a no-op editor
+  const noopEditor2 = "/tmp/pr-smoke-happy-noop.sh"
+  writeFileSync(noopEditor2, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor2, 0o755)
+  const out = await testHooks.tool.plan_review.execute(
+    { plan: "x" },
+    { sessionID: "ses_happy", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  if (!out.includes("Switched to build agent")) throw new Error("happy path did not report success")
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("build prompt not sent with agent=build")
+  if (buildPrompt.body?.model?.providerID !== "ya-glm") throw new Error(`inline model.providerID wrong: ${JSON.stringify(buildPrompt.body?.model)}`)
+  if (buildPrompt.body?.model?.modelID !== "glm") throw new Error(`inline model.modelID wrong: ${JSON.stringify(buildPrompt.body?.model)}`)
+  if (buildPrompt.body?.noReply !== true) throw new Error("build prompt must have noReply=true")
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: build event memory")) {
+    throw new Error("build prompt text missing source label: " + buildPrompt.body?.parts?.[0]?.text)
+  }
+  console.log("[7b] exitPlanMode happy path with inline model+agent: ok")
+}
+
 // 8. experimental.chat.system.transform appends ENFORCEMENT block
 {
   const logs: any[] = []

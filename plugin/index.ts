@@ -141,7 +141,7 @@ async function setBuildOverride(v2: any, sessionID: string, modelStr: string): P
   })
 }
 
-async function exitPlanMode(
+export async function exitPlanMode(
   client: any,
   v2: any | null,
   buildModels: Map<string, ModelRef>,
@@ -164,6 +164,23 @@ async function exitPlanMode(
   else if (agentCfg)   { target = agentCfg;     source = "agent.build.model" }
   else if (globalCfg)  { target = globalCfg;    source = "config.model" }
   else                 { source = "opencode default" }
+
+  if (!target) {
+    await log(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`).catch(() => {})
+    try {
+      await client.session.prompt({
+        path: { id: sessionID },
+        body: {
+          noReply: true,
+          parts: [{
+            type: "text",
+            text: `Plan approved. ${summary}\n\n⚠ No build model resolved (tried /set-build-model, build event memory, agent.build.model, config.model — all undefined). Run \`/agent build\` then \`/model <provider>/<model>\` before continuing, or set \`/set-build-model <provider>/<model>\` for next time.`,
+          }],
+        },
+      })
+    } catch {}
+    return
+  }
 
   const errors: string[] = []
 
@@ -191,7 +208,7 @@ async function exitPlanMode(
   await log(
     client,
     "info",
-    `auto-exit to build. model=${target ? `${target.providerID}/${target.modelID}` : "(default)"} source=${source} errors=${errors.length}`,
+    `auto-exit to build. model=${target.providerID}/${target.modelID} source=${source} errors=${errors.length}`,
   ).catch(() => {})
 
   try {
@@ -201,7 +218,7 @@ async function exitPlanMode(
         noReply: true,
         parts: [{
           type: "text",
-          text: `Plan approved. ${summary} Build model: ${target ? `${target.providerID}/${target.modelID}` : "(opencode default)"} (source: ${source}).${statusText} Proceed with implementation.`,
+          text: `Plan approved. ${summary} Build model: ${target.providerID}/${target.modelID} (source: ${source}).${statusText} Proceed with implementation.`,
         }],
       },
     })

@@ -7,6 +7,7 @@ import { homedir } from "node:os"
 
 const pluginPath = new URL("../plugin/index.ts", import.meta.url).pathname
 const scriptPath = new URL("../bin/plan-review.py", import.meta.url).pathname
+const { rememberBuildModel, sessionUpdateInfo } = await import("../plugin/model-memory.ts")
 
 // 1. plugin loads and registers plan_review tool
 const mod = await import(pluginPath)
@@ -87,7 +88,6 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
 // 5. rememberBuildModel correctly tracks last build-agent model per session
 {
   const models = new Map<string, { providerID: string; modelID: string }>()
-  const { rememberBuildModel, sessionUpdateInfo } = await import("../plugin/model-memory.ts")
 
   // ignore plan-agent events
   rememberBuildModel({
@@ -134,6 +134,53 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (!sessionUpdateInfo({ type: "session.updated", properties: { info: { id: "x" } } })) throw new Error("info extractor broken")
 
   console.log("[5] build event memory: 6/6 cases ok")
+}
+
+// 6. real-world event format from opencode SQLite (data.sessionID + data.info.{agent,model})
+{
+  const models = new Map<string, { providerID: string; modelID: string }>()
+  rememberBuildModel({
+    type: "session.updated.1",
+    data: {
+      sessionID: "ses_real",
+      info: {
+        id: "ses_real",
+        agent: "build",
+        model: { id: "MiniMax-M3", providerID: "minimax-coding-plan", variant: "thinking" },
+      },
+    },
+  }, models)
+  if (JSON.stringify(models.get("ses_real")) !== JSON.stringify({ providerID: "minimax-coding-plan", modelID: "MiniMax-M3" })) {
+    throw new Error(`real-world event not captured: ${JSON.stringify(models.get("ses_real"))}`)
+  }
+  console.log("[6] real-world event format (SQLite-style): ok")
+}
+
+// 7. exitPlanMode refuses when no target resolved (no silent default-to-plan-model)
+{
+  const { exitPlanMode } = await import("../plugin/index.ts")
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async (opts: any) => { prompts.push(opts) } },
+  }
+  await exitPlanMode(
+    fakeClient,
+    null,  // v2 unavailable
+    new Map(),  // no build event memory
+    "ses_target_undef",
+    "test summary",
+  )
+  if (prompts.length !== 1) throw new Error(`expected 1 prompt, got ${prompts.length}`)
+  const text = prompts[0].body.parts[0].text
+  if (!text.includes("No build model resolved")) throw new Error("missing refusal warning")
+  if (!text.includes("/set-build-model")) throw new Error("missing /set-build-model hint")
+  if (text.includes("(opencode default)")) throw new Error("still contains fallback to opencode default")
+  if (!logs.some((l: any) => l.body?.level === "warn" && l.body?.message?.includes("no build model resolved"))) {
+    throw new Error("missing warn log")
+  }
+  console.log("[7] exitPlanMode refuses when target undefined: ok")
 }
 
 console.log("[OK] all smoke checks passed")

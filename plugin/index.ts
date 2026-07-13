@@ -141,7 +141,7 @@ async function setBuildOverride(v2: any, sessionID: string, modelStr: string): P
   })
 }
 
-export async function exitPlanMode(
+async function exitPlanMode(
   client: any,
   v2: any | null,
   buildModels: Map<string, ModelRef>,

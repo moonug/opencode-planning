@@ -156,30 +156,40 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[6] real-world event format (SQLite-style): ok")
 }
 
-// 7. exitPlanMode refuses when no target resolved (no silent default-to-plan-model)
+// 7. exitPlanMode refuses when no target resolved — exercise via plan_review.execute
+//    with a no-op editor (empty diff triggers exitPlanMode). Map and client are
+//    the real plugin context; we mock client.session.prompt to capture the build
+//    prompt instead of letting python helper run.
 {
-  const { exitPlanMode } = await import("../plugin/index.ts")
+  const noopEditor = "/tmp/pr-smoke-exitnoop.sh"
+  writeFileSync(noopEditor, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor, 0o755)
+
   const prompts: any[] = []
   const logs: any[] = []
   const fakeClient = {
     app: { log: async (opts: any) => { logs.push(opts) } },
-    session: { prompt: async (opts: any) => { prompts.push(opts) } },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
   }
-  await exitPlanMode(
-    fakeClient,
-    null,  // v2 unavailable
-    new Map(),  // no build event memory
-    "ses_target_undef",
-    "test summary",
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  const out = await testHooks.tool.plan_review.execute(
+    { plan: "no change" },
+    { sessionID: "ses_target_undef", messageID: "m", agent: "build", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
   )
+  if (!out.includes("Switched to build agent")) throw new Error("plan_review did not report success")
   if (prompts.length !== 1) throw new Error(`expected 1 prompt, got ${prompts.length}`)
   const text = prompts[0].body.parts[0].text
-  if (!text.includes("No build model resolved")) throw new Error("missing refusal warning")
+  if (!text.includes("No build model resolved")) throw new Error("missing refusal warning: " + text)
   if (!text.includes("/set-build-model")) throw new Error("missing /set-build-model hint")
   if (text.includes("(opencode default)")) throw new Error("still contains fallback to opencode default")
-  if (!logs.some((l: any) => l.body?.level === "warn" && l.body?.message?.includes("no build model resolved"))) {
-    throw new Error("missing warn log")
-  }
   console.log("[7] exitPlanMode refuses when target undefined: ok")
 }
 

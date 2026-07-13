@@ -24,8 +24,8 @@ const t = hooks.tool.plan_review
 console.log("[1] tool registered:", Object.keys(t.args).join(","))
 if (!t.args.plan) throw new Error("plan arg missing")
 
-// 1b. self-install: symlinks for both commands
-for (const name of ["plan-review.md", "set-build-model.md"]) {
+// 1b. self-install: symlinks for all commands
+for (const name of ["plan-review.md", "set-build-model.md", "plan-diag.md"]) {
   const linkPath = `${homedir()}/.config/opencode/commands/${name}`
   const target = readlinkSync(linkPath)
   if (!target.includes("opencode-planning")) throw new Error(`symlink target wrong: ${target}`)
@@ -218,6 +218,66 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" } }, subOut)
   if (subOut.system.join("\n").includes("ENFORCEMENT")) throw new Error("ENFORCEMENT should not be added for subagent")
   console.log("[8] system prompt transform with ENFORCEMENT: ok")
+}
+
+// 9. event hook emits diagnostic log for session.updated + plan-diag handler
+{
+  const logs: any[] = []
+  const prompts: any[] = []
+  const testHooks = await mod.default({
+    client: {
+      app: { log: async (opts: any) => { logs.push(opts) } },
+      session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+    } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+
+  // simulate a session.updated event with build agent and a model
+  await testHooks.event({
+    event: {
+      type: "session.updated.1",
+      data: {
+        sessionID: "ses_diag_test",
+        info: { id: "ses_diag_test", agent: "build", model: { providerID: "ya-glm", id: "glm" } },
+      },
+    },
+  } as any)
+
+  // diagnostic log line for session.updated must be present
+  if (!logs.some((l: any) => l.body?.level === "debug" && l.body?.message?.includes("session.updated:") && l.body?.message?.includes("ya-glm/glm"))) {
+    throw new Error("diagnostic log for session.updated missing")
+  }
+
+  // rememberBuildModel should have populated the Map
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "plan-diag", arguments: "", sessionID: "ses_diag_test" },
+    },
+  } as any)
+  if (!prompts.some((p: any) => p.body?.parts?.[0]?.text?.includes("# plan-diag"))) {
+    throw new Error("/plan-diag handler did not produce diag output")
+  }
+  const diagText = prompts.find((p: any) => p.body?.parts?.[0]?.text?.includes("# plan-diag"))?.body.parts[0].text
+  if (!diagText.includes("ya-glm/glm")) throw new Error("plan-diag output missing remembered build model")
+
+  // /plan-diag reset clears the map
+  prompts.length = 0
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "plan-diag", arguments: "reset", sessionID: "ses_diag_test" },
+    },
+  } as any)
+  if (!prompts.some((p: any) => p.body?.parts?.[0]?.text?.includes("build-event memory cleared"))) {
+    throw new Error("/plan-diag reset did not produce confirmation")
+  }
+
+  console.log("[9] diagnostic log + /plan-diag handler: ok")
 }
 
 console.log("[OK] all smoke checks passed")

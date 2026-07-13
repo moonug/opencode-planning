@@ -12,6 +12,7 @@ const SCRIPT_PATH =
 const COMMAND_SOURCES = [
   join(REPO_DIR, "commands", "plan-review.md"),
   join(REPO_DIR, "commands", "set-build-model.md"),
+  join(REPO_DIR, "commands", "plan-diag.md"),
 ]
 const BUILD_MODEL_METADATA_KEY = "plan_review_build_model"
 
@@ -145,6 +146,7 @@ async function exitPlanMode(
   client: any,
   v2: any | null,
   buildModels: Map<string, ModelRef>,
+  lastResolution: { target?: ModelRef; source?: string },
   sessionID: string | undefined,
   summary: string,
 ): Promise<void> {
@@ -164,6 +166,9 @@ async function exitPlanMode(
   else if (agentCfg)   { target = agentCfg;     source = "agent.build.model" }
   else if (globalCfg)  { target = globalCfg;    source = "config.model" }
   else                 { source = "opencode default" }
+
+  lastResolution.target = target
+  lastResolution.source = source
 
   if (!target) {
     await log(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`).catch(() => {})
@@ -244,6 +249,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   let v2: any | null = null
   let v2Tried = false
   const buildModels = new Map<string, ModelRef>()
+  const lastResolution: { target?: ModelRef; source?: string } = {}
 
   async function getV2(): Promise<any> {
     if (v2Tried) return v2
@@ -276,7 +282,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, await getV2(), buildModels, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, await getV2(), buildModels, lastResolution, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -316,6 +322,21 @@ ENFORCEMENT (added by plan-review plugin):
 
     event: async ({ event }) => {
       const e = event as any
+
+      // diagnostic log: surface every session.updated variant we receive so the
+      // user can verify in opencode log whether UI actions (ctrl-x m, agent
+      // tab switch) actually emit events. Useful to debug why "build model
+      // ignored" — the plugin only knows what opencode tells it.
+      if (e.type === "session.updated" || e.type === "session.updated.1") {
+        const info = e.properties?.info ?? e.data?.info
+        if (info) {
+          await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch(() => {})
+        }
+      }
+      if (e.type === "session.next.model.switched.1" || e.type === "session.next.agent.switched.1") {
+        await log(client, "debug", `${e.type}: ${JSON.stringify({ sessionID: e.sessionID, model: e.model, agent: e.agent })}`).catch(() => {})
+      }
+
       try {
         rememberBuildModel(e, buildModels)
       } catch {
@@ -366,6 +387,57 @@ ENFORCEMENT (added by plan-review plugin):
         return
       }
 
+      if (name === "plan-diag") {
+        if (!sessionID) {
+          await log(client, "error", "plan-diag: no active session").catch(() => {})
+          return
+        }
+        const subCmd = rawArgs.trim()
+        if (subCmd === "reset") {
+          buildModels.clear()
+          await client.session.prompt({
+            path: { id: sessionID },
+            body: {
+              noReply: true,
+              parts: [{
+                type: "text",
+                text: `plan-diag: build-event memory cleared. Next session.updated will repopulate it.`,
+              }],
+            },
+          }).catch(() => {})
+          return
+        }
+        // show: dump state
+        const memEntries = Array.from(buildModels.entries()).map(([sid, m]) => `  ${sid.slice(0, 16)}… → ${m.providerID}/${m.modelID}`).join("\n") || "  (empty)"
+        await client.session.prompt({
+          path: { id: sessionID },
+          body: {
+            noReply: true,
+            parts: [{
+              type: "text",
+              text: `# plan-diag
+
+## Build event memory (in-memory)
+${memEntries}
+
+## Current session
+- sessionID: \`${sessionID}\`
+- last target resolved: ${lastResolution.target ? `${lastResolution.target.providerID}/${lastResolution.target.modelID} (source: ${lastResolution.source})` : "never called"}
+
+If you switched build agent via ctrl-x m in this session but the memory
+above does not show that model, opencode did NOT emit a \`session.updated\`
+event for your picker action. Workarounds:
+- \`/set-build-model <provider>/<model>\` before approving the plan
+- \`/agent build\` → \`/model <provider>/<model>\` → \`/agent plan\`, then approve
+
+Diagnostic lines \`plan-review: session.updated: ...\` appear in opencode log for every session.updated event.
+`,
+            }],
+          },
+        }).catch(() => {})
+        return
+      }
+
       if (name !== "plan-review") return
 
       const filePath = rawArgs.trim()
@@ -398,7 +470,7 @@ ENFORCEMENT (added by plan-review plugin):
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, await getV2(), buildModels, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, await getV2(), buildModels, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})

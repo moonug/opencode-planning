@@ -23,14 +23,12 @@ const t = hooks.tool.plan_review
 console.log("[1] tool registered:", Object.keys(t.args).join(","))
 if (!t.args.plan) throw new Error("plan arg missing")
 
-// 1b. self-install: symlink at ~/.config/opencode/commands/plan-review.md exists
-const linkPath = `${homedir()}/.config/opencode/commands/plan-review.md`
-try {
+// 1b. self-install: symlinks for both commands
+for (const name of ["plan-review.md", "set-build-model.md"]) {
+  const linkPath = `${homedir()}/.config/opencode/commands/${name}`
   const target = readlinkSync(linkPath)
   if (!target.includes("opencode-planning")) throw new Error(`symlink target wrong: ${target}`)
-  console.log("[1b] command symlink:", target)
-} catch (e) {
-  throw new Error(`command symlink missing: ${(e as Error).message}`)
+  console.log(`[1b] ${name} →`, target)
 }
 
 // 2. python helper produces correct diff when invoked via shebang
@@ -60,5 +58,82 @@ const empty = spawnSync(scriptPath, ["--plan-text", "no change"], {
 })
 console.log("[3] no-op stdout length:", empty.stdout.length)
 if (empty.stdout.length !== 0) throw new Error("expected empty diff for no-op editor")
+
+// 4. parseModelString edge cases (mirrors plugin/index.ts)
+function parseModelString(s: string): { providerID: string; modelID: string } | undefined {
+  const m = s.match(/^([^/\s]+)\/(.+)$/)
+  if (!m) return undefined
+  return { providerID: m[1], modelID: m[2] }
+}
+{
+  const cases: Array<[string, { providerID: string; modelID: string } | undefined]> = [
+    ["anthropic/claude-sonnet-4", { providerID: "anthropic", modelID: "claude-sonnet-4" }],
+    ["ya-deepseek/deepseek-v4-flash", { providerID: "ya-deepseek", modelID: "deepseek-v4-flash" }],
+    ["no-slash", undefined],
+    ["/missing-provider", undefined],
+    ["missing-model/", undefined],
+    ["", undefined],
+    ["   ", undefined],
+  ]
+  for (const [input, expected] of cases) {
+    const got = parseModelString(input)
+    if (JSON.stringify(got) !== JSON.stringify(expected)) {
+      throw new Error(`parseModelString("${input}"): expected ${JSON.stringify(expected)}, got ${JSON.stringify(got)}`)
+    }
+  }
+  console.log("[4] parseModelString: 7/7 cases ok")
+}
+
+// 5. rememberBuildModel correctly tracks last build-agent model per session
+{
+  const models = new Map<string, { providerID: string; modelID: string }>()
+  const { rememberBuildModel, sessionUpdateInfo } = await import("../plugin/model-memory.ts")
+
+  // ignore plan-agent events
+  rememberBuildModel({
+    type: "session.updated",
+    properties: { info: { id: "s1", agent: "plan", model: { providerID: "ya-glm", id: "glm" } } },
+  }, models)
+  if (models.has("s1")) throw new Error("plan-agent event should be ignored")
+
+  // remember build-agent model
+  rememberBuildModel({
+    type: "session.updated",
+    properties: { info: { id: "s1", agent: "build", model: { providerID: "omlx", id: "Ornith" } } },
+  }, models)
+  if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "omlx", modelID: "Ornith" })) {
+    throw new Error("first build-agent model not remembered")
+  }
+
+  // overwrite with later build-agent model
+  rememberBuildModel({
+    type: "session.updated.1",
+    data: { info: { id: "s1", agent: "build", model: { providerID: "ya-deepseek", id: "deepseek-v4-flash" } } },
+  }, models)
+  if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "ya-deepseek", modelID: "deepseek-v4-flash" })) {
+    throw new Error("second build-agent model did not overwrite")
+  }
+
+  // sync wrapper
+  rememberBuildModel({
+    type: "sync",
+    syncEvent: {
+      type: "session.updated.1",
+      data: { info: { id: "s2", agent: "build", model: { providerID: "minimax", id: "M3" } } },
+    },
+  }, models)
+  if (JSON.stringify(models.get("s2")) !== JSON.stringify({ providerID: "minimax", modelID: "M3" })) {
+    throw new Error("sync wrapper not handled")
+  }
+
+  // ignore malformed events
+  rememberBuildModel({ type: "session.updated", properties: { info: { id: "s3" } } }, models)
+  if (models.has("s3")) throw new Error("malformed event should be ignored")
+
+  // sessionUpdateInfo returns info from any wrapper
+  if (!sessionUpdateInfo({ type: "session.updated", properties: { info: { id: "x" } } })) throw new Error("info extractor broken")
+
+  console.log("[5] build event memory: 6/6 cases ok")
+}
 
 console.log("[OK] all smoke checks passed")

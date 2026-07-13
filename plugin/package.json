@@ -8,7 +8,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode-ai/plugin": "*",
+    "@opencode-ai/sdk": "*"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",

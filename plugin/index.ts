@@ -1,13 +1,19 @@
-import { tool, type Plugin, type BunShell } from "@opencode-ai/plugin"
-import { existsSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync } from "node:fs"
-import { dirname, resolve, join } from "node:path"
+import { tool, type Plugin } from "@opencode-ai/plugin"
+import { createOpencodeClient as createV2Client } from "@opencode-ai/sdk/v2/client"
+import { existsSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync } from "node:fs"
+import { dirname, resolve, join, basename } from "node:path"
 import { homedir } from "node:os"
+import { rememberBuildModel, type ModelRef } from "./model-memory"
 
 const PLUGIN_DIR = dirname(new URL(import.meta.url).pathname)
 const REPO_DIR = resolve(PLUGIN_DIR, "..")
 const SCRIPT_PATH =
   process.env.PLAN_REVIEW_SCRIPT ?? join(REPO_DIR, "bin", "plan-review.py")
-const COMMAND_SOURCE = join(REPO_DIR, "commands", "plan-review.md")
+const COMMAND_SOURCES = [
+  join(REPO_DIR, "commands", "plan-review.md"),
+  join(REPO_DIR, "commands", "set-build-model.md"),
+]
+const BUILD_MODEL_METADATA_KEY = "plan_review_build_model"
 
 const FEEDBACK_HEADER =
   "User reviewed the plan in their editor and made changes.\n" +
@@ -29,43 +35,186 @@ function ensureExecutable(path: string): void {
 }
 
 function ensureCommandSymlink(): void {
-  const linkPath = join(homedir(), ".config", "opencode", "commands", "plan-review.md")
-  mkdirSync(dirname(linkPath), { recursive: true })
-  try {
-    const existing = readlinkSync(linkPath)
-    if (resolve(existing) === resolve(COMMAND_SOURCE)) return
-    unlinkSync(linkPath)
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      try { unlinkSync(linkPath) } catch {}  // not a symlink, replace
+  for (const source of COMMAND_SOURCES) {
+    const linkPath = join(homedir(), ".config", "opencode", "commands", basename(source))
+    try {
+      mkdirSync(dirname(linkPath), { recursive: true })
+    } catch {
+      continue
     }
-  }
-  try {
-    symlinkSync(COMMAND_SOURCE, linkPath)
-  } catch {
-    // symlink failed (windows without dev mode?) — fall back to copy
-    const { copyFileSync } = require("node:fs") as typeof import("node:fs")
-    copyFileSync(COMMAND_SOURCE, linkPath)
+    try {
+      const existing = readlinkSync(linkPath)
+      if (resolve(existing) === resolve(source)) continue
+      unlinkSync(linkPath)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        try { unlinkSync(linkPath) } catch {}
+      }
+    }
+    try {
+      symlinkSync(source, linkPath)
+    } catch {
+      copyFileSync(source, linkPath)
+    }
   }
 }
 
-async function exitPlanMode(client: any, sessionID: string | undefined, summary: string): Promise<void> {
+function parseModelString(s: string): ModelRef | undefined {
+  const m = s.trim().match(/^([^/\s]+)\/(.+)$/)
+  if (!m) return undefined
+  return { providerID: m[1]!, modelID: m[2]! }
+}
+
+function runPlanReview($: any, planText: string): Promise<string> {
+  return $`${SCRIPT_PATH} --plan-text ${$.escape(planText)}`.text()
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ])
+}
+
+function log(client: any, level: "debug" | "info" | "warn" | "error", message: string): Promise<unknown> {
+  return client.app.log({ body: { service: "plan-review", level, message } })
+}
+
+async function getOverrideFromMetadata(v2: any, sessionID: string): Promise<ModelRef | undefined> {
+  try {
+    const res = await v2.session.get({ path: { sessionID } })
+    const md = res?.data?.metadata ?? res?.metadata
+    const override = md?.[BUILD_MODEL_METADATA_KEY]
+    if (typeof override === "string") return parseModelString(override)
+  } catch {}
+  return undefined
+}
+
+async function getBuildAgentModel(client: any): Promise<ModelRef | undefined> {
+  try {
+    const res = await client.app.agents()
+    const agents = (res as any)?.data ?? res
+    const buildAgent = (Array.isArray(agents) ? agents : []).find(
+      (a: any) => a.name === "build" || a.id === "build"
+    )
+    if (buildAgent?.model?.providerID && buildAgent?.model?.modelID) {
+      return { providerID: buildAgent.model.providerID, modelID: buildAgent.model.modelID }
+    }
+  } catch {}
+  return undefined
+}
+
+async function getGlobalModel(client: any): Promise<ModelRef | undefined> {
+  try {
+    const res = await client.config.get()
+    const model = (res as any)?.data?.model ?? (res as any)?.model
+    if (typeof model === "string") return parseModelString(model)
+  } catch {}
+  return undefined
+}
+
+async function getSessionRuntimeModel(v2: any, sessionID: string): Promise<ModelRef | undefined> {
+  try {
+    const res = await v2.session.get({ path: { sessionID } })
+    const m = (res as any)?.data?.model ?? (res as any)?.model
+    if (m?.providerID && m?.id) return { providerID: m.providerID, modelID: m.id }
+  } catch {}
+  return undefined
+}
+
+async function applyBuildModel(v2: any, sessionID: string, target: ModelRef): Promise<void> {
+  await v2.session.switchModel({
+    sessionID,
+    model: { id: target.modelID, providerID: target.providerID },
+  })
+}
+
+async function setBuildOverride(v2: any, sessionID: string, modelStr: string): Promise<void> {
+  let existing: Record<string, unknown> = {}
+  try {
+    const res = await v2.session.get({ path: { sessionID } })
+    existing = (res?.data?.metadata ?? res?.metadata ?? {}) as Record<string, unknown>
+  } catch {}
+  await v2.session.update({
+    path: { sessionID },
+    body: { metadata: { ...existing, [BUILD_MODEL_METADATA_KEY]: modelStr } },
+  })
+}
+
+async function exitPlanMode(
+  client: any,
+  v2: any | null,
+  buildModels: Map<string, ModelRef>,
+  sessionID: string | undefined,
+  summary: string,
+): Promise<void> {
   if (!sessionID) return
+
+  const [metadata, agentCfg, globalCfg] = await Promise.all([
+    withTimeout(getOverrideFromMetadata(v2 ?? noV2(), sessionID), 2000, undefined),
+    withTimeout(getBuildAgentModel(client), 2000, undefined),
+    withTimeout(getGlobalModel(client), 2000, undefined),
+  ])
+  const remembered = buildModels.get(sessionID)
+
+  let source: string
+  let target: ModelRef | undefined
+  if (metadata)        { target = metadata;     source = "/set-build-model" }
+  else if (remembered) { target = remembered;   source = "build event memory" }
+  else if (agentCfg)   { target = agentCfg;     source = "agent.build.model" }
+  else if (globalCfg)  { target = globalCfg;    source = "config.model" }
+  else                 { source = "opencode default" }
+
+  const errors: string[] = []
+
+  if (v2) {
+    try {
+      await withTimeout(v2.session.switchAgent({ sessionID, agent: "build" }), 2000, undefined)
+    } catch (err) {
+      errors.push(`switchAgent failed: ${(err as Error).message}`)
+    }
+    if (target) {
+      try {
+        await withTimeout(applyBuildModel(v2, sessionID, target), 2000, undefined)
+      } catch (err) {
+        errors.push(`switchModel failed: ${(err as Error).message}`)
+      }
+    }
+  } else {
+    errors.push("v2 SDK unavailable — auto-switch disabled. Use /agent build + /model manually.")
+  }
+
+  const statusText = errors.length
+    ? `\n\n⚠ Build agent switch had errors:\n${errors.map(e => `  - ${e}`).join("\n")}\nYou can switch manually via /agent build and /model <provider>/<model>.`
+    : ""
+
+  await log(
+    client,
+    "info",
+    `auto-exit to build. model=${target ? `${target.providerID}/${target.modelID}` : "(default)"} source=${source} errors=${errors.length}`,
+  ).catch(() => {})
+
   try {
     await client.session.prompt({
       path: { id: sessionID },
       body: {
-        agent: "build",
         noReply: true,
-        parts: [{ type: "text", text: `Plan approved. ${summary} Proceed with implementation.` }],
+        parts: [{
+          type: "text",
+          text: `Plan approved. ${summary} Build model: ${target ? `${target.providerID}/${target.modelID}` : "(opencode default)"} (source: ${source}).${statusText} Proceed with implementation.`,
+        }],
       },
     })
-  } catch {
-    // not in plan mode, or session busy — silent fail, build agent prompt will sort it out
+  } catch (err) {
+    await log(client, "error", `failed to send build-exit prompt: ${(err as Error).message}`).catch(() => {})
   }
 }
 
-export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
+function noV2(): any {
+  return { session: { get: async () => { throw new Error("v2 unavailable") } } }
+}
+
+export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
       `plan-review: helper script not found at ${SCRIPT_PATH}. ` +
@@ -75,24 +224,42 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   ensureExecutable(SCRIPT_PATH)
   ensureCommandSymlink()
 
+  let v2: any | null = null
+  let v2Tried = false
+  const buildModels = new Map<string, ModelRef>()
+
+  async function getV2(): Promise<any> {
+    if (v2Tried) return v2
+    v2Tried = true
+    try {
+      v2 = createV2Client({ baseUrl: serverUrl.toString().replace(/\/+$/, ""), directory: process.cwd() })
+    } catch (err) {
+      await log(client, "warn", `v2 SDK init failed: ${(err as Error).message}, build-model persistence disabled`).catch(() => {})
+      v2 = null
+    }
+    return v2
+  }
+
   const plan_review = tool({
     description:
       "Open the current plan in $EDITOR for the user to annotate. " +
       "Pass the full markdown of your plan as the `plan` argument. " +
-      "Returns a unified diff of the user's edits, or empty output if the " +
-      "user closed the editor without changes (which means approved, and " +
-      "the session will auto-switch to the build agent). " +
-      "Iterate until the result is empty.",
+      "Returns a unified diff of the user's edits, or empty output if " +
+      "the user closed the editor without changes (which means approved, and " +
+      "the session will auto-switch to the build agent on a per-session " +
+      "build model — set via /set-build-model, or falling back to the " +
+      "last model selected while build was active, or agent.build.model, " +
+      "or config.model). Iterate until the result is empty.",
     args: {
       plan: tool.schema.string().describe(
         "full markdown of the plan to show the user for review"
       ),
     },
     async execute(args, context) {
-      const result = await ($ as BunShell)`${SCRIPT_PATH} --plan-text ${args.plan}`.text()
+      const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, await getV2(), buildModels, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -124,33 +291,77 @@ Do NOT proceed to implementation, do not write code, do not run commands, do not
     },
 
     event: async ({ event }) => {
-      const e = event as { type?: string; properties?: Record<string, unknown> }
+      const e = event as any
+      try {
+        rememberBuildModel(e, buildModels)
+      } catch {
+        // ignore — event handler must never throw
+      }
+
       if (e.type !== "command.executed" && e.type !== "tui.command.execute") return
 
       const props = e.properties ?? {}
       const name = (props.name ?? (e as Record<string, unknown>).command) as string | undefined
+      const rawArgs = (props.arguments ?? "") as string
+      const sessionID = props.sessionID as string | undefined
+
+      if (name === "set-build-model") {
+        const modelStr = rawArgs.trim()
+        if (!sessionID) {
+          await log(client, "error", "set-build-model: no active session").catch(() => {})
+          return
+        }
+        if (!modelStr) {
+          await log(client, "error", "Usage: /set-build-model <provider/model-id>").catch(() => {})
+          return
+        }
+        if (!parseModelString(modelStr)) {
+          await log(client, "error", `Invalid model format "${modelStr}". Expected "provider/model-id".`).catch(() => {})
+          return
+        }
+        const v = await getV2()
+        if (!v) {
+          await log(client, "error", "set-build-model: v2 SDK unavailable, cannot persist override").catch(() => {})
+          return
+        }
+        try {
+          await setBuildOverride(v, sessionID, modelStr)
+          await client.session.prompt({
+            path: { id: sessionID },
+            body: {
+              noReply: true,
+              parts: [{
+                type: "text",
+                text: `Build model for this session set to: \`${modelStr}\`. On the next plan approval, the session will switch to this model before build executes.`,
+              }],
+            },
+          })
+        } catch (err) {
+          await log(client, "error", `set-build-model failed: ${(err as Error).message}`).catch(() => {})
+        }
+        return
+      }
+
       if (name !== "plan-review") return
 
-      const rawArgs = (props.arguments ?? "") as string
       const filePath = rawArgs.trim()
-      const sessionID = props.sessionID as string | undefined
       if (!filePath) {
-        await client.app.log({ level: "error", message: "Usage: /plan-review <path-to-plan.md>" })
+        await log(client, "error", "Usage: /plan-review <path-to-plan.md>").catch(() => {})
         return
       }
       if (!sessionID) {
-        await client.app.log({ level: "error", message: "plan-review: no active session" })
+        await log(client, "error", "plan-review: no active session").catch(() => {})
         return
       }
 
       const absolutePath = resolve(filePath)
       if (!existsSync(absolutePath)) {
-        await client.app.log({ level: "error", message: `plan-review: file not found: ${absolutePath}` })
+        await log(client, "error", `plan-review: file not found: ${absolutePath}`).catch(() => {})
         return
       }
 
       const planContent = readFileSync(absolutePath, "utf8")
-      const diff = await ($ as BunShell)`${SCRIPT_PATH} --plan-text ${planContent}`.text()
+      const diff = await runPlanReview($, planContent)
       const trimmed = diff.trim()
 
       const feedback = trimmed
@@ -163,13 +374,10 @@ Do NOT proceed to implementation, do not write code, do not run commands, do not
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, await getV2(), buildModels, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
-        await client.app.log({
-          level: "error",
-          message: `plan-review: failed to send feedback: ${(err as Error).message}`,
-        })
+        await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})
       }
     },
   }

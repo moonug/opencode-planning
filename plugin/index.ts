@@ -144,6 +144,7 @@ async function exitPlanMode(
   summary: string,
 ): Promise<void> {
   if (!sessionID) return
+  await log(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`).catch(() => {})
 
   const overridden = buildModels.get(sessionID)
   const perAgent = chatMessageMemory.get(sessionID)
@@ -213,6 +214,7 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
+  await log(client, "info", "plan-review: plugin init v0.2.0").catch(() => {})
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
       `plan-review: helper script not found at ${SCRIPT_PATH}. ` +
@@ -251,6 +253,8 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
       return FEEDBACK_HEADER + result + REVISION_PROMPT
     },
   })
+
+  await log(client, "info", `plan-review: tool 'plan_review' created, args: ${Object.keys(plan_review.args).join(",")}`).catch(() => {})
 
   return {
     tool: { plan_review },

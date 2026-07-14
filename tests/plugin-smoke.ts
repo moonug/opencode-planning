@@ -511,6 +511,26 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[14] priority order: chat.message wins over /set-build-model: ok")
 }
 
+// 15. plugin init logs: "plugin init v0.2.0" + "tool 'plan_review' created, args: ..."
+{
+  const logs: any[] = []
+  const testHooks = await mod.default({
+    client: { app: { log: async (opts: any) => { logs.push(opts) } }, session: { prompt: async () => {} } } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const initLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("plugin init v0.2.0"))
+  if (!initLog) throw new Error("init log 'plan-review: plugin init v0.2.0' missing")
+  const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
+  if (!toolLog) throw new Error("tool registration log missing")
+  if (!toolLog.body.message.includes("plan")) throw new Error("tool log missing arg name")
+  if (!testHooks.tool.plan_review) throw new Error("plan_review not in returned hooks")
+  console.log("[15] init + tool registration logs emitted: ok")
+}
+
 // 8. experimental.chat.system.transform appends ENFORCEMENT block
 {
   const logs: any[] = []

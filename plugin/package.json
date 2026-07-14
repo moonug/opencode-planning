@@ -4,6 +4,10 @@
   "description": "opencode plugin: review plans in $EDITOR, return diff to the model",
   "type": "module",
   "main": "index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui-plugin.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },

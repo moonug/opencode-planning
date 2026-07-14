@@ -56,6 +56,30 @@ function ensureCommandSymlink(): void {
       copyFileSync(source, linkPath)
     }
   }
+  // also install the TUI plugin so the TUI process can forward Tab
+  // agent switches to the server plugin's metadata handler. Without
+  // this, the opencode TUI agent state stays in-memory and the server
+  // cannot attribute picker changes to a specific agent.
+  try {
+    const tuiPluginPath = join(REPO_DIR, "plugin", "tui-plugin.ts")
+    const pluginsDir = join(homedir(), ".config", "opencode", "plugins")
+    mkdirSync(pluginsDir, { recursive: true })
+    const link = join(pluginsDir, "plan-review-tui.ts")
+    try {
+      const existing = readlinkSync(link)
+      if (resolve(existing) === resolve(tuiPluginPath)) return
+      unlinkSync(link)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        try { unlinkSync(link) } catch {}
+      }
+    }
+    try {
+      symlinkSync(tuiPluginPath, link)
+    } catch {
+      copyFileSync(tuiPluginPath, link)
+    }
+  } catch {}
 }
 
 function parseModelString(s: string): ModelRef | undefined {
@@ -640,6 +664,23 @@ Do NOT proceed with implementation until the plan is approved.
               lastSessionModel = { providerID, modelID }
             }
             if (sid) lastSessionID = sid
+          }
+          // TUI-side plugin (plugin/tui-plugin.ts) writes
+          // metadata.planReviewTabSwitchTo when the user cycles agents
+          // via Tab/Shift+Tab. The opencode TUI's local agent state is
+          // purely in-memory (no server publication), so without this
+          // metadata bridge the server cannot know which agent the user
+          // just switched to until the next chat.message fires.
+          // session.updated.1 fires whenever the session row is patched,
+          // including via session.update({body:{metadata:{...}}}), so
+          // this handler picks up the TUI plugin's notifications.
+          const meta = info?.metadata ?? {}
+          const tabSwitchTo = (meta as any)?.planReviewTabSwitchTo
+          if (typeof tabSwitchTo === "string" && tabSwitchTo && sid) {
+            lastSessionAgent = tabSwitchTo
+            await log(client, "info",
+              `plan-review: tab switch forwarded by TUI plugin: session=${sid} -> ${tabSwitchTo}`,
+            ).catch(() => {})
           }
         }
       } catch {}

@@ -259,8 +259,16 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
   ])
 }
 
-export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
+export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   await log(client, "info", "plan-review: plugin init v0.1.0").catch(() => {})
+
+  // diagnostic: log serverUrl so we can probe it with curl from outside
+  // the plugin. opencode 1.17.18 has no plugin hook for picker changes,
+  // so we need a server-side way to learn the current agent — the server
+  // is the only piece of state that might have it.
+  queueMicrotask(() => {
+    void log(client, "info", `diag.init.serverUrl: ${serverUrl.toString()}`).catch(() => {})
+  })
 
   // Diagnostic: probe v1 SDK responses to see what fields are actually
   // returned. opencode 1.17.18 has no plugin hook for picker changes,

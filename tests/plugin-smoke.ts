@@ -334,6 +334,62 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[27] picker memory (model.json recent[0]) wins when all other sources undefined: ok")
 }
 
+// 28. lastActiveAgents tracking + watcher log mentions agent context
+{
+  // reset
+  _writeFileSync(process.env.PLAN_REVIEW_MODEL_JSON!, JSON.stringify({ recent: [], favorite: [], variant: {} }))
+
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  logs.length = 0
+  // simulate session.updated.1 with agent=build, model=ya-glm/glm
+  await testHooks.event({
+    event: {
+      type: "session.updated.1",
+      data: {
+        sessionID: "ses_diag_28",
+        info: {
+          id: "ses_diag_28",
+          agent: "build",
+          model: { providerID: "ya-glm", id: "glm" },
+        },
+      },
+    },
+  } as any)
+  // write model.json with same model (ya-glm/glm) — watcher should
+  // cross-reference and log "matched agent=build"
+  _writeFileSync(
+    process.env.PLAN_REVIEW_MODEL_JSON!,
+    JSON.stringify({ recent: [{ providerID: "ya-glm", modelID: "glm" }], favorite: [], variant: {} }),
+  )
+  // give the watcher a tick to fire
+  await new Promise((r) => setTimeout(r, 50))
+  const matched = logs.find((l: any) =>
+    l.body?.level === "info" &&
+    l.body?.message?.includes("model.json changed") &&
+    l.body?.message?.includes("ya-glm/glm") &&
+    l.body?.message?.includes("matched agent=build"),
+  )
+  if (!matched) {
+    throw new Error("watcher did not log matched agent=build. logs: " + JSON.stringify(logs.map((l: any) => l.body?.message)))
+  }
+  // reset
+  _writeFileSync(process.env.PLAN_REVIEW_MODEL_JSON!, JSON.stringify({ recent: [], favorite: [], variant: {} }))
+  console.log("[28] watcher logs 'matched agent=X' for picker changes: ok")
+}
+
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent
 //     override in client.session.prompt body (v1 SDK shorthand, no v2 needed).
 {

@@ -274,19 +274,39 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   const lastResolution: { target?: ModelRef; source?: string } = {}
   const lastShownModels = new Map<string, ProviderListEntry[]>()
   const chatMessageMemory = new Map<string, Map<string, ModelRef>>()
+  // sessionID -> { agent, model } — last known active agent and its model
+  // from session.updated.1 events. Used to attribute picker changes in
+  // model.json to a specific agent (model.json has no agent field).
+  const lastActiveAgents = new Map<string, { agent: string; model?: ModelRef }>()
   const MODEL_JSON_PATH = process.env.PLAN_REVIEW_MODEL_JSON
     ?? `${homedir()}/.local/state/opencode/model.json`
   let lastGlobalPicker: ModelRef | undefined = readPickerState(MODEL_JSON_PATH)
 
   // Watch model.json so we pick up TUI picker changes even when no message
-  // is sent. TUI writes its selection to recent[0]; we read it eagerly.
+  // is sent. TUI writes its selection to recent[0]; we read it eagerly and
+  // cross-reference with lastActiveAgents to infer which agent the picker
+  // change was for.
   try {
     if (existsSync(MODEL_JSON_PATH)) {
       watch(MODEL_JSON_PATH, { persistent: false }, () => {
         const m = readPickerState(MODEL_JSON_PATH)
         if (m && (!lastGlobalPicker || lastGlobalPicker.providerID !== m.providerID || lastGlobalPicker.modelID !== m.modelID)) {
+          const old = lastGlobalPicker
           lastGlobalPicker = m
-          log(client, "info", `plan-review: model.json changed, recent[0]=${m.providerID}/${m.modelID}`).catch(() => {})
+          // Cross-reference: did the new picker match a known
+          // (agent, model) pair from session.updated.1? If so we can
+          // tell which agent the user was on when they picked.
+          let matchedAgent: string | undefined
+          for (const [, info] of lastActiveAgents) {
+            if (info.model && info.model.providerID === m.providerID && info.model.modelID === m.modelID) {
+              matchedAgent = info.agent
+            }
+          }
+          const oldStr = old ? `${old.providerID}/${old.modelID}` : "(none)"
+          const ctx = matchedAgent ? `, matched agent=${matchedAgent}` : ", no matching active agent (picker for unrecorded agent)"
+          log(client, "info",
+            `plan-review: model.json changed, recent[0]=${m.providerID}/${m.modelID} (was ${oldStr})${ctx}`,
+          ).catch(() => {})
         }
       })
     }
@@ -422,6 +442,20 @@ Do NOT proceed with implementation until the plan is approved.
           if (info?.agent === "build" && sid && buildModels.has(sid)) {
             const m = buildModels.get(sid)!
             await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch(() => {})
+          }
+          // Track last active agent per session so picker changes in
+          // model.json can be attributed to a specific agent. Used by the
+          // model.json watcher to log 'matched agent=X' for each change.
+          if (sid && info?.agent) {
+            const modelID = info.model?.modelID ?? info.model?.id
+            const providerID = info.model?.providerID
+            const prev = lastActiveAgents.get(sid)
+            if (!prev || prev.agent !== info.agent || (providerID && modelID && (!prev.model || prev.model.providerID !== providerID || prev.model.modelID !== modelID))) {
+              lastActiveAgents.set(sid, {
+                agent: info.agent,
+                model: providerID && modelID ? { providerID, modelID } : prev?.model,
+              })
+            }
           }
         }
       } catch {}

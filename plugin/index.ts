@@ -138,13 +138,16 @@ function formatProviderList(entries: ProviderListEntry[]): string {
 async function exitPlanMode(
   client: any,
   buildModels: Map<string, ModelRef>,
+  chatMessageMemory: Map<string, Map<string, ModelRef>>,
   lastResolution: { target?: ModelRef; source?: string },
   sessionID: string | undefined,
   summary: string,
 ): Promise<void> {
   if (!sessionID) return
 
-  const remembered = buildModels.get(sessionID)
+  const overridden = buildModels.get(sessionID)
+  const perAgent = chatMessageMemory.get(sessionID)
+  const fromChat = perAgent?.get("build")
   const [agentCfg, globalCfg] = await Promise.all([
     withTimeoutSafe(getBuildAgentModel(client), 2000, undefined),
     withTimeoutSafe(getGlobalModel(client), 2000, undefined),
@@ -152,7 +155,8 @@ async function exitPlanMode(
 
   let source: string
   let target: ModelRef | undefined
-  if (remembered)       { target = remembered; source = "/set-build-model" }
+  if (fromChat)         { target = fromChat;    source = "chat.message" }
+  else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
   else                  { source = "opencode default" }
@@ -221,6 +225,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   const buildModels = new Map<string, ModelRef>()
   const lastResolution: { target?: ModelRef; source?: string } = {}
   const lastShownModels = new Map<string, ProviderListEntry[]>()
+  const chatMessageMemory = new Map<string, Map<string, ModelRef>>()
 
   const plan_review = tool({
     description:
@@ -240,7 +245,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, buildModels, lastResolution, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -249,6 +254,25 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
 
   return {
     tool: { plan_review },
+
+    "chat.message": async (input, _output) => {
+      if (input.sessionID && input.agent && input.model) {
+        let perSession = chatMessageMemory.get(input.sessionID)
+        if (!perSession) {
+          perSession = new Map()
+          chatMessageMemory.set(input.sessionID, perSession)
+        }
+        perSession.set(input.agent, {
+          providerID: input.model.providerID,
+          modelID: input.model.modelID,
+        })
+        await log(
+          client,
+          "debug",
+          `chat.message captured: agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
+        ).catch(() => {})
+      }
+    },
 
     "experimental.chat.system.transform": async (_input, output) => {
       const joined = output.system.join("\n").toLowerCase()
@@ -400,6 +424,10 @@ ENFORCEMENT (added by plan-review plugin):
           return
         }
         const memEntries = Array.from(buildModels.entries()).map(([sid, m]) => `  ${sid.slice(0, 16)}… → ${m.providerID}/${m.modelID}`).join("\n") || "  (empty)"
+        const chatEntries = Array.from(chatMessageMemory.entries()).map(([sid, byAgent]) => {
+          const lines = Array.from(byAgent.entries()).map(([agent, m]) => `    ${agent}: ${m.providerID}/${m.modelID}`).join("\n")
+          return `  ${sid.slice(0, 16)}…\n${lines}`
+        }).join("\n") || "  (empty)"
         await client.session.prompt({
           path: { id: sessionID },
           body: {
@@ -408,16 +436,24 @@ ENFORCEMENT (added by plan-review plugin):
               type: "text",
               text: `# plan-diag
 
-## Build model memory (in-memory)
+## /set-build-model overrides (in-memory)
 ${memEntries}
+
+## chat.message memory (last inline model per agent, from TUI picker)
+${chatEntries}
 
 ## Current session
 - sessionID: \`${sessionID}\`
 - last target resolved: ${lastResolution.target ? `${lastResolution.target.providerID}/${lastResolution.target.modelID} (source: ${lastResolution.source})` : "never called"}
 
-Diagnostic lines \`plan-review: session.updated: ...\` appear in opencode log for every session.updated event.
+Resolution priority on plan approval:
+1. chat.message memory for build agent (last picker choice)
+2. /set-build-model override
+3. agent.build.model from opencode.jsonc
+4. config.model global default
+5. opencode default
 
-Note: \`/set-build-model\` writes to the in-memory Map above (priority #1 in the chain). It does NOT persist across opencode restarts. For persistent switches, configure \`agent.build.model\` in opencode.jsonc.
+Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.message captured: ...\` appear in opencode log.
 `,
             }],
           },
@@ -457,7 +493,7 @@ Note: \`/set-build-model\` writes to the in-memory Map above (priority #1 in the
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, buildModels, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})

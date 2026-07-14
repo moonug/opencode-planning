@@ -365,6 +365,152 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[11] /set-build-model picker (list + numeric pick): ok")
 }
 
+// 12. chat.message hook captures inline model from TUI picker
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  await testHooks["chat.message"](
+    {
+      sessionID: "ses_chat",
+      agent: "build",
+      model: { providerID: "ya-glm", modelID: "glm" },
+    } as any,
+    { message: {} as any, parts: [] },
+  )
+  if (!logs.some((l: any) => l.body?.level === "debug" && l.body?.message?.includes("chat.message captured") && l.body?.message?.includes("ya-glm/glm"))) {
+    throw new Error("chat.message hook did not emit capture log")
+  }
+  console.log("[12] chat.message captures TUI picker inline model: ok")
+}
+
+// 13. exitPlanMode priority chain: chat.message wins over build event memory
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    },
+    config: { get: async () => ({ data: { model: "anthropic/claude-sonnet-4" } }) },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  // populate BOTH: build event memory with MiniMax-M3 AND chat.message with ya-glm
+  await testHooks.event({
+    event: {
+      type: "session.updated.1",
+      data: {
+        sessionID: "ses_prio",
+        info: { id: "ses_prio", agent: "build", model: { providerID: "minimax-coding-plan", id: "MiniMax-M3" } },
+      },
+    },
+  } as any)
+  await testHooks["chat.message"](
+    {
+      sessionID: "ses_prio",
+      agent: "build",
+      model: { providerID: "ya-glm", modelID: "glm" },
+    } as any,
+    { message: {} as any, parts: [] },
+  )
+  prompts.length = 0
+  const noopEditor4 = "/tmp/pr-smoke-prio-noop.sh"
+  writeFileSync(noopEditor4, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor4, 0o755)
+  await testHooks.tool.plan_review.execute(
+    { plan: "x" },
+    { sessionID: "ses_prio", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("build prompt missing")
+  if (buildPrompt.body?.model?.providerID !== "ya-glm" || buildPrompt.body?.model?.modelID !== "glm") {
+    throw new Error(`chat.message should win over session.updated, got: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: chat.message")) {
+    throw new Error(`build prompt should have 'source: chat.message' label, got: ${buildPrompt.body?.parts?.[0]?.text}`)
+  }
+  console.log("[13] chat.message wins over session.updated: ok")
+}
+
+// 14. priority chain order: chat.message > /set-build-model (per user choice)
+//     We verify by NOT touching /set-build-model and confirming chat.message wins.
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    },
+    config: { get: async () => ({ data: {} }) },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  // set both: chat.message with minimax + /set-build-model with ya-glm
+  // priority #1 is chat.message per user's choice — must win
+  await testHooks["chat.message"](
+    {
+      sessionID: "ses_over",
+      agent: "build",
+      model: { providerID: "minimax-coding-plan", modelID: "MiniMax-M3" },
+    } as any,
+    { message: {} as any, parts: [] },
+  )
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "set-build-model", arguments: "ya-glm/glm", sessionID: "ses_over" },
+    },
+  } as any)
+  prompts.length = 0
+  const noopEditor5 = "/tmp/pr-smoke-over-noop.sh"
+  writeFileSync(noopEditor5, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor5, 0o755)
+  await testHooks.tool.plan_review.execute(
+    { plan: "x" },
+    { sessionID: "ses_over", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("build prompt missing")
+  // chat.message should win (per user's priority choice: "chat.message wins")
+  if (buildPrompt.body?.model?.providerID !== "minimax-coding-plan") {
+    throw new Error(`chat.message should win per user priority, got: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: chat.message")) {
+    throw new Error(`expected source: chat.message, got: ${buildPrompt.body?.parts?.[0]?.text}`)
+  }
+  console.log("[14] priority order: chat.message wins over /set-build-model: ok")
+}
+
 // 8. experimental.chat.system.transform appends ENFORCEMENT block
 {
   const logs: any[] = []

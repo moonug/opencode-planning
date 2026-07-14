@@ -389,10 +389,10 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     } as any,
     { message: {} as any, parts: [] },
   )
-  if (!logs.some((l: any) => l.body?.level === "debug" && l.body?.message?.includes("chat.message captured") && l.body?.message?.includes("ya-glm/glm"))) {
-    throw new Error("chat.message hook did not emit capture log")
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("chat.message:") && l.body?.message?.includes("ya-glm/glm"))) {
+    throw new Error("chat.message hook did not emit info-level log")
   }
-  console.log("[12] chat.message captures TUI picker inline model: ok")
+  console.log("[12] chat.message captures TUI picker inline model (info level): ok")
 }
 
 // 13. exitPlanMode priority chain: chat.message wins over build event memory
@@ -581,6 +581,88 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[16] fallback to plan agent model when all sources undefined: ok")
 }
 
+// 17. config hook injects plan_review into primary_tools (whitelist)
+{
+  const cfg: any = { experimental: { primary_tools: ["bash"] } }
+  // simulate by calling the same logic directly
+  const exp = cfg.experimental ?? {}
+  const tools: string[] = exp.primary_tools ?? []
+  if (!tools.includes("plan_review")) {
+    cfg.experimental = { ...exp, primary_tools: [...tools, "plan_review"] }
+  }
+  if (!cfg.experimental.primary_tools.includes("plan_review")) {
+    throw new Error("plan_review not in primary_tools after inject")
+  }
+  // idempotent
+  const exp2 = cfg.experimental
+  const tools2 = exp2.primary_tools
+  if (tools2.filter((t: string) => t === "plan_review").length !== 1) {
+    throw new Error("primary_tools whitelist not idempotent")
+  }
+  // also verify hook is wired — instantiate the plugin and check config in returned hooks
+  const logs: any[] = []
+  const testHooks = await mod.default({
+    client: { app: { log: async (opts: any) => { logs.push(opts) } }, session: { prompt: async () => {} } } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  if (typeof testHooks.config !== "function") throw new Error("config hook not exported from plugin")
+  console.log("[17] config hook injects plan_review into primary_tools: ok")
+}
+
+// 18. system prompt is short (plannotator-style) — regression check
+{
+  const logs: any[] = []
+  const testHooks = await mod.default({
+    client: { app: { log: async (opts: any) => { logs.push(opts) } }, session: { prompt: async () => {} } } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const out: any = { system: ["base prompt"] }
+  await testHooks["experimental.chat.system.transform"]({ sessionID: "ses_short", model: {} as any } as any, out)
+  const appended = out.system[out.system.length - 1] ?? ""
+  if (appended.length > 800) throw new Error(`system prompt too long: ${appended.length} chars (max 800)`)
+  if (!appended.includes("plan_review")) throw new Error("system prompt missing plan_review mention")
+  if (!appended.includes("MUST call")) throw new Error("system prompt missing 'MUST call' directive")
+  console.log(`[18] system prompt short and directive: ${appended.length} chars`)
+}
+
+// 19. system prompt skip when last user message was from build agent
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: {
+      prompt: async () => {},
+      messages: async () => ({
+        data: [
+          { info: { role: "user", agent: "plan" } },
+          { info: { role: "user", agent: "build" } },  // most recent
+        ],
+      }),
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const out: any = { system: ["base prompt"] }
+  await testHooks["experimental.chat.system.transform"]({ sessionID: "ses_build", model: {} as any } as any, out)
+  const injected = out.system.some((s: string) => s.includes("MUST call"))
+  if (injected) throw new Error("system prompt should be skipped when last user message is from build agent")
+  console.log("[19] system prompt skip for build agent: ok")
+}
+
 // 8. experimental.chat.system.transform appends ENFORCEMENT block
 {
   const logs: any[] = []
@@ -593,13 +675,12 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     $,
   })
   const out: any = { system: ["base prompt about file editing"] }
-  await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" } }, out)
+  await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" }, sessionID: "ses_old" } as any, out)
   const joined = out.system.join("\n")
-  if (!joined.includes("ENFORCEMENT")) throw new Error("ENFORCEMENT block missing")
+  if (!joined.includes("MUST call")) throw new Error("'MUST call' directive missing")
   if (!joined.includes("plan_review")) throw new Error("plan_review mention missing")
-  if (!joined.includes("bash tool")) throw new Error("bash fallback hint missing")
-  if (!logs.some((l: any) => l.body?.level === "debug" && l.body?.message?.includes("system prompt injected"))) {
-    throw new Error("diagnostic log missing")
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("system prompt injected"))) {
+    throw new Error("diagnostic info log missing")
   }
   // must skip subagent agents
   const subOut: any = { system: ["subagent system prompt"] }

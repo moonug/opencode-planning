@@ -275,6 +275,20 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   return {
     tool: { plan_review },
 
+    // Whitelist plan_review in primary_tools (mirrors plannotator). Keeps the
+    // tool visible to primary agents even when an `agent.tools` map would
+    // otherwise filter it out.
+    config: async (opencodeConfig) => {
+      const exp = (opencodeConfig as any).experimental ?? {}
+      const tools: string[] = exp.primary_tools ?? []
+      if (!tools.includes("plan_review")) {
+        ;(opencodeConfig as any).experimental = {
+          ...exp,
+          primary_tools: [...tools, "plan_review"],
+        }
+      }
+    },
+
     "chat.message": async (input, _output) => {
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
@@ -288,38 +302,38 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
         })
         await log(
           client,
-          "debug",
-          `chat.message captured: agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
+          "info",
+          `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
         ).catch(() => {})
       }
     },
 
-    "experimental.chat.system.transform": async (_input, output) => {
+    "experimental.chat.system.transform": async (input, output) => {
       const joined = output.system.join("\n").toLowerCase()
-      if (joined.includes("subagent") || joined.includes("title generator")) return
+      if (joined.includes("title generator") || joined.includes("subagent")) return
+      // Skip injection for the build agent (mirrors plannotator's skip).
+      if (input.sessionID) try {
+        const msgs = await client.session.messages({ path: { id: input.sessionID } })
+        const data = (msgs as any)?.data ?? msgs
+        const list = Array.isArray(data) ? data : []
+        for (let i = list.length - 1; i >= 0; i--) {
+          const m = list[i]
+          if (m?.info?.role === "user" && m?.info?.agent) {
+            if (m.info.agent === "build") return
+            break
+          }
+        }
+      } catch {}
       output.system.push(`
-# Plan Review REQUIRED (this is a plan-mode session)
+## Plan Review
 
-You are operating in opencode's plan agent. In this mode, the user reviews plans via the \`plan_review\` tool — NOT by reading inline text responses.
+When you have completed your plan, you MUST call the \`plan_review\` tool to submit it for user review. The user can annotate, approve, or request changes.
 
-After producing a structured plan in your reasoning or response, your NEXT assistant turn MUST be a single tool call:
+If your plan is rejected, you will receive feedback — revise the plan and call \`plan_review\` again.
 
-  tool_call({ name: "plan_review", args: { plan: "<full markdown plan>" } })
-
-Do NOT:
-- Write the plan inline as a plain text response and stop.
-- Ask "should I open in editor or proceed?" — the answer is always editor.
-- Skip this step even if you think the plan is final.
-
-Do NOT proceed to implementation, do not write code, do not run commands, do not call other tools, until plan_review returns "no changes" (empty diff = user approved). If it returns a unified diff, revise the plan and call plan_review again.
-
-ENFORCEMENT (added by plan-review plugin):
-- \`plan_review\` IS in your available tools right now. Call it directly — do not narrate that you "would call" it.
-- Your reply after drafting the plan must be EXACTLY ONE tool call to plan_review. No prose, no markdown summary outside the tool args, no questions.
-- If you write the plan as a plain text response instead, the user will see no plan-review prompt, the editor will not open, and you have failed this contract. The user has to nudge you manually and that wastes a turn.
-- If plan_review is not in your toolset for any reason, fall back to running \`bin/plan-review.py --plan-text "<markdown>"\` via the bash tool and treat its stdout as feedback.
+Do NOT proceed with implementation until the plan is approved.
 `)
-      await log(client, "debug", `plan-review: system prompt injected (${output.system.length} blocks total, ${output.system[output.system.length - 1]!.length} chars appended)`).catch(() => {})
+      await log(client, "info", `plan-review: system prompt injected (${output.system.length} blocks, ${output.system[output.system.length - 1]!.length} chars)`).catch(() => {})
     },
 
     event: async ({ event }) => {

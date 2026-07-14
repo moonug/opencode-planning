@@ -86,6 +86,20 @@ async function getBuildAgentModel(client: any): Promise<ModelRef | undefined> {
   return undefined
 }
 
+async function getPlanAgentModel(client: any): Promise<ModelRef | undefined> {
+  try {
+    const res = await client.app.agents()
+    const agents = (res as any)?.data ?? res
+    const planAgent = (Array.isArray(agents) ? agents : []).find(
+      (a: any) => a.name === "plan" || a.id === "plan"
+    )
+    if (planAgent?.model?.providerID && planAgent?.model?.modelID) {
+      return { providerID: planAgent.model.providerID, modelID: planAgent.model.modelID }
+    }
+  } catch {}
+  return undefined
+}
+
 async function getGlobalModel(client: any): Promise<ModelRef | undefined> {
   try {
     const res = await client.config.get()
@@ -149,8 +163,9 @@ async function exitPlanMode(
   const overridden = buildModels.get(sessionID)
   const perAgent = chatMessageMemory.get(sessionID)
   const fromChat = perAgent?.get("build")
-  const [agentCfg, globalCfg] = await Promise.all([
+  const [agentCfg, planCfg, globalCfg] = await Promise.all([
     withTimeoutSafe(getBuildAgentModel(client), 2000, undefined),
+    withTimeoutSafe(getPlanAgentModel(client), 2000, undefined),
     withTimeoutSafe(getGlobalModel(client), 2000, undefined),
   ])
 
@@ -160,6 +175,7 @@ async function exitPlanMode(
   else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
+  else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }
   else                  { source = "opencode default" }
 
   lastResolution.target = target

@@ -531,6 +531,56 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[15] init + tool registration logs emitted: ok")
 }
 
+// 16. priority chain fallback: all 4 sources undefined, plan agent model wins
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      // build agent has NO model, plan agent has MiniMax-M3
+      agents: async () => ({
+        data: [
+          { name: "build", model: null },
+          { name: "plan", model: { providerID: "minimax-coding-plan", modelID: "MiniMax-M3" } },
+        ],
+      }),
+    },
+    config: { get: async () => ({ data: {} }) },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  prompts.length = 0
+  const noopEditorFB = "/tmp/pr-smoke-fb-noop.sh"
+  writeFileSync(noopEditorFB, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditorFB, 0o755)
+  await testHooks.tool.plan_review.execute(
+    { plan: "x" },
+    { sessionID: "ses_fb", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("build prompt missing for fallback case")
+  if (buildPrompt.body?.model?.providerID !== "minimax-coding-plan" ||
+      buildPrompt.body?.model?.modelID !== "MiniMax-M3") {
+    throw new Error(`fallback should pick plan agent model, got: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: agent.plan.model (fallback)")) {
+    throw new Error("build prompt text missing fallback source label: " + buildPrompt.body?.parts?.[0]?.text)
+  }
+  if (buildPrompt.body?.parts?.[0]?.text?.includes("No build model resolved")) {
+    throw new Error("refusal text should not appear when fallback resolved a model")
+  }
+  console.log("[16] fallback to plan agent model when all sources undefined: ok")
+}
+
 // 8. experimental.chat.system.transform appends ENFORCEMENT block
 {
   const logs: any[] = []

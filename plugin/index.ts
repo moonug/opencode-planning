@@ -170,6 +170,7 @@ async function exitPlanMode(
   chatMessageMemory: Map<string, Map<string, ModelRef>>,
   lastResolution: { target?: ModelRef; source?: string },
   lastGlobalPicker: (() => ModelRef | undefined) | undefined,
+  lastSession: () => { agent?: string; model?: ModelRef } | undefined,
   sessionID: string | undefined,
   summary: string,
 ): Promise<void> {
@@ -190,6 +191,12 @@ async function exitPlanMode(
   // plugin init). In tests the default is undefined so the picker
   // source does not leak across test runs.
   const fromPicker = lastGlobalPicker?.()
+  // lastSession is the session.list[0] probe populated at init, refreshed
+  // by session.updated.1 events. Use it as a fallback when neither
+  // chat.message nor session.updated.1 has given us a per-session agent
+  // (e.g. user changed picker without sending a message).
+  const sess = lastSession?.()
+  const fromLastSession = sess?.agent === "build" ? sess.model : undefined
 
   let source: string
   let target: ModelRef | undefined
@@ -199,6 +206,7 @@ async function exitPlanMode(
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
   else if (fromPicker)   { target = fromPicker;   source = "picker (model.json recent[0])" }
+  else if (fromLastSession) { target = fromLastSession; source = "session.list[0] (build agent)" }
   else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }
   else                  { source = "opencode default" }
 
@@ -285,6 +293,21 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch(() => {})
         await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch(() => {})
         await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch(() => {})
+        // Populate fallback state from session.list[0]. The runtime response
+        // carries `agent` and `model` even though the v1 SDK Session type
+        // doesn't declare them — see diag logs above. This is the most
+        // recent session, so its agent is a reasonable proxy for "which
+        // agent the user is currently in" when no chat.message or
+        // session.updated.1 has fired yet.
+        const firstAgent = (first as any)?.agent
+        if (typeof firstAgent === "string" && firstAgent) {
+          lastSessionAgent = firstAgent
+        }
+        const m = (first as any)?.model
+        if (m && (m.providerID || m.id)) {
+          lastSessionModel = { providerID: m.providerID, modelID: m.id }
+        }
+        await log(client, "info", `diag.session.list.first.populated: agent=${lastSessionAgent ?? "?"} model=${lastSessionModel?.providerID ?? "?"}/${lastSessionModel?.modelID ?? "?"}`).catch(() => {})
       } catch (e) {
         await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch(() => {})
       }
@@ -325,6 +348,16 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   // from session.updated.1 events. Used to attribute picker changes in
   // model.json to a specific agent (model.json has no agent field).
   const lastActiveAgents = new Map<string, { agent: string; model?: ModelRef }>()
+
+  // Fallback for when neither chat.message nor session.updated.1 has fired
+  // (e.g. user changed the picker in the TUI without sending a message).
+  // session.list({query:{limit:1}}) returns the most recent session in
+  // runtime response, and that session has an `agent` field — populated
+  // by the init probe below. Note: this is the LAST session's agent, not
+  // necessarily the CURRENT one, but in practice the user usually keeps
+  // working in the same session.
+  let lastSessionAgent: string | undefined
+  let lastSessionModel: ModelRef | undefined
   const MODEL_JSON_PATH = process.env.PLAN_REVIEW_MODEL_JSON
     ?? `${homedir()}/.local/state/opencode/model.json`
   let lastGlobalPicker: ModelRef | undefined = readPickerState(MODEL_JSON_PATH)
@@ -348,6 +381,13 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
             if (info.model && info.model.providerID === m.providerID && info.model.modelID === m.modelID) {
               matchedAgent = info.agent
             }
+          }
+          // Fallback: if no per-session match (no chat.message or
+          // session.updated.1 fired yet), use lastSessionAgent from the
+          // session.list[0] probe. This is the most recent session's
+          // agent, which is usually the agent the user is in now.
+          if (!matchedAgent && lastSessionAgent) {
+            matchedAgent = lastSessionAgent
           }
           // Read full recent[] timeline from model.json. opencode stores
           // picker history as an ordered array; recent[0] is current,
@@ -394,7 +434,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, () => ({ agent: lastSessionAgent, model: lastSessionModel }), context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -561,6 +601,14 @@ Do NOT proceed with implementation until the plan is approved.
                 agent: info.agent,
                 model: providerID && modelID ? { providerID, modelID } : prev?.model,
               })
+            }
+            // Keep lastSessionAgent/lastSessionModel fresh — they shadow
+            // the session.list[0] probe at init. When session.updated.1
+            // fires, the event's info object is more authoritative than
+            // the initial probe, so we update with it.
+            lastSessionAgent = info.agent
+            if (providerID && modelID) {
+              lastSessionModel = { providerID, modelID }
             }
           }
         }
@@ -739,7 +787,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, () => ({ agent: lastSessionAgent, model: lastSessionModel }), sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})

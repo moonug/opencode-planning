@@ -69,6 +69,9 @@ interface TuiClient {
 interface TuiApi {
   client: TuiClient
   keymap: TuiKeymap
+  event: {
+    on: (type: string, handler: (event: any) => void) => () => void
+  }
 }
 
 // Self-install: symlink this TUI plugin into ~/.config/opencode/plugins/
@@ -223,6 +226,30 @@ const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
       })
       .catch(() => {})
   }
+
+  // Subscribe to chat.message hook on the TUI client. Every user
+  // message — including the one our own session.prompt fake creates —
+  // fires this with input.agent = the actual current agent. That gives
+  // us a real-time prevAgent for computeNext, replacing the unreliable
+  // session.list[0].agent initialization above. (Without this, the
+  // live test showed prev=explore because session.list returned a
+  // subagent child session as the most recently updated.)
+  api.event.on("chat.message", (msg: any) => {
+    const m = msg as { agent?: string; sessionID?: string }
+    if (typeof m.agent === "string" && m.agent) {
+      prevAgent = m.agent
+      if (typeof m.sessionID === "string" && m.sessionID) {
+        sessionID = m.sessionID
+      }
+      void api.client.app
+        .log({
+          service: "plan-review-tui",
+          level: "info",
+          message: `plan-review-TUI: chat.message update: prevAgent=${prevAgent}${sessionID ? ` sessionID=${sessionID}` : ""}`,
+        })
+        .catch(() => {})
+    }
+  })
 
   api.keymap.intercept(
     "key",

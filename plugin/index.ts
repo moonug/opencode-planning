@@ -1,5 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync, watch } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, lstatSync, chmodSync, statSync, copyFileSync, watch } from "node:fs"
 import { dirname, resolve, join, basename } from "node:path"
 import { homedir as osHomedir } from "node:os"
 
@@ -93,6 +93,21 @@ function ensureCommandSymlink(): void {
     const tuiPluginPath = join(REPO_DIR, "plugin", "tui-plugin.ts")
     const tuiJsonPath = join(homedir(), ".config", "opencode", "tui.jsonc")
     const tuiJsonLegacy = join(homedir(), ".config", "opencode", "tui.json")
+    // Always remove a legacy symlink at ~/.config/opencode/plugins/
+    // plan-review-tui.ts. That path is server-plugin territory and the
+    // server loader requires .server() export on whatever it loads —
+    // a TUI plugin there produces 'must default export an object with
+    // server()' and clutters every opencode startup with a failed
+    // plugin load log. Earlier install iterations (before tui.json was
+    // adopted) created this symlink; we now delete it on every init.
+    const legacySymlink = join(homedir(), ".config", "opencode", "plugins", "plan-review-tui.ts")
+    try {
+      const stat = lstatSync(legacySymlink)
+      if (stat.isSymbolicLink()) {
+        unlinkSync(legacySymlink)
+      }
+    } catch {}
+
     let existing: string | undefined
     try { existing = readFileSync(tuiJsonPath, "utf8") } catch {}
     if (existing === undefined) {
@@ -611,6 +626,26 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         })
       }
 
+      // Update the agent cache. The TUI plugin issues
+      // client.session.prompt({noReply:true, agent: to, parts: ["."]}) on
+      // every Tab/Shift+Tab cycle to inform the server of agent
+      // switches (because v2.session.switchAgent's event is dropped by
+      // the server plugin's location filter at
+      // packages/opencode/src/plugin/index.ts:252). That session.prompt
+      // call goes through packages/opencode/src/session/prompt.ts:999
+      // which fires the chat.message plugin hook for every user message
+      // — including programmatic ones with noReply: true (per source,
+      // createUserMessage always runs). So this handler is the
+      // REAL reliable sink for agent-switch notifications, even when
+      // the picker hasn't been touched yet. We update both
+      // chatMessageMemory[agent]=model (existing behavior) AND
+      // lastSessionAgent/lastSessionID (new — keeps the picker
+      // attribution cache in sync so model.json changes after a Tab
+      // cycle land on the right agent).
+      if (input.sessionID && input.agent) {
+        lastSessionAgent = input.agent
+        lastSessionID = input.sessionID
+      }
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
         if (!perSession) {
@@ -665,42 +700,16 @@ Do NOT proceed with implementation until the plan is approved.
     event: async ({ event }) => {
       const e = event as any
 
-      // one-shot diagnostic: enumerate the FIRST 3 non-sync events so we can
-      // see what event types actually arrive at the server plugin's event
-      // hook and what their payload shape is. Particularly useful for
-      // verifying whether session.next.agent.switched (the event that
-      // v2.session.switchAgent publishes through packages/core/src/session.ts:393)
-      // actually reaches this plugin. Useful for the next time the live
-      // picker-attribution path shows wrong behavior and we need to
-      // confirm the server plugin is even seeing the event.
-      if (e?.type && e.type !== "sync" && !(globalThis as any).__planReviewEventDiscoveryDone) {
-        const counterKey = "__planReviewEventDiscoveryCount"
-        const count = ((globalThis as any)[counterKey] ?? 0) + 1
-        ;(globalThis as any)[counterKey] = count
-        if (count <= 3) {
-          const keys = Object.keys(e)
-          const propertiesKeys = e.properties ? Object.keys(e.properties) : []
-          await logged(client, "info",
-            `plan-review: diag event discovery #${count}: type=${e.type} keys=[${keys.join(",")}] propertiesKeys=[${propertiesKeys.join(",")}] hasTopLevelSessionID=${typeof e.sessionID} hasTopLevelAgent=${typeof e.agent} hasTopLevelModel=${typeof e.model}`,
-          )
-          if (count >= 3) {
-            ;(globalThis as any).__planReviewEventDiscoveryDone = true
-          }
-        }
-      }
-
-      // one-shot diagnostic: on first session.* event, dump the info object's
-      // keys so we can see what fields the server actually returns (the v1 SDK
-      // Session type doesn't declare agent/model but runtime may have them)
-      if (e.type?.startsWith?.("session.") && !(globalThis as any).__planReviewEventProbeDone) {
-        ;(globalThis as any).__planReviewEventProbeDone = true
-        try {
-          const info = e.properties?.info ?? e.data?.info ?? {}
-          await log(client, "info", `diag.event.${e.type}.info.keys: ${JSON.stringify(Object.keys(info))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L675): ${(e as Error)?.message ?? String(e)}`) })
-          await log(client, "info", `diag.event.${e.type}.info.agent: ${(info as any)?.agent ?? "<undefined>"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L676): ${(e as Error)?.message ?? String(e)}`) })
-          await log(client, "info", `diag.event.${e.type}.info.model: ${JSON.stringify((info as any)?.model)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L677): ${(e as Error)?.message ?? String(e)}`) })
-        } catch {}
-      }
+      // Diagnostic block removed. Earlier iterations logged the first
+      // few event types the server plugin received (plan-review: diag
+      // event discovery #N). That served its purpose: it proved that
+      // session.* events are filtered out by the server plugin event
+      // hook at packages/opencode/src/plugin/index.ts:252 (only
+      // plugin.added events reach us, nothing else). Per AGENTS.md,
+      // diagnostic code that has done its job should not stay. We
+      // removed it once we understood the actual signal flow and
+      // confirmed the chat.message handler is what we should rely on
+      // for agent-switch notifications.
 
       // diagnostic log: surface every session.updated variant we receive
       if (e.type === "session.updated" || e.type === "session.updated.1") {
@@ -709,48 +718,17 @@ Do NOT proceed with implementation until the plan is approved.
            await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L685): ${(e as Error)?.message ?? String(e)}`) })
          }
        }
-      // session.next.* events are published by V2 SDK calls
-      // (client.v2.session.switchAgent / switchModel). switchAgent goes
-      // through packages/core/src/session.ts:393 (V2Session layer)
-      // which calls events.publish(SessionEvent.AgentSwitched, ...).
-      // The EventV2.Service fires events.listen() callbacks,
-      // EventV2Bridge forwards them via GlobalBus.emit("event", ...),
-      // and the server plugin runtime pumps them into the plugin's
-      // `event` hook (the inner `event` argument carries type plus a
-      // properties object — see packages/sdk/js/src/v2/gen/types.gen.ts:6246
-      // and packages/schema/src/session-event.ts:54).
-      //
-      // IMPORTANT: the plugin's runtime filters out events with
-      // type === "sync" (those are the durable/sync variants whose
-      // names end in ".1" — see packages/tui/src/context/event.ts:14).
-      // We therefore match the non-suffixed type names here. The
-      // payload lives under `.properties`, NOT at the top level.
-      if (e.type === "session.next.agent.switched") {
-        const props = (e.properties ?? {}) as { sessionID?: string; agent?: string }
-        const nextAgent = props.agent
-        const nextSid = props.sessionID
-        if (typeof nextAgent === "string" && nextAgent && typeof nextSid === "string" && nextSid) {
-          lastSessionAgent = nextAgent
-          lastSessionID = nextSid
-          await logged(client, "info",
-            `plan-review: tab switch via session.next.agent.switched: session=${nextSid} -> ${nextAgent}`,
-          )
-        }
-      }
-      if (e.type === "session.next.model.switched") {
-        const props = (e.properties ?? {}) as { sessionID?: string; model?: { providerID?: string; id?: string; modelID?: string } }
-        const nextModel = props.model
-        const nextSid = props.sessionID
-        const providerID = nextModel?.providerID
-        const modelID = nextModel?.id ?? nextModel?.modelID
-        if (nextModel && providerID && modelID && typeof nextSid === "string" && nextSid) {
-          lastSessionModel = { providerID, modelID }
-          lastSessionID = nextSid
-          await logged(client, "info",
-            `plan-review: tab switch via session.next.model.switched: session=${nextSid} -> ${providerID}/${modelID}`,
-          )
-        }
-      }
+      // Note: session.next.agent.switched and session.next.model.switched
+      // events are NOT handled here. They are published by v2 SDK calls
+      // (client.v2.session.switchAgent / switchModel) but the server
+      // plugin's event hook at packages/opencode/src/plugin/index.ts:252
+      // filters out events with undefined event.location.directory — and
+      // session.next.* events come through EventV2.Service (no location
+      // context), so they are silently dropped before reaching any plugin.
+      // The TUI plugin's session.prompt fallback (which fires the
+      // chat.message hook — see packages/opencode/src/session/prompt.ts:999)
+      // is what actually carries the agent-switch signal. Keep the
+      // chat.message handler in sync with the latest agent.
 
       try {
         rememberBuildModel(e, buildModels)

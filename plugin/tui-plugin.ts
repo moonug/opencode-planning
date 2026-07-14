@@ -81,7 +81,7 @@ export function ensureTuiPluginSymlink(pluginPath: string, id = "plan-review-tui
   return link
 }
 
-const tuiPlugin = async ({ api }: { api: TuiApi }) => {
+const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
   // closure state for this TUI session (in-memory only, lost on restart)
   let prevAgent: string | undefined
   let sessionID: string | undefined
@@ -162,4 +162,12 @@ const tuiPlugin = async ({ api }: { api: TuiApi }) => {
   )
 }
 
-export default tuiPlugin
+// opencode's TUI plugin loader (packages/opencode/src/plugin/shared.ts:272-303)
+// requires: export default { id, tui } — NOT a direct function. The default
+// export must be an object with a tui() method that the loader calls per
+// activate. Without { id, tui } wrapping, PluginLoader.readV1Plugin throws
+// "Plugin <spec> must default export an object with tui()".
+export default {
+  id: "plan-review-tui",
+  tui: tuiPlugin,
+}

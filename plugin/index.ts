@@ -1,7 +1,19 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync, watch } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync, watch } from "node:fs"
 import { dirname, resolve, join, basename } from "node:path"
-import { homedir } from "node:os"
+import { homedir as osHomedir } from "node:os"
+
+// On macOS, node:os's homedir() falls back to /etc/passwd when HOME is
+// unset or invalid, regardless of process.env.HOME. This makes it
+// awkward to test, and in some sandboxed processes (opencode's server
+// can spawn child processes with a reduced env) it can return the
+// build user's home instead of the runtime user's. Prefer
+// process.env.HOME, fall back to homedir() only when unset/empty.
+function homedir(): string {
+  const fromEnv = process.env.HOME
+  if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv
+  return osHomedir()
+}
 import { rememberBuildModel, type ModelRef } from "./model-memory"
 
 const PLUGIN_DIR = dirname(new URL(import.meta.url).pathname)
@@ -56,28 +68,40 @@ function ensureCommandSymlink(): void {
       copyFileSync(source, linkPath)
     }
   }
-  // also install the TUI plugin so the TUI process can forward Tab
-  // agent switches to the server plugin's metadata handler. Without
-  // this, the opencode TUI agent state stays in-memory and the server
-  // cannot attribute picker changes to a specific agent.
+  // also register the TUI plugin via tui.json so the opencode TUI
+  // plugin host picks it up on launch. Without this, the TUI's local
+  // agent state (which is purely in-memory in a private SolidJS store
+  // that is not exposed through TuiPluginApi) cannot be observed, and
+  // the server plugin cannot attribute model.json picker changes to
+  // the agent the user is actually in. The TUI plugin's keymap.intercept
+  // handler fires on Tab/Shift+Tab and forwards the resulting agent
+  // change to the server via client.session.update({metadata:{...}}).
+  //
+  // NOTE: TUI plugins are NOT auto-discovered from
+  // ~/.config/opencode/plugins/ — that path is server-side only and
+  // tries to load the file as a server plugin (which fails with
+  // 'must default export an object with server()'). TUI plugins
+  // MUST be registered in tui.json (or tui.jsonc) under the 'plugin'
+  // field, see packages/opencode/src/config/tui.ts:89.
   try {
     const tuiPluginPath = join(REPO_DIR, "plugin", "tui-plugin.ts")
-    const pluginsDir = join(homedir(), ".config", "opencode", "plugins")
-    mkdirSync(pluginsDir, { recursive: true })
-    const link = join(pluginsDir, "plan-review-tui.ts")
-    try {
-      const existing = readlinkSync(link)
-      if (resolve(existing) === resolve(tuiPluginPath)) return
-      unlinkSync(link)
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        try { unlinkSync(link) } catch {}
-      }
+    const tuiJsonPath = join(homedir(), ".config", "opencode", "tui.jsonc")
+    const tuiJsonAlt = join(homedir(), ".config", "opencode", "tui.json")
+    let existing: string | undefined
+    try { existing = readFileSync(tuiJsonPath, "utf8") } catch {}
+    if (existing === undefined) {
+      try { existing = readFileSync(tuiJsonAlt, "utf8") } catch {}
     }
-    try {
-      symlinkSync(tuiPluginPath, link)
-    } catch {
-      copyFileSync(tuiPluginPath, link)
+    let parsed: any = {}
+    if (existing) {
+      try { parsed = JSON.parse(existing) } catch {}
+    }
+    const plugins = Array.isArray(parsed.plugin) ? parsed.plugin : []
+    if (!plugins.includes(tuiPluginPath)) {
+      plugins.push(tuiPluginPath)
+      parsed.plugin = plugins
+      try { mkdirSync(dirname(tuiJsonPath), { recursive: true }) } catch {}
+      writeFileSync(tuiJsonPath, JSON.stringify(parsed, null, 2) + "\n")
     }
   } catch {}
 }

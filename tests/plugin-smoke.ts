@@ -761,43 +761,23 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[37] lastSessionAgent=plan populated correctly: ok")
 }
 
-// 38. TUI plugin: server snapshot of session.list[0] populates initial agent,
-//     and intercept handler is registered. Use dynamic import so the
-//     smoke runs in the same process as the server plugin (both are TS).
+// 38. TUI plugin module exports { id, tui } — required by opencode's
+//     PluginLoader.readV1Plugin which throws "must default export an
+//     object with tui()" otherwise. Confirm id is "plan-review-tui"
+//     and tui is a function.
 {
-  const tuiPlugin = (await import("../plugin/tui-plugin.ts" as any)).default
-  const updates: any[] = []
-  const interceptCalls: any[] = []
-  const fakeApi = {
-    client: {
-      session: {
-        list: async () => ({ data: [{ id: "ses_tui", agent: "build" }] }),
-        get: async () => ({ data: { agent: "build" } }),
-        update: async (opts: any) => { updates.push(opts); return {} },
-      },
-      app: {
-        agents: async () => ({ data: [
-          { name: "plan", mode: "primary" },
-          { name: "build", mode: "primary" },
-        ] }),
-      },
-    },
-    keymap: {
-      intercept: (_type: string, handler: any) => { interceptCalls.push(handler); return () => {} },
-    },
-  }
-  await tuiPlugin({ api: fakeApi as any })
-  if (interceptCalls.length !== 1) throw new Error("intercept should be registered once, got: " + interceptCalls.length)
-  console.log("[38] TUI plugin init registers intercept handler: ok")
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const exp = mod.default as any
+  if (!exp || typeof exp !== "object") throw new Error("default export must be an object, got: " + typeof exp)
+  if (exp.id !== "plan-review-tui") throw new Error("default.id should be 'plan-review-tui', got: " + exp.id)
+  if (typeof exp.tui !== "function") throw new Error("default.tui must be a function, got: " + typeof exp.tui)
+  console.log("[38] TUI plugin exports { id, tui } object: ok")
 }
 
-// 39. TUI plugin: Tab key triggers session.update with tabSwitchTo metadata,
-//     Shift+Tab reverses. Verify prevAgent cycle and update calls.
+// 39. TUI plugin tui() registers intercept handler and Tab cycles agents
 {
-  // use module-level reset: re-import tui-plugin — but it's the same module
-  // due to bun's import cache. Use a fresh route via a helper: pre-load the
-  // module and snapshot the handler.
-  const tuiPlugin = (await import("../plugin/tui-plugin.ts" as any)).default
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
   const updates: any[] = []
   let handlerFn: any = null
   const fakeApi = {
@@ -818,7 +798,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       intercept: (_type: string, handler: any) => { handlerFn = handler; return () => {} },
     },
   }
-  await tuiPlugin({ api: fakeApi as any })
+  await tuiPluginFn(fakeApi, undefined, undefined)
   if (!handlerFn) throw new Error("intercept handler not registered")
   // 1st Tab: build -> plan (forward)
   handlerFn({ event: { name: "tab" } })
@@ -873,26 +853,66 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[40] server event hook reads metadata.planReviewTabSwitchTo: ok")
 }
 
-// 41. ensureCommandSymlink installs plan-review-tui.ts in ~/.config/opencode/plugins/
-//     — verify the helper's filesystem effect without touching real user state.
+// 41. tui.json (or tui.jsonc) registration via ensureCommandSymlink —
+//     TUI plugins are NOT auto-discovered from ~/.config/opencode/plugins/
+//     (that path is server-side only), they MUST be in tui.json plugin[].
+//     Verify the helper writes the entry under a fake HOME.
 {
-  const tmp = `${process.env.PLAN_REVIEW_MODEL_JSON}.plugins`
+  const tmp = `${process.env.PLAN_REVIEW_MODEL_JSON}.tui-json`
   const fs = await import("node:fs")
+  fs.mkdirSync(tmp, { recursive: true })
+  fs.mkdirSync(`${tmp}/.config/opencode`, { recursive: true })
   const old = process.env.HOME
   process.env.HOME = tmp
   try {
-    fs.mkdirSync(`${tmp}/.config/opencode/plugins`, { recursive: true })
-    // re-import plugin module under a fresh HOME
-    const modFresh = await import(`${import.meta.dir}/../plugin/index.ts` as any)
-    // The plugin's init may run during import — call ensureCommandSymlink via
-    // modFresh if exposed; otherwise just verify the installer function exists
-    // by checking the package.json exports
-    const pkg = JSON.parse(fs.readFileSync(`${import.meta.dir}/../plugin/package.json`, "utf8"))
-    if (!pkg.exports || !pkg.exports["./tui"]) throw new Error("package.json exports['./tui'] missing")
-    if (pkg.exports["./tui"] !== "./tui-plugin.ts") throw new Error("./tui export should point to tui-plugin.ts, got: " + pkg.exports["./tui"])
-    // suppress unused-var noise
-    void modFresh
-    console.log("[41] package.json exports TUI plugin at ./{tui}: ok")
+    const { homedir } = await import("node:os")
+    process.env.HOME = tmp
+    console.log("smoke [41] before mod.default, HOME=" + process.env.HOME + ", homedir()=" + homedir() + ", tmp=" + tmp)
+    // invoke ensureCommandSymlink via mod.default's init
+    try {
+      const result = await mod.default({
+        client: {
+          app: { log: async () => {}, agents: async () => ({ data: [] }) } as any,
+          session: { prompt: async () => {} },
+        } as any,
+        project: {} as any,
+        directory: "/tmp",
+        worktree: "/tmp",
+        serverUrl: new URL("http://x"),
+        $,
+      })
+      console.log("smoke [41] mod.default returned, has event=" + (typeof result?.event))
+    } catch (e) {
+      console.log("smoke [41] mod.default error (expected): " + (e as Error).message)
+    }
+    // plugin init runs in background (queueMicrotask), wait briefly
+    await new Promise(r => setTimeout(r, 100))
+    console.log("smoke [41] after wait, homedir()=" + homedir())
+    let fakeListing: string[] = []
+    try { fakeListing = fs.readdirSync(`${tmp}/.config/opencode`) } catch {}
+    console.log("smoke [41] after wait, listing " + tmp + "/.config/opencode: " + JSON.stringify(fakeListing))
+    // also check real HOMEdir for any accidental writes
+    let realListing: string[] = []
+    try { realListing = fs.readdirSync(`/Users/moonug/.config/opencode`) } catch {}
+    console.log("smoke [41] real HOME listing: " + JSON.stringify(realListing.filter((f: string) => f.includes('tui'))))
+    const candidates = ["tui.jsonc", "tui.json"]
+    let found: string | undefined
+    for (const c of candidates) {
+      const p = `${tmp}/.config/opencode/${c}`
+      if (fs.existsSync(p)) { found = p; break }
+    }
+    if (!found) {
+      let listing: string[] = []
+      try { listing = fs.readdirSync(`${tmp}/.config/opencode`) } catch {}
+      throw new Error("tui.json(c) was not written. List of " + tmp + "/.config/opencode/: " + JSON.stringify(listing))
+    }
+    const raw = fs.readFileSync(found, "utf8")
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed.plugin)) throw new Error("tui.json plugin[] missing")
+    if (!parsed.plugin.some((p: any) => typeof p === "string" && p.includes("tui-plugin.ts"))) {
+      throw new Error("tui.json plugin[] should contain tui-plugin.ts path, got: " + JSON.stringify(parsed.plugin))
+    }
+    console.log("[41] ensureCommandSymlink writes tui.json plugin[] entry: ok")
   } finally {
     process.env.HOME = old
   }

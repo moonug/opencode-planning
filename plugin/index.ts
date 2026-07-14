@@ -181,6 +181,12 @@ async function exitPlanMode(
   lastResolution.target = target
   lastResolution.source = source
 
+  await log(
+    client,
+    "info",
+    `plan-review: exitPlanMode resolution: session=${sessionID} target=${target ? `${target.providerID}/${target.modelID}` : "undefined"} source=${source}`,
+  ).catch(() => {})
+
   if (!target) {
     await log(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`).catch(() => {})
     try {
@@ -279,17 +285,28 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
     // tool visible to primary agents even when an `agent.tools` map would
     // otherwise filter it out.
     config: async (opencodeConfig) => {
-      const exp = (opencodeConfig as any).experimental ?? {}
-      const tools: string[] = exp.primary_tools ?? []
-      if (!tools.includes("plan_review")) {
-        ;(opencodeConfig as any).experimental = {
-          ...exp,
-          primary_tools: [...tools, "plan_review"],
+      await log(client, "info", "plan-review: config hook fired").catch(() => {})
+      try {
+        const exp = (opencodeConfig as any).experimental ?? {}
+        const tools: string[] = exp.primary_tools ?? []
+        if (!tools.includes("plan_review")) {
+          ;(opencodeConfig as any).experimental = {
+            ...exp,
+            primary_tools: [...tools, "plan_review"],
+          }
+          await log(client, "info", `plan-review: config hook added plan_review to primary_tools (count=${tools.length + 1})`).catch(() => {})
         }
+      } catch (err) {
+        await log(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`).catch(() => {})
       }
     },
 
     "chat.message": async (input, _output) => {
+      await log(
+        client,
+        "info",
+        `plan-review: chat.message HOOK FIRED: session=${input.sessionID ?? "?"} agent=${input.agent ?? "?"} model=${input.model?.providerID ?? "?"}/${input.model?.modelID ?? "?"}`,
+      ).catch(() => {})
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
         if (!perSession) {
@@ -309,6 +326,11 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
     },
 
     "experimental.chat.system.transform": async (input, output) => {
+      await log(
+        client,
+        "info",
+        `plan-review: system.transform HOOK FIRED: session=${input.sessionID ?? "?"} system_blocks=${output.system.length}`,
+      ).catch(() => {})
       const joined = output.system.join("\n").toLowerCase()
       if (joined.includes("title generator") || joined.includes("subagent")) return
       // Skip injection for the build agent (mirrors plannotator's skip).
@@ -352,6 +374,15 @@ Do NOT proceed with implementation until the plan is approved.
 
       try {
         rememberBuildModel(e, buildModels)
+        // log when build agent model captured
+        if (e.type === "session.updated" || e.type === "session.updated.1") {
+          const info = e.properties?.info ?? e.data?.info
+          const sid = info?.id
+          if (info?.agent === "build" && sid && buildModels.has(sid)) {
+            const m = buildModels.get(sid)!
+            await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch(() => {})
+          }
+        }
       } catch {}
 
       if (e.type !== "command.executed" && e.type !== "tui.command.execute") return

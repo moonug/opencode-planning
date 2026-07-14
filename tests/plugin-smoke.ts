@@ -663,6 +663,122 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[19] system prompt skip for build agent: ok")
 }
 
+// 20. config hook: HOOK FIRED log emitted, try/catch protects against failure
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  if (typeof testHooks.config !== "function") throw new Error("config hook not exported")
+  // call with a real config object
+  const cfg: any = { experimental: { primary_tools: ["bash"] } }
+  await testHooks.config(cfg)
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message === "plan-review: config hook fired")) {
+    throw new Error("config hook did not emit HOOK FIRED log")
+  }
+  if (!cfg.experimental.primary_tools.includes("plan_review")) {
+    throw new Error("config hook did not add plan_review to primary_tools")
+  }
+  // call with a config that throws on access — should not crash the hook
+  const evilCfg: any = new Proxy({}, {
+    get() { throw new Error("boom") },
+    set() { throw new Error("boom") },
+  })
+  await testHooks.config(evilCfg)  // must not throw
+  console.log("[20] config hook: HOOK FIRED log + try/catch works: ok")
+}
+
+// 21. system.transform HOOK FIRED log emitted at start (before skip check)
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: {
+      prompt: async () => {},
+      messages: async () => ({ data: [] }),
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const out: any = { system: ["base prompt"] }
+  await testHooks["experimental.chat.system.transform"]({ sessionID: "ses_diag_21", model: {} as any } as any, out)
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("system.transform HOOK FIRED") && l.body?.message?.includes("ses_diag_21"))) {
+    throw new Error("system.transform HOOK FIRED log missing")
+  }
+  console.log("[21] system.transform HOOK FIRED log: ok")
+}
+
+// 22. chat.message HOOK FIRED log emitted even when input has no model
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  // call with no agent, no model — should still emit HOOK FIRED log
+  await testHooks["chat.message"](
+    { sessionID: "ses_diag_22" } as any,
+    { message: {} as any, parts: [] },
+  )
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("chat.message HOOK FIRED") && l.body?.message?.includes("ses_diag_22"))) {
+    throw new Error("chat.message HOOK FIRED log missing")
+  }
+  console.log("[22] chat.message HOOK FIRED log: ok")
+}
+
+// 23. build event memory log on session.updated for build agent
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  await testHooks.event({
+    event: {
+      type: "session.updated.1",
+      data: {
+        sessionID: "ses_build_mem",
+        info: { id: "ses_build_mem", agent: "build", model: { providerID: "ya-glm", id: "glm" } },
+      },
+    },
+  } as any)
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("build event memory updated") && l.body?.message?.includes("ya-glm/glm"))) {
+    throw new Error("build event memory update log missing")
+  }
+  console.log("[23] build event memory update log: ok")
+}
+
 // 8. experimental.chat.system.transform appends ENFORCEMENT block
 {
   const logs: any[] = []

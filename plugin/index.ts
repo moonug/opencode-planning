@@ -169,9 +169,12 @@ async function exitPlanMode(
     withTimeoutSafe(getGlobalModel(client), 2000, undefined),
   ])
 
+  const fromChatPlan = perAgent?.get("plan")
+
   let source: string
   let target: ModelRef | undefined
-  if (fromChat)         { target = fromChat;    source = "chat.message" }
+  if (fromChat)         { target = fromChat;    source = "chat.message (build)" }
+  else if (fromChatPlan) { target = fromChatPlan; source = "chat.message (plan)" }
   else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
@@ -236,7 +239,7 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
-  await log(client, "info", "plan-review: plugin init v0.2.0").catch(() => {})
+  await log(client, "info", "plan-review: plugin init v0.1.0").catch(() => {})
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
       `plan-review: helper script not found at ${SCRIPT_PATH}. ` +

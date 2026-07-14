@@ -85,16 +85,18 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[4] parseModelString: 7/7 cases ok")
 }
 
-// 5. rememberBuildModel correctly tracks last build-agent model per session
+// 5. rememberBuildModel correctly tracks last model per session (any agent)
 {
   const models = new Map<string, { providerID: string; modelID: string }>()
 
-  // ignore plan-agent events
+  // any-agent events populate the map (no agent guard)
   rememberBuildModel({
     type: "session.updated",
     properties: { info: { id: "s1", agent: "plan", model: { providerID: "ya-glm", id: "glm" } } },
   }, models)
-  if (models.has("s1")) throw new Error("plan-agent event should be ignored")
+  if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "ya-glm", modelID: "glm" })) {
+    throw new Error("plan-agent model not remembered")
+  }
 
   // remember build-agent model
   rememberBuildModel({
@@ -102,7 +104,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     properties: { info: { id: "s1", agent: "build", model: { providerID: "omlx", id: "Ornith" } } },
   }, models)
   if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "omlx", modelID: "Ornith" })) {
-    throw new Error("first build-agent model not remembered")
+    throw new Error("build-agent model did not overwrite plan-agent model")
   }
 
   // overwrite with later build-agent model
@@ -191,6 +193,55 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (!text.includes("/set-build-model")) throw new Error("missing /set-build-model hint")
   if (text.includes("(opencode default)")) throw new Error("still contains fallback to opencode default")
   console.log("[7] exitPlanMode refuses when target undefined: ok")
+}
+
+// 25. exitPlanMode: chatMessageMemory.plan wins when build is not picked
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    },
+    config: { get: async () => ({ data: {} }) },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  // picker in plan agent set ya-glm, no build picker, no /set-build-model
+  await testHooks["chat.message"](
+    {
+      sessionID: "ses_plan_pick",
+      agent: "plan",
+      model: { providerID: "ya-glm", modelID: "glm" },
+    } as any,
+    { message: {} as any, parts: [] },
+  )
+  prompts.length = 0
+  const noopEditorPM = "/tmp/pr-smoke-pm-noop.sh"
+  writeFileSync(noopEditorPM, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditorPM, 0o755)
+  await testHooks.tool.plan_review.execute(
+    { plan: "x" },
+    { sessionID: "ses_plan_pick", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("build prompt missing for plan-picker case")
+  if (buildPrompt.body?.model?.providerID !== "ya-glm" || buildPrompt.body?.model?.modelID !== "glm") {
+    throw new Error(`chat.message (plan) should win, got: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: chat.message (plan)")) {
+    throw new Error(`build prompt text missing chat.message (plan) source label: ${buildPrompt.body?.parts?.[0]?.text}`)
+  }
+  console.log("[25] chat.message (plan) wins when no build pick: ok")
 }
 
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent
@@ -511,7 +562,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[14] priority order: chat.message wins over /set-build-model: ok")
 }
 
-// 15. plugin init logs: "plugin init v0.2.0" + "tool 'plan_review' created, args: ..."
+// 15. plugin init logs: "plugin init v0.1.0" + "tool 'plan_review' created, args: ..."
 {
   const logs: any[] = []
   const testHooks = await mod.default({
@@ -522,8 +573,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
-  const initLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("plugin init v0.2.0"))
-  if (!initLog) throw new Error("init log 'plan-review: plugin init v0.2.0' missing")
+  const initLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("plugin init v0.1.0"))
+  if (!initLog) throw new Error("init log 'plan-review: plugin init v0.1.0' missing")
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")
   if (!toolLog.body.message.includes("plan")) throw new Error("tool log missing arg name")

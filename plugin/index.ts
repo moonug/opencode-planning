@@ -665,6 +665,30 @@ Do NOT proceed with implementation until the plan is approved.
     event: async ({ event }) => {
       const e = event as any
 
+      // one-shot diagnostic: enumerate the FIRST 3 non-sync events so we can
+      // see what event types actually arrive at the server plugin's event
+      // hook and what their payload shape is. Particularly useful for
+      // verifying whether session.next.agent.switched (the event that
+      // v2.session.switchAgent publishes through packages/core/src/session.ts:393)
+      // actually reaches this plugin. Useful for the next time the live
+      // picker-attribution path shows wrong behavior and we need to
+      // confirm the server plugin is even seeing the event.
+      if (e?.type && e.type !== "sync" && !(globalThis as any).__planReviewEventDiscoveryDone) {
+        const counterKey = "__planReviewEventDiscoveryCount"
+        const count = ((globalThis as any)[counterKey] ?? 0) + 1
+        ;(globalThis as any)[counterKey] = count
+        if (count <= 3) {
+          const keys = Object.keys(e)
+          const propertiesKeys = e.properties ? Object.keys(e.properties) : []
+          await logged(client, "info",
+            `plan-review: diag event discovery #${count}: type=${e.type} keys=[${keys.join(",")}] propertiesKeys=[${propertiesKeys.join(",")}] hasTopLevelSessionID=${typeof e.sessionID} hasTopLevelAgent=${typeof e.agent} hasTopLevelModel=${typeof e.model}`,
+          )
+          if (count >= 3) {
+            ;(globalThis as any).__planReviewEventDiscoveryDone = true
+          }
+        }
+      }
+
       // one-shot diagnostic: on first session.* event, dump the info object's
       // keys so we can see what fields the server actually returns (the v1 SDK
       // Session type doesn't declare agent/model but runtime may have them)
@@ -682,40 +706,49 @@ Do NOT proceed with implementation until the plan is approved.
       if (e.type === "session.updated" || e.type === "session.updated.1") {
         const info = e.properties?.info ?? e.data?.info
         if (info) {
-          await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L685): ${(e as Error)?.message ?? String(e)}`) })
-        }
-      }
-      if (e.type === "session.next.model.switched.1" || e.type === "session.next.agent.switched.1") {
-        await log(client, "debug", `${e.type}: ${JSON.stringify({ sessionID: e.sessionID, model: e.model, agent: e.agent })}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L689): ${(e as Error)?.message ?? String(e)}`) })
-      }
+           await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L685): ${(e as Error)?.message ?? String(e)}`) })
+         }
+       }
       // session.next.* events are published by V2 SDK calls
-      // (client.v2.session.switchAgent / switchModel). Even though
-      // v2.session.update({metadata}) silently drops on the server,
-      // switchAgent/switchModel go through setAgentModel/setAgentModel
-      // and DO publish session.next.agent.switched.1 and
-      // session.next.model.switched.1 events. We receive them via the
-      // plugin event hook (which subscribes to EventV2Bridge.GlobalBus),
-      // so we must update lastSessionAgent / lastSessionModel here.
-      if (e.type === "session.next.agent.switched.1") {
-        const nextAgent = (e as any).agent
-        const nextSid = (e as any).sessionID
+      // (client.v2.session.switchAgent / switchModel). switchAgent goes
+      // through packages/core/src/session.ts:393 (V2Session layer)
+      // which calls events.publish(SessionEvent.AgentSwitched, ...).
+      // The EventV2.Service fires events.listen() callbacks,
+      // EventV2Bridge forwards them via GlobalBus.emit("event", ...),
+      // and the server plugin runtime pumps them into the plugin's
+      // `event` hook (the inner `event` argument carries type plus a
+      // properties object — see packages/sdk/js/src/v2/gen/types.gen.ts:6246
+      // and packages/schema/src/session-event.ts:54).
+      //
+      // IMPORTANT: the plugin's runtime filters out events with
+      // type === "sync" (those are the durable/sync variants whose
+      // names end in ".1" — see packages/tui/src/context/event.ts:14).
+      // We therefore match the non-suffixed type names here. The
+      // payload lives under `.properties`, NOT at the top level.
+      if (e.type === "session.next.agent.switched") {
+        const props = (e.properties ?? {}) as { sessionID?: string; agent?: string }
+        const nextAgent = props.agent
+        const nextSid = props.sessionID
         if (typeof nextAgent === "string" && nextAgent && typeof nextSid === "string" && nextSid) {
           lastSessionAgent = nextAgent
           lastSessionID = nextSid
-          await log(client, "info",
+          await logged(client, "info",
             `plan-review: tab switch via session.next.agent.switched: session=${nextSid} -> ${nextAgent}`,
-          ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L707): ${(e as Error)?.message ?? String(e)}`) })
+          )
         }
       }
-      if (e.type === "session.next.model.switched.1") {
-        const nextModel = (e as any).model
-        const nextSid = (e as any).sessionID
-        if (nextModel && nextModel.providerID && nextModel.modelID && typeof nextSid === "string" && nextSid) {
-          lastSessionModel = { providerID: nextModel.providerID, modelID: nextModel.modelID }
+      if (e.type === "session.next.model.switched") {
+        const props = (e.properties ?? {}) as { sessionID?: string; model?: { providerID?: string; id?: string; modelID?: string } }
+        const nextModel = props.model
+        const nextSid = props.sessionID
+        const providerID = nextModel?.providerID
+        const modelID = nextModel?.id ?? nextModel?.modelID
+        if (nextModel && providerID && modelID && typeof nextSid === "string" && nextSid) {
+          lastSessionModel = { providerID, modelID }
           lastSessionID = nextSid
-          await log(client, "info",
-            `plan-review: tab switch via session.next.model.switched: session=${nextSid} -> ${nextModel.providerID}/${nextModel.modelID}`,
-          ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L718): ${(e as Error)?.message ?? String(e)}`) })
+          await logged(client, "info",
+            `plan-review: tab switch via session.next.model.switched: session=${nextSid} -> ${providerID}/${modelID}`,
+          )
         }
       }
 

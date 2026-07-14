@@ -1094,25 +1094,30 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
-  // session.next.agent.switched.1 fires when v2.session.switchAgent is
-  // called. Payload shape (per packages/opencode/src/session/*): top-level
-  // sessionID and agent fields, NOT inside .properties (different from
-  // session.updated.1).
+  // session.next.agent.switched (NO .1 — that's the sync/durable variant
+  // which is filtered out before reaching the plugin by
+  // packages/tui/src/context/event.ts:14). Fires when v2.session
+  // .switchAgent is called. Payload shape per packages/sdk/js/src/v2/gen
+  // /types.gen.ts:6246: { id, type, properties: { timestamp, sessionID,
+  // messageID, agent } } — the data lives UNDER .properties.
   await testHooks.event({
     event: {
-      type: "session.next.agent.switched.1",
-      sessionID: "ses_next_a",
-      agent: "code-review",
+      type: "session.next.agent.switched",
+      properties: {
+        sessionID: "ses_next_a",
+        agent: "code-review",
+      },
     },
   })
   await new Promise(r => setTimeout(r, 30))
   const log = logs.find((l: any) => l.body?.message?.includes("session.next.agent.switched") && l.body.message.includes("code-review"))
   if (!log) throw new Error("expected log 'session.next.agent.switched: session=ses_next_a -> code-review', got: " + logs.map((l:any)=>l.body?.message).join("\n"))
-  console.log("[45] server event hook handles session.next.agent.switched.1: ok")
+  console.log("[45] server event hook handles session.next.agent.switched: ok")
 }
 
-// 46. Server event hook handles session.next.model.switched.1 — visible log
-//     emitted and lastSessionModel updated.
+// 46. Server event hook handles session.next.model.switched — visible log
+//     emitted and lastSessionModel updated. Same payload-shape caveat as
+//     [45]: no .1 in type, data under .properties.
 {
   ;(globalThis as any).__planReviewEventProbeDone = false
   ;(globalThis as any).__planReviewChatMessageProbeDone = false
@@ -1131,15 +1136,17 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   await testHooks.event({
     event: {
-      type: "session.next.model.switched.1",
-      sessionID: "ses_next_m",
-      model: { providerID: "openai", modelID: "gpt-x" },
+      type: "session.next.model.switched",
+      properties: {
+        sessionID: "ses_next_m",
+        model: { providerID: "openai", modelID: "gpt-x" },
+      },
     },
   })
   await new Promise(r => setTimeout(r, 30))
   const log = logs.find((l: any) => l.body?.message?.includes("session.next.model.switched") && l.body.message.includes("openai/gpt-x"))
   if (!log) throw new Error("expected log 'session.next.model.switched: session=ses_next_m -> openai/gpt-x', got: " + logs.map((l:any)=>l.body?.message).join("\n"))
-  console.log("[46] server event hook handles session.next.model.switched.1: ok")
+  console.log("[46] server event hook handles session.next.model.switched: ok")
 }
 
 // 47. visibleErr helper exists and no silent .catch(() => {}) sites
@@ -1164,6 +1171,47 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("expected at least 50 visible catch handlers, got: " + visibleHandlers)
   }
   console.log("[47] no silent .catch(() => {}) left; " + visibleHandlers + " visible handlers active: ok")
+}
+
+// 48. Event discovery diagnostic: when ANY non-sync event arrives at
+//     the plugin's event hook, the first 3 should be logged with their
+//     type, top-level keys, and properties keys. This is what we'll see
+//     in the live log immediately after opencode starts; if the
+//     session.next.* events we expect do not appear in those three
+//     samples, the live pipeline has a different delivery path than
+//     the v2 switchAgent code path assumes.
+{
+  ;(globalThis as any).__planReviewEventProbeDone = false
+  ;(globalThis as any).__planReviewChatMessageProbeDone = false
+  ;(globalThis as any).__planReviewEventDiscoveryDone = false
+  ;(globalThis as any).__planReviewEventDiscoveryCount = 0
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) }, agents: async () => ({ data: [] }) } as any,
+    session: { prompt: async () => {} },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  // Fire two distinct event types. Discovery should log both.
+  await testHooks.event({ event: { type: "session.updated.1", properties: { info: { agent: "build" } } } })
+  await testHooks.event({ event: { type: "session.next.agent.switched", properties: { sessionID: "ses_x", agent: "plan" } } })
+  await new Promise(r => setTimeout(r, 30))
+  const discoveryLogs = logs.filter((l: any) => l.body?.message?.includes("diag event discovery"))
+  if (discoveryLogs.length < 2) {
+    throw new Error("expected at least 2 discovery logs, got: " + discoveryLogs.length + "\n" + logs.map((l:any)=>l.body?.message).join("\n"))
+  }
+  // Both event types must be enumerated, otherwise live test won't show us
+  // session.next.* at all.
+  const seenTypes = new Set(discoveryLogs.map((l: any) => l.body.message.split("type=")[1]?.split(" ")[0]))
+  if (!seenTypes.has("session.updated.1")) throw new Error("discovery did not see session.updated.1: " + Array.from(seenTypes))
+  if (!seenTypes.has("session.next.agent.switched")) throw new Error("discovery did not see session.next.agent.switched: " + Array.from(seenTypes))
+  console.log("[48] event discovery logs first 2 events with type+keys: ok")
 }
 
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent

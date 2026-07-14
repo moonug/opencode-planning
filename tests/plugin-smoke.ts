@@ -449,10 +449,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
 }
 
 // 30. plugin init probes client.session.list and logs keys+agent+model
+//     (probes are fire-and-forget via queueMicrotask; smoke flushes microtasks)
 {
   const logs: any[] = []
   const fakeClient = {
-    app: { log: async (opts: any) => { logs.push(opts) } },
+    app: { log: async (opts: any) => { logs.push(opts) }, agents: async () => ({ data: [] }) } as any,
     session: {
       prompt: async () => {},
       list: async () => ({
@@ -465,7 +466,6 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
         }],
       }),
     },
-    app: { log: async (opts: any) => { logs.push(opts) }, agents: async () => ({ data: [] }) } as any,
   }
   await mod.default({
     client: fakeClient as any,
@@ -475,6 +475,9 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
+  // flush microtask queue (probes are queued)
+  for (let i = 0; i < 20; i++) await new Promise(r => queueMicrotask(r))
+  await new Promise(r => setTimeout(r, 50))
   const keys = logs.find((l: any) => l.body?.message?.startsWith("diag.session.list.first.keys"))
   if (!keys) throw new Error("diag.session.list.first.keys log missing")
   if (!keys.body.message.includes("agent")) throw new Error("session.list first should have 'agent' key")
@@ -486,11 +489,10 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
 }
 
 // 31. plugin init probes client.app.agents and logs first agent
+//     (probes are fire-and-forget via queueMicrotask; smoke flushes microtasks)
 {
   const logs: any[] = []
   const fakeClient = {
-    app: { log: async (opts: any) => { logs.push(opts) } },
-    session: { prompt: async () => {} },
     app: {
       log: async (opts: any) => { logs.push(opts) },
       agents: async () => ({
@@ -500,6 +502,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
         ],
       }),
     } as any,
+    session: { prompt: async () => {} },
   }
   await mod.default({
     client: fakeClient as any,
@@ -509,11 +512,81 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
+  for (let i = 0; i < 20; i++) await new Promise(r => queueMicrotask(r))
+  await new Promise(r => setTimeout(r, 50))
   const count = logs.find((l: any) => l.body?.message?.startsWith("diag.app.agents.count"))
   if (count?.body?.message !== "diag.app.agents.count: 2") {
     throw new Error("expected count=2, got: " + count?.body?.message)
   }
   console.log("[31] plugin init probes app.agents: ok")
+}
+
+// 32. event hook probe logs first session.* event info keys/agent/model
+{
+  ;(globalThis as any).__planReviewEventProbeDone = false
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+    config: { get: async () => ({ data: { model: "p/m" } }) },
+    app: { log: async (opts: any) => { logs.push(opts) }, agents: async () => ({ data: [] }) } as any,
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  await testHooks.event({
+    event: {
+      type: "session.updated",
+      properties: { info: { id: "ses_evt", agent: "build", model: { providerID: "ya-glm", modelID: "glm" } } },
+    },
+  })
+  const keys = logs.find((l: any) => l.body?.message?.startsWith("diag.event.session.updated.info.keys"))
+  if (!keys) throw new Error("event probe keys log missing: " + logs.map((l:any)=>l.body?.message).join("\n"))
+  if (!keys.body.message.includes("agent")) throw new Error("event info should have 'agent' key")
+  const agentLog = logs.find((l: any) => l.body?.message?.startsWith("diag.event.session.updated.info.agent"))
+  if (agentLog?.body?.message !== "diag.event.session.updated.info.agent: build") {
+    throw new Error("event info.agent should be 'build', got: " + agentLog?.body?.message)
+  }
+  console.log("[32] event hook probe logs session.* info agent: ok")
+}
+
+// 33. chat.message hook probe logs input keys/agent/model/variant
+{
+  ;(globalThis as any).__planReviewChatMessageProbeDone = false
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+    app: { log: async (opts: any) => { logs.push(opts) }, agents: async () => ({ data: [] }) } as any,
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  await testHooks["chat.message"](
+    { sessionID: "ses_cm", agent: "plan", model: { providerID: "p", modelID: "m" }, variant: "x" } as any,
+    {},
+  )
+  const keys = logs.find((l: any) => l.body?.message?.startsWith("diag.chat.message.input.keys"))
+  if (!keys) throw new Error("chat.message probe keys log missing: " + logs.map((l:any)=>l.body?.message).join("\n"))
+  const agentLog = logs.find((l: any) => l.body?.message?.startsWith("diag.chat.message.input.agent"))
+  if (agentLog?.body?.message !== "diag.chat.message.input.agent: plan") {
+    throw new Error("chat.message input.agent should be 'plan', got: " + agentLog?.body?.message)
+  }
+  const modelLog = logs.find((l: any) => l.body?.message?.startsWith("diag.chat.message.input.model"))
+  if (!modelLog?.body?.message.includes("p") || !modelLog?.body?.message.includes("m")) {
+    throw new Error("chat.message model log missing: " + modelLog?.body?.message)
+  }
+  console.log("[33] chat.message hook probe logs input agent/model: ok")
 }
 
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent

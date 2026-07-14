@@ -265,28 +265,40 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   // Diagnostic: probe v1 SDK responses to see what fields are actually
   // returned. opencode 1.17.18 has no plugin hook for picker changes,
   // so we need to find a server-side way to learn the current agent.
-  try {
-    const list = await (client as any).session.list({ query: { limit: 1 } })
-    const first = (list as any)?.data?.[0]
-    await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch(() => {})
-    await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch(() => {})
-    await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch(() => {})
-  } catch (e) {
-    await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch(() => {})
-  }
+  // These calls MUST be fire-and-forget — init cannot await HTTP calls,
+  // the client is not ready at this point and it would hang opencode startup.
+  // Probes also fire from event hook and chat.message hook (belt-and-suspenders)
+  // because init's queueMicrotask may race with server readiness.
+  queueMicrotask(() => {
+    void (async () => {
+      try {
+        const list = await (client as any).session.list({ query: { limit: 1 } })
+        const first = (list as any)?.data?.[0]
+        await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch(() => {})
+        await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch(() => {})
+        await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch(() => {})
+      } catch (e) {
+        await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch(() => {})
+      }
+    })()
+  })
 
-  try {
-    const res = await (client as any).app.agents()
-    const data = (res as any)?.data ?? res
-    const agents = Array.isArray(data) ? data : []
-    await log(client, "info", `diag.app.agents.count: ${agents.length}`).catch(() => {})
-    if (agents.length > 0) {
-      await log(client, "info", `diag.app.agents[0].keys: ${JSON.stringify(Object.keys(agents[0]))}`).catch(() => {})
-      await log(client, "info", `diag.app.agents[0]: ${JSON.stringify(agents[0])}`).catch(() => {})
-    }
-  } catch (e) {
-    await log(client, "warn", `diag.app.agents failed: ${(e as Error).message}`).catch(() => {})
-  }
+  queueMicrotask(() => {
+    void (async () => {
+      try {
+        const res = await (client as any).app.agents()
+        const data = (res as any)?.data ?? res
+        const agents = Array.isArray(data) ? data : []
+        await log(client, "info", `diag.app.agents.count: ${agents.length}`).catch(() => {})
+        if (agents.length > 0) {
+          await log(client, "info", `diag.app.agents[0].keys: ${JSON.stringify(Object.keys(agents[0]))}`).catch(() => {})
+          await log(client, "info", `diag.app.agents[0]: ${JSON.stringify(agents[0])}`).catch(() => {})
+        }
+      } catch (e) {
+        await log(client, "warn", `diag.app.agents failed: ${(e as Error).message}`).catch(() => {})
+      }
+    })()
+  })
 
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
@@ -412,6 +424,35 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
         "info",
         `plan-review: chat.message HOOK FIRED: session=${input.sessionID ?? "?"} agent=${input.agent ?? "?"} model=${input.model?.providerID ?? "?"}/${input.model?.modelID ?? "?"}`,
       ).catch(() => {})
+
+      // one-shot probe: on first chat.message, dump input keys + app.agents count.
+      // chat.message is the most reliable hook — it fires on every prompt, and
+      // the client is guaranteed to be ready here.
+      if (!(globalThis as any).__planReviewChatMessageProbeDone) {
+        ;(globalThis as any).__planReviewChatMessageProbeDone = true
+        try {
+          await log(client, "info", `diag.chat.message.input.keys: ${JSON.stringify(Object.keys(input ?? {}))}`).catch(() => {})
+          await log(client, "info", `diag.chat.message.input.agent: ${(input as any)?.agent ?? "<undefined>"}`).catch(() => {})
+          await log(client, "info", `diag.chat.message.input.model: ${JSON.stringify((input as any)?.model)}`).catch(() => {})
+          await log(client, "info", `diag.chat.message.input.variant: ${JSON.stringify((input as any)?.variant)}`).catch(() => {})
+        } catch {}
+        queueMicrotask(() => {
+          void (async () => {
+            try {
+              const res = await (client as any).app.agents()
+              const data = (res as any)?.data ?? res
+              const agents = Array.isArray(data) ? data : []
+              await log(client, "info", `diag.chat.message.app.agents.count: ${agents.length}`).catch(() => {})
+              if (agents.length > 0) {
+                await log(client, "info", `diag.chat.message.app.agents[0]: ${JSON.stringify(agents[0])}`).catch(() => {})
+              }
+            } catch (e) {
+              await log(client, "warn", `diag.chat.message.app.agents failed: ${(e as Error).message}`).catch(() => {})
+            }
+          })()
+        })
+      }
+
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
         if (!perSession) {
@@ -465,6 +506,19 @@ Do NOT proceed with implementation until the plan is approved.
 
     event: async ({ event }) => {
       const e = event as any
+
+      // one-shot diagnostic: on first session.* event, dump the info object's
+      // keys so we can see what fields the server actually returns (the v1 SDK
+      // Session type doesn't declare agent/model but runtime may have them)
+      if (e.type?.startsWith?.("session.") && !(globalThis as any).__planReviewEventProbeDone) {
+        ;(globalThis as any).__planReviewEventProbeDone = true
+        try {
+          const info = e.properties?.info ?? e.data?.info ?? {}
+          await log(client, "info", `diag.event.${e.type}.info.keys: ${JSON.stringify(Object.keys(info))}`).catch(() => {})
+          await log(client, "info", `diag.event.${e.type}.info.agent: ${(info as any)?.agent ?? "<undefined>"}`).catch(() => {})
+          await log(client, "info", `diag.event.${e.type}.info.model: ${JSON.stringify((info as any)?.model)}`).catch(() => {})
+        } catch {}
+      }
 
       // diagnostic log: surface every session.updated variant we receive
       if (e.type === "session.updated" || e.type === "session.updated.1") {

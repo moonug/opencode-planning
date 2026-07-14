@@ -448,6 +448,74 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[29] watcher logs recent[] timeline in fallback path: ok")
 }
 
+// 30. plugin init probes client.session.list and logs keys+agent+model
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: {
+      prompt: async () => {},
+      list: async () => ({
+        data: [{
+          id: "ses_x", directory: "/tmp", projectID: "p",
+          title: "Test", version: "1.17.18",
+          time: { created: 0, updated: 0 },
+          agent: "build",
+          model: { providerID: "ya-glm", modelID: "glm" },
+        }],
+      }),
+    },
+    app: { log: async (opts: any) => { logs.push(opts) }, agents: async () => ({ data: [] }) } as any,
+  }
+  await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const keys = logs.find((l: any) => l.body?.message?.startsWith("diag.session.list.first.keys"))
+  if (!keys) throw new Error("diag.session.list.first.keys log missing")
+  if (!keys.body.message.includes("agent")) throw new Error("session.list first should have 'agent' key")
+  const agentLog = logs.find((l: any) => l.body?.message?.startsWith("diag.session.list.first.agent"))
+  if (agentLog?.body?.message !== "diag.session.list.first.agent: build") {
+    throw new Error("session.list first.agent should be 'build', got: " + agentLog?.body?.message)
+  }
+  console.log("[30] plugin init probes session.list for current agent: ok")
+}
+
+// 31. plugin init probes client.app.agents and logs first agent
+{
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({
+        data: [
+          { name: "plan", model: { providerID: "minimax-coding-plan", modelID: "MiniMax-M3" } },
+          { name: "build", model: { providerID: "ya-glm", modelID: "glm" } },
+        ],
+      }),
+    } as any,
+  }
+  await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const count = logs.find((l: any) => l.body?.message?.startsWith("diag.app.agents.count"))
+  if (count?.body?.message !== "diag.app.agents.count: 2") {
+    throw new Error("expected count=2, got: " + count?.body?.message)
+  }
+  console.log("[31] plugin init probes app.agents: ok")
+}
+
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent
 //     override in client.session.prompt body (v1 SDK shorthand, no v2 needed).
 {

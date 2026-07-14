@@ -261,6 +261,33 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 
 export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   await log(client, "info", "plan-review: plugin init v0.1.0").catch(() => {})
+
+  // Diagnostic: probe v1 SDK responses to see what fields are actually
+  // returned. opencode 1.17.18 has no plugin hook for picker changes,
+  // so we need to find a server-side way to learn the current agent.
+  try {
+    const list = await (client as any).session.list({ query: { limit: 1 } })
+    const first = (list as any)?.data?.[0]
+    await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch(() => {})
+    await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch(() => {})
+    await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch(() => {})
+  } catch (e) {
+    await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch(() => {})
+  }
+
+  try {
+    const res = await (client as any).app.agents()
+    const data = (res as any)?.data ?? res
+    const agents = Array.isArray(data) ? data : []
+    await log(client, "info", `diag.app.agents.count: ${agents.length}`).catch(() => {})
+    if (agents.length > 0) {
+      await log(client, "info", `diag.app.agents[0].keys: ${JSON.stringify(Object.keys(agents[0]))}`).catch(() => {})
+      await log(client, "info", `diag.app.agents[0]: ${JSON.stringify(agents[0])}`).catch(() => {})
+    }
+  } catch (e) {
+    await log(client, "warn", `diag.app.agents failed: ${(e as Error).message}`).catch(() => {})
+  }
+
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
       `plan-review: helper script not found at ${SCRIPT_PATH}. ` +

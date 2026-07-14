@@ -242,10 +242,127 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (buildPrompt.body?.model?.providerID !== "ya-glm") throw new Error(`inline model.providerID wrong: ${JSON.stringify(buildPrompt.body?.model)}`)
   if (buildPrompt.body?.model?.modelID !== "glm") throw new Error(`inline model.modelID wrong: ${JSON.stringify(buildPrompt.body?.model)}`)
   if (buildPrompt.body?.noReply !== true) throw new Error("build prompt must have noReply=true")
-  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: build event memory")) {
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: /set-build-model")) {
     throw new Error("build prompt text missing source label: " + buildPrompt.body?.parts?.[0]?.text)
   }
   console.log("[7b] exitPlanMode happy path with inline model+agent: ok")
+}
+
+// 10. /set-build-model <provider>/<model> writes to in-memory Map, exitPlanMode uses it
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    },
+    config: { get: async () => ({ data: {} }) },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  // call /set-build-model with explicit string
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "set-build-model", arguments: "ya-glm/glm", sessionID: "ses_set" },
+    },
+  } as any)
+  const confirm = prompts.find((p: any) => p.body?.parts?.[0]?.text?.includes("Build model for this session set to"))
+  if (!confirm) throw new Error("set-build-model did not produce confirmation")
+  if (!confirm.body.parts[0].text.includes("ya-glm/glm")) throw new Error("confirmation missing model id")
+
+  // drive exitPlanMode via plan_review tool execute with no-op editor
+  prompts.length = 0
+  const noopEditor3 = "/tmp/pr-smoke-set-noop.sh"
+  writeFileSync(noopEditor3, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor3, 0o755)
+  await testHooks.tool.plan_review.execute(
+    { plan: "x" },
+    { sessionID: "ses_set", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("build prompt not sent after set-build-model")
+  if (buildPrompt.body?.model?.providerID !== "ya-glm" || buildPrompt.body?.model?.modelID !== "glm") {
+    throw new Error(`build prompt wrong model: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: /set-build-model")) {
+    throw new Error("build prompt text missing /set-build-model source label")
+  }
+  console.log("[10] /set-build-model writes Map, exitPlanMode uses it: ok")
+}
+
+// 11. /set-build-model without args lists providers via client.config.providers()
+{
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeProviders = {
+    data: {
+      providers: [
+        { id: "ya-glm", name: "Yandex GLM", models: { glm: { name: "GLM" } } },
+        { id: "anthropic", name: "Anthropic", models: { "claude-sonnet-4": { name: "Claude Sonnet 4" } } },
+        { id: "minimax-coding-plan", name: "Coding Plan", models: { "MiniMax-M3": { status: "active" } } },
+      ],
+    },
+  }
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    },
+    config: {
+      get: async () => ({ data: {} }),
+      providers: async () => fakeProviders,
+    },
+    session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  prompts.length = 0
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "set-build-model", arguments: "", sessionID: "ses_pick" },
+    },
+  } as any)
+  const picker = prompts.find((p: any) => p.body?.parts?.[0]?.text?.includes("set-build-model picker"))
+  if (!picker) throw new Error("picker output missing")
+  const text = picker.body.parts[0].text
+  if (!text.includes("ya-glm") || !text.includes("anthropic") || !text.includes("minimax-coding-plan")) {
+    throw new Error("picker list missing providers: " + text)
+  }
+  if (!text.includes("/set-build-model <number>")) {
+    throw new Error("picker missing usage hint for number selection")
+  }
+  // pick via number — must use last shown list
+  prompts.length = 0
+  await testHooks.event({
+    event: {
+      type: "command.executed",
+      properties: { name: "set-build-model", arguments: "2", sessionID: "ses_pick" },
+    },
+  } as any)
+  const pick2 = prompts.find((p: any) => p.body?.parts?.[0]?.text?.includes("Build model for this session set to"))
+  if (!pick2) throw new Error("numeric pick did not produce confirmation")
+  if (!pick2.body.parts[0].text.includes("anthropic/claude-sonnet-4")) {
+    throw new Error(`numeric pick wrong: expected anthropic/claude-sonnet-4, got ${pick2.body.parts[0].text}`)
+  }
+  console.log("[11] /set-build-model picker (list + numeric pick): ok")
 }
 
 // 8. experimental.chat.system.transform appends ENFORCEMENT block

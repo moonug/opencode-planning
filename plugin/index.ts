@@ -1,5 +1,4 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { createOpencodeClient as createV2Client } from "@opencode-ai/sdk/v2/client"
 import { existsSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync } from "node:fs"
 import { dirname, resolve, join, basename } from "node:path"
 import { homedir } from "node:os"
@@ -14,7 +13,6 @@ const COMMAND_SOURCES = [
   join(REPO_DIR, "commands", "set-build-model.md"),
   join(REPO_DIR, "commands", "plan-diag.md"),
 ]
-const BUILD_MODEL_METADATA_KEY = "plan_review_build_model"
 
 const FEEDBACK_HEADER =
   "User reviewed the plan in their editor and made changes.\n" +
@@ -70,25 +68,8 @@ function runPlanReview($: any, planText: string): Promise<string> {
   return $`${SCRIPT_PATH} --plan-text ${$.escape(planText)}`.text()
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
-  ])
-}
-
 function log(client: any, level: "debug" | "info" | "warn" | "error", message: string): Promise<unknown> {
   return client.app.log({ body: { service: "plan-review", level, message } })
-}
-
-async function getOverrideFromMetadata(v2: any, sessionID: string): Promise<ModelRef | undefined> {
-  try {
-    const res = await v2.session.get({ path: { sessionID } })
-    const md = res?.data?.metadata ?? res?.metadata
-    const override = md?.[BUILD_MODEL_METADATA_KEY]
-    if (typeof override === "string") return parseModelString(override)
-  } catch {}
-  return undefined
 }
 
 async function getBuildAgentModel(client: any): Promise<ModelRef | undefined> {
@@ -114,30 +95,48 @@ async function getGlobalModel(client: any): Promise<ModelRef | undefined> {
   return undefined
 }
 
-async function getSessionRuntimeModel(v2: any, sessionID: string): Promise<ModelRef | undefined> {
-  try {
-    const res = await v2.session.get({ path: { sessionID } })
-    const m = (res as any)?.data?.model ?? (res as any)?.model
-    if (m?.providerID && m?.id) return { providerID: m.providerID, modelID: m.id }
-  } catch {}
-  return undefined
+interface ProviderListEntry {
+  providerID: string
+  providerName?: string
+  modelID: string
+  displayName?: string
 }
 
-async function setBuildOverride(v2: any, sessionID: string, modelStr: string): Promise<void> {
-  let existing: Record<string, unknown> = {}
+async function listAvailableModels(client: any): Promise<ProviderListEntry[]> {
+  const entries: ProviderListEntry[] = []
   try {
-    const res = await v2.session.get({ path: { sessionID } })
-    existing = (res?.data?.metadata ?? res?.metadata ?? {}) as Record<string, unknown>
+    const res = await client.config.providers()
+    const data = (res as any)?.data ?? res
+    const providers: any[] = data?.providers ?? []
+    for (const provider of providers) {
+      const id = provider.id
+      const name = provider.name
+      const models: Record<string, any> = provider.models ?? {}
+      for (const [modelID, model] of Object.entries(models)) {
+        if (model?.status === "deprecated") continue
+        const displayName = model?.name ?? modelID
+        entries.push({ providerID: id, providerName: name, modelID, displayName })
+      }
+    }
   } catch {}
-  await v2.session.update({
-    path: { sessionID },
-    body: { metadata: { ...existing, [BUILD_MODEL_METADATA_KEY]: modelStr } },
-  })
+  return entries
+}
+
+function formatProviderList(entries: ProviderListEntry[]): string {
+  if (entries.length === 0) return "  (no providers found — check opencode config)"
+  const lines: string[] = []
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]!
+    const label = e.displayName && e.displayName !== e.modelID
+      ? `${e.displayName} (\`${e.modelID}\`)`
+      : `\`${e.modelID}\``
+    lines.push(`  ${(i + 1).toString().padStart(3, " ")}. ${e.providerID.padEnd(24)} ${label}`)
+  }
+  return lines.join("\n")
 }
 
 async function exitPlanMode(
   client: any,
-  v2: any | null,
   buildModels: Map<string, ModelRef>,
   lastResolution: { target?: ModelRef; source?: string },
   sessionID: string | undefined,
@@ -145,24 +144,18 @@ async function exitPlanMode(
 ): Promise<void> {
   if (!sessionID) return
 
-  // read /set-build-model override from session metadata (only source that
-  // needs v2 SDK). Everything else works without v2.
-  const metadata = v2
-    ? await withTimeout(getOverrideFromMetadata(v2, sessionID), 2000, undefined)
-    : undefined
-  const [agentCfg, globalCfg] = await Promise.all([
-    withTimeout(getBuildAgentModel(client), 2000, undefined),
-    withTimeout(getGlobalModel(client), 2000, undefined),
-  ])
   const remembered = buildModels.get(sessionID)
+  const [agentCfg, globalCfg] = await Promise.all([
+    withTimeoutSafe(getBuildAgentModel(client), 2000, undefined),
+    withTimeoutSafe(getGlobalModel(client), 2000, undefined),
+  ])
 
   let source: string
   let target: ModelRef | undefined
-  if (metadata)        { target = metadata;     source = "/set-build-model" }
-  else if (remembered) { target = remembered;   source = "build event memory" }
-  else if (agentCfg)   { target = agentCfg;     source = "agent.build.model" }
-  else if (globalCfg)  { target = globalCfg;    source = "config.model" }
-  else                 { source = "opencode default" }
+  if (remembered)       { target = remembered; source = "/set-build-model" }
+  else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
+  else if (globalCfg)   { target = globalCfg;   source = "config.model" }
+  else                  { source = "opencode default" }
 
   lastResolution.target = target
   lastResolution.source = source
@@ -176,7 +169,7 @@ async function exitPlanMode(
           noReply: true,
           parts: [{
             type: "text",
-            text: `Plan approved. ${summary}\n\n⚠ No build model resolved (tried /set-build-model, build event memory, agent.build.model, config.model — all undefined). Run \`/agent build\` then \`/model <provider>/<model>\` before continuing, or set \`/set-build-model <provider>/<model>\` for next time.`,
+            text: `Plan approved. ${summary}\n\n⚠ No build model resolved (tried /set-build-model, agent.build.model, config.model — all undefined). Run \`/set-build-model <provider>/<model>\` (or \`/set-build-model\` for a picker), \`/agent build\`, then \`/model <provider>/<model>\` before continuing.`,
           }],
         },
       })
@@ -184,10 +177,6 @@ async function exitPlanMode(
     return
   }
 
-  // inline v1 SDK override: pass model+agent in body so the next provider
-  // turn uses them. Works without v2 SDK and without persistent switchModel.
-  // This matches what opencode CLI does internally
-  // (~/projects/opencode/packages/opencode/src/cli/cmd/run.ts: client.session.prompt({ sessionID, agent, model, ... })).
   await log(
     client,
     "info",
@@ -212,7 +201,14 @@ async function exitPlanMode(
   }
 }
 
-export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
+async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ])
+}
+
+export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
       `plan-review: helper script not found at ${SCRIPT_PATH}. ` +
@@ -222,22 +218,9 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   ensureExecutable(SCRIPT_PATH)
   ensureCommandSymlink()
 
-  let v2: any | null = null
-  let v2Tried = false
   const buildModels = new Map<string, ModelRef>()
   const lastResolution: { target?: ModelRef; source?: string } = {}
-
-  async function getV2(): Promise<any> {
-    if (v2Tried) return v2
-    v2Tried = true
-    try {
-      v2 = createV2Client({ baseUrl: serverUrl.toString().replace(/\/+$/, ""), directory: process.cwd() })
-    } catch (err) {
-      await log(client, "warn", `v2 SDK init failed: ${(err as Error).message}, build-model persistence disabled`).catch(() => {})
-      v2 = null
-    }
-    return v2
-  }
+  const lastShownModels = new Map<string, ProviderListEntry[]>()
 
   const plan_review = tool({
     description:
@@ -246,9 +229,8 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       "Returns a unified diff of the user's edits, or empty output if " +
       "the user closed the editor without changes (which means approved, and " +
       "the session will auto-switch to the build agent on a per-session " +
-      "build model — set via /set-build-model, or falling back to the " +
-      "last model selected while build was active, or agent.build.model, " +
-      "or config.model). Iterate until the result is empty.",
+      "build model — set via /set-build-model, or falling back to " +
+      "agent.build.model, or config.model). Iterate until the result is empty.",
     args: {
       plan: tool.schema.string().describe(
         "full markdown of the plan to show the user for review"
@@ -258,7 +240,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, await getV2(), buildModels, lastResolution, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, buildModels, lastResolution, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -299,10 +281,7 @@ ENFORCEMENT (added by plan-review plugin):
     event: async ({ event }) => {
       const e = event as any
 
-      // diagnostic log: surface every session.updated variant we receive so the
-      // user can verify in opencode log whether UI actions (ctrl-x m, agent
-      // tab switch) actually emit events. Useful to debug why "build model
-      // ignored" — the plugin only knows what opencode tells it.
+      // diagnostic log: surface every session.updated variant we receive
       if (e.type === "session.updated" || e.type === "session.updated.1") {
         const info = e.properties?.info ?? e.data?.info
         if (info) {
@@ -315,9 +294,7 @@ ENFORCEMENT (added by plan-review plugin):
 
       try {
         rememberBuildModel(e, buildModels)
-      } catch {
-        // ignore — event handler must never throw
-      }
+      } catch {}
 
       if (e.type !== "command.executed" && e.type !== "tui.command.execute") return
 
@@ -327,39 +304,78 @@ ENFORCEMENT (added by plan-review plugin):
       const sessionID = props.sessionID as string | undefined
 
       if (name === "set-build-model") {
-        const modelStr = rawArgs.trim()
         if (!sessionID) {
           await log(client, "error", "set-build-model: no active session").catch(() => {})
           return
         }
-        if (!modelStr) {
-          await log(client, "error", "Usage: /set-build-model <provider/model-id>").catch(() => {})
-          return
-        }
-        if (!parseModelString(modelStr)) {
-          await log(client, "error", `Invalid model format "${modelStr}". Expected "provider/model-id".`).catch(() => {})
-          return
-        }
-        const v = await getV2()
-        if (!v) {
-          await log(client, "error", "set-build-model: v2 SDK unavailable, cannot persist override").catch(() => {})
-          return
-        }
-        try {
-          await setBuildOverride(v, sessionID, modelStr)
+        const arg = rawArgs.trim()
+
+        // numeric index from last shown list
+        const numIdx = Number(arg)
+        if (arg !== "" && Number.isInteger(numIdx) && numIdx > 0) {
+          const list = lastShownModels.get(sessionID) ?? []
+          const entry = list[numIdx - 1]
+          if (!entry) {
+            await client.session.prompt({
+              path: { id: sessionID },
+              body: {
+                noReply: true,
+                parts: [{
+                  type: "text",
+                  text: `set-build-model: index ${numIdx} out of range (last list had ${list.length} entries). Run \`/set-build-model\` to refresh.`,
+                }],
+              },
+            }).catch(() => {})
+            return
+          }
+          buildModels.set(sessionID, { providerID: entry.providerID, modelID: entry.modelID })
           await client.session.prompt({
             path: { id: sessionID },
             body: {
               noReply: true,
               parts: [{
                 type: "text",
-                text: `Build model for this session set to: \`${modelStr}\`. On the next plan approval, the session will switch to this model before build executes.`,
+                text: `Build model for this session set to: \`${entry.providerID}/${entry.modelID}\` (picked #${numIdx} from list). On the next plan approval, the session will switch to this model before build executes.`,
               }],
             },
-          })
-        } catch (err) {
-          await log(client, "error", `set-build-model failed: ${(err as Error).message}`).catch(() => {})
+          }).catch(() => {})
+          return
         }
+
+        // explicit provider/model string
+        if (arg !== "") {
+          const parsed = parseModelString(arg)
+          if (!parsed) {
+            await log(client, "error", `set-build-model: invalid format "${arg}". Expected "provider/model-id".`).catch(() => {})
+            return
+          }
+          buildModels.set(sessionID, parsed)
+          await client.session.prompt({
+            path: { id: sessionID },
+            body: {
+              noReply: true,
+              parts: [{
+                type: "text",
+                text: `Build model for this session set to: \`${parsed.providerID}/${parsed.modelID}\`. On the next plan approval, the session will switch to this model before build executes.`,
+              }],
+            },
+          }).catch(() => {})
+          return
+        }
+
+        // no args: list providers
+        const entries = await listAvailableModels(client)
+        lastShownModels.set(sessionID, entries)
+        await client.session.prompt({
+          path: { id: sessionID },
+          body: {
+            noReply: true,
+            parts: [{
+              type: "text",
+              text: `# set-build-model picker\n\nAvailable models (${entries.length}):\n\n${formatProviderList(entries)}\n\nReply with:\n- \`/set-build-model <number>\` to pick from this list (e.g. \`/set-build-model 5\`)\n- \`/set-build-model <provider>/<model-id>\` to set directly (e.g. \`/set-build-model ya-glm/glm\`)\n\nStored in this plugin's in-memory session memory — lost on opencode restart. For runtime model picker use the opencode UI (Ctrl-X M).`,
+            }],
+          },
+        }).catch(() => {})
         return
       }
 
@@ -383,7 +399,6 @@ ENFORCEMENT (added by plan-review plugin):
           }).catch(() => {})
           return
         }
-        // show: dump state
         const memEntries = Array.from(buildModels.entries()).map(([sid, m]) => `  ${sid.slice(0, 16)}… → ${m.providerID}/${m.modelID}`).join("\n") || "  (empty)"
         await client.session.prompt({
           path: { id: sessionID },
@@ -393,20 +408,16 @@ ENFORCEMENT (added by plan-review plugin):
               type: "text",
               text: `# plan-diag
 
-## Build event memory (in-memory)
+## Build model memory (in-memory)
 ${memEntries}
 
 ## Current session
 - sessionID: \`${sessionID}\`
 - last target resolved: ${lastResolution.target ? `${lastResolution.target.providerID}/${lastResolution.target.modelID} (source: ${lastResolution.source})` : "never called"}
 
-If you switched build agent via ctrl-x m in this session but the memory
-above does not show that model, opencode did NOT emit a \`session.updated\`
-event for your picker action. Workarounds:
-- \`/set-build-model <provider>/<model>\` before approving the plan
-- \`/agent build\` → \`/model <provider>/<model>\` → \`/agent plan\`, then approve
-
 Diagnostic lines \`plan-review: session.updated: ...\` appear in opencode log for every session.updated event.
+
+Note: \`/set-build-model\` writes to the in-memory Map above (priority #1 in the chain). It does NOT persist across opencode restarts. For persistent switches, configure \`agent.build.model\` in opencode.jsonc.
 `,
             }],
           },
@@ -446,7 +457,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` appear in opencode log fo
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, await getV2(), buildModels, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, buildModels, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})

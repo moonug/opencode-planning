@@ -1,19 +1,34 @@
 ---
-description: set the model used when the session auto-switches to the build agent after plan approval
+description: override the model used when the session auto-switches to the build agent after plan approval
 ---
 
 # /set-build-model
 
-Set a per-session override for the model used after `/plan-review` (or the `plan_review` tool) approves a plan and the session auto-switches to the build agent.
+Override which model the session switches to when `/plan-review` (or the
+`plan_review` tool) approves a plan and the session auto-exits to the
+build agent.
 
-Usage: `/set-build-model <provider>/<model-id>`
+The override is stored in **this plugin's in-memory session memory** —
+it is lost when opencode restarts. For a persistent override, configure
+`agent.build.model` in `opencode.jsonc`.
 
-Example: `/set-build-model ya-deepseek/deepseek-v4-flash`
+Usage:
 
-The override is persisted in `session.metadata` and survives until the session ends. Resolution priority on plan approval:
+- `/set-build-model` — show a numbered list of available models pulled
+  from `client.config.providers()`. Reply with `/set-build-model N` to
+  pick the Nth entry, or `/set-build-model <provider>/<model-id>` to set
+  directly.
+- `/set-build-model 5` — pick the 5th model from the last shown list.
+- `/set-build-model <provider>/<model-id>` — set directly, e.g.
+  `/set-build-model ya-glm/glm`.
 
-1. `/set-build-model` override (this command)
-2. last model selected while the build agent was active (in-memory session memory)
-3. `agent.build.model` from `opencode.jsonc`
-4. `config.model` global default
-5. opencode default
+Resolution priority on plan approval:
+
+1. `/set-build-model` override (this command, in-memory, session-scoped)
+2. `agent.build.model` from `opencode.jsonc`
+3. `config.model` global default
+4. opencode default
+
+Note: the opencode TUI model picker (Ctrl-X M) is a separate runtime
+mechanism that does not emit a persistent event; this command is the
+text-based counterpart for plugin-internal state.

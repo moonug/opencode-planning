@@ -332,7 +332,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
         `plan-review: system.transform HOOK FIRED: session=${input.sessionID ?? "?"} system_blocks=${output.system.length}`,
       ).catch(() => {})
       const joined = output.system.join("\n").toLowerCase()
-      if (joined.includes("title generator") || joined.includes("subagent")) return
+      if (joined.includes("title generator") || joined.includes("generate a title")) return
       // Skip injection for the build agent (mirrors plannotator's skip).
       if (input.sessionID) try {
         const msgs = await client.session.messages({ path: { id: input.sessionID } })

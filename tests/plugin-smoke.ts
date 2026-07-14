@@ -663,6 +663,33 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[19] system prompt skip for build agent: ok")
 }
 
+// 24. system prompt transform NOT skipped when system contains "subagent" word
+//     (opencode plan-agent system prompt mentions sub-agents in tool delegation
+//     guidance; my old skip was too broad and caused 100% skip rate in
+//     ses_09fbfdba5ffea6PmErY6PMQo8l)
+{
+  const fakeClient = {
+    app: { log: async () => {} },
+    session: {
+      prompt: async () => {},
+      messages: async () => ({ data: [{ info: { role: "user", agent: "plan" } }] }),
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  const out: any = { system: ["You may delegate to a subagent for exploration tasks."] }
+  await testHooks["experimental.chat.system.transform"]({ sessionID: "ses_sub", model: {} as any } as any, out)
+  const injected = out.system.some((s: string) => s.includes("MUST call"))
+  if (!injected) throw new Error("system prompt should NOT be skipped when system contains 'subagent' word")
+  console.log("[24] system prompt not skipped on 'subagent' word: ok")
+}
+
 // 20. config hook: HOOK FIRED log emitted, try/catch protects against failure
 {
   const logs: any[] = []

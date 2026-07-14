@@ -390,6 +390,64 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[28] watcher logs 'matched agent=X' for picker changes: ok")
 }
 
+// 29. watcher logs recent[] timeline when lastActiveAgents is empty
+{
+  _writeFileSync(
+    process.env.PLAN_REVIEW_MODEL_JSON!,
+    JSON.stringify({
+      recent: [
+        { providerID: "minimax-coding-plan", modelID: "MiniMax-M3" },  // current
+        { providerID: "ya-glm", modelID: "glm" },                       // previous (build picker)
+        { providerID: "anthropic", modelID: "claude-sonnet-4-6" },     // older
+      ],
+      favorite: [],
+      variant: {},
+    }),
+  )
+
+  const logs: any[] = []
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } },
+    session: { prompt: async () => {} },
+  }
+  const ctx = {
+    client: fakeClient,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  }
+  const testHooks = await mod.default(ctx)
+  logs.length = 0
+  // overwrite model.json with new recent[0]=anthropic/claude-sonnet-4-6
+  _writeFileSync(
+    process.env.PLAN_REVIEW_MODEL_JSON!,
+    JSON.stringify({
+      recent: [
+        { providerID: "anthropic", modelID: "claude-sonnet-4-6" },
+        { providerID: "minimax-coding-plan", modelID: "MiniMax-M3" },
+        { providerID: "ya-glm", modelID: "glm" },
+      ],
+      favorite: [],
+      variant: {},
+    }),
+  )
+  await new Promise((r) => setTimeout(r, 50))
+  const timeline = logs.find((l: any) =>
+    l.body?.level === "info" &&
+    l.body?.message?.includes("model.json changed") &&
+    l.body?.message?.includes("anthropic/claude-sonnet-4-6") &&
+    l.body?.message?.includes("recent[]=") &&
+    l.body?.message?.includes("ya-glm/glm"),
+  )
+  if (!timeline) {
+    throw new Error("watcher did not log recent[] timeline. logs: " + JSON.stringify(logs.map((l: any) => l.body?.message)))
+  }
+  _writeFileSync(process.env.PLAN_REVIEW_MODEL_JSON!, JSON.stringify({ recent: [], favorite: [], variant: {} }))
+  console.log("[29] watcher logs recent[] timeline in fallback path: ok")
+}
+
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent
 //     override in client.session.prompt body (v1 SDK shorthand, no v2 needed).
 {

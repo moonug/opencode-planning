@@ -302,8 +302,25 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
               matchedAgent = info.agent
             }
           }
+          // Read full recent[] timeline from model.json. opencode stores
+          // picker history as an ordered array; recent[0] is current,
+          // recent[1..N] is the timeline. Without per-pickup agent
+          // metadata this is the best approximation we have for which
+          // picker happened on which agent — typically each agent
+          // switch flips the agent tab before the next picker click.
+          let recentStr = ""
+          try {
+            const raw = readFileSync(MODEL_JSON_PATH, "utf8")
+            const data = JSON.parse(raw) as { recent?: Array<{ providerID?: string; modelID?: string }> }
+            const recent = Array.isArray(data.recent) ? data.recent : []
+            recentStr = recent.slice(0, 5)
+              .map((r) => `${r.providerID ?? "?"}/${r.modelID ?? "?"}`)
+              .join(", ")
+          } catch {}
           const oldStr = old ? `${old.providerID}/${old.modelID}` : "(none)"
-          const ctx = matchedAgent ? `, matched agent=${matchedAgent}` : ", no matching active agent (picker for unrecorded agent)"
+          const ctx = matchedAgent
+            ? `, matched agent=${matchedAgent}`
+            : `, lastActiveAgents empty (no chat.message or session.updated.1 yet), recent[]=[${recentStr}]`
           log(client, "info",
             `plan-review: model.json changed, recent[0]=${m.providerID}/${m.modelID} (was ${oldStr})${ctx}`,
           ).catch(() => {})

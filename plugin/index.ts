@@ -307,6 +307,10 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         if (m && (m.providerID || m.id)) {
           lastSessionModel = { providerID: m.providerID, modelID: m.id }
         }
+        const firstID = (first as any)?.id
+        if (typeof firstID === "string" && firstID) {
+          lastSessionID = firstID
+        }
         await log(client, "info", `diag.session.list.first.populated: agent=${lastSessionAgent ?? "?"} model=${lastSessionModel?.providerID ?? "?"}/${lastSessionModel?.modelID ?? "?"}`).catch(() => {})
       } catch (e) {
         await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch(() => {})
@@ -358,6 +362,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   // working in the same session.
   let lastSessionAgent: string | undefined
   let lastSessionModel: ModelRef | undefined
+  let lastSessionID: string | undefined
   const MODEL_JSON_PATH = process.env.PLAN_REVIEW_MODEL_JSON
     ?? `${homedir()}/.local/state/opencode/model.json`
   let lastGlobalPicker: ModelRef | undefined = readPickerState(MODEL_JSON_PATH)
@@ -388,6 +393,30 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
           // agent, which is usually the agent the user is in now.
           if (!matchedAgent && lastSessionAgent) {
             matchedAgent = lastSessionAgent
+          }
+          // Probe client.session.get for current agent. The runtime
+          // response may carry an up-to-date `agent` field even when
+          // session.list[0] is stale (e.g. user switched agent tabs
+          // without sending a message). Fire-and-forget so the watcher
+          // log stays synchronous.
+          if (lastSessionID) {
+            queueMicrotask(() => {
+              void (async () => {
+                try {
+                  const got = await (client as any).session.get({ path: { id: lastSessionID } })
+                  const data = (got as any)?.data ?? got
+                  const fresh = (data as any)?.agent
+                  if (typeof fresh === "string" && fresh && fresh !== lastSessionAgent) {
+                    lastSessionAgent = fresh
+                    log(client, "info",
+                      `plan-review: session.get probe updated agent: session=${lastSessionID} ${lastSessionAgent} -> ${fresh}`,
+                    ).catch(() => {})
+                  }
+                } catch (e) {
+                  log(client, "warn", `diag.session.get failed: ${(e as Error).message}`).catch(() => {})
+                }
+              })()
+            })
           }
           // Read full recent[] timeline from model.json. opencode stores
           // picker history as an ordered array; recent[0] is current,
@@ -610,6 +639,7 @@ Do NOT proceed with implementation until the plan is approved.
             if (providerID && modelID) {
               lastSessionModel = { providerID, modelID }
             }
+            if (sid) lastSessionID = sid
           }
         }
       } catch {}

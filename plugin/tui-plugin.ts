@@ -51,6 +51,7 @@ interface TuiClient {
   }
   app: {
     agents: () => Promise<{ data?: Array<{ name: string; mode?: string }> }>
+    log: (input: { service?: string; level?: "info" | "warn" | "error" | "debug"; message: string }) => Promise<unknown>
   }
 }
 
@@ -82,6 +83,17 @@ export function ensureTuiPluginSymlink(pluginPath: string, id = "plan-review-tui
 }
 
 const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
+  // diagnostic: confirm the plugin was loaded by the TUI plugin host.
+  // This appears in ~/.local/share/opencode/log/opencode.log and lets
+  // us distinguish three failure modes:
+  //   1. plugin never loaded   -> no log line
+  //   2. plugin loaded but init threw -> error from .log() .catch
+  //   3. plugin loaded and intercept handler never fires -> need to
+  //      inspect keymap priority or the event.name shape
+  void api.client.app
+    .log({ service: "plan-review-tui", level: "info", message: "plan-review-TUI: plugin loaded" })
+    .catch(() => {})
+
   // closure state for this TUI session (in-memory only, lost on restart)
   let prevAgent: string | undefined
   let sessionID: string | undefined
@@ -151,7 +163,19 @@ const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
       const name = event.name
       if (name !== "tab" && name !== "shift+tab") return
       const direction: 1 | -1 = name === "tab" ? 1 : -1
+      // diagnostic: confirm the intercept handler is being called for
+      // Tab/Shift+Tab. The first cycle attempt logs the candidate next
+      // agent even if computeNext returns undefined — that way we know
+      // whether the handler fired at all (vs. keymap priority dropping
+      // it before ours gets a turn).
       const next = computeNext(prevAgent, direction)
+      void api.client.app
+        .log({
+          service: "plan-review-tui",
+          level: "info",
+          message: `plan-review-TUI: intercept ${name}: prev=${prevAgent ?? "?"} next=${next ?? "?"} sessionID=${sessionID ?? "?"}`,
+        })
+        .catch(() => {})
       if (!next || next === prevAgent) return
       cycleCount++
       const from = prevAgent

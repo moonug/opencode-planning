@@ -83,14 +83,20 @@ function ensureCommandSymlink(): void {
   // 'must default export an object with server()'). TUI plugins
   // MUST be registered in tui.json (or tui.jsonc) under the 'plugin'
   // field, see packages/opencode/src/config/tui.ts:89.
+  //
+  // Prior iterations wrote both ~/.config/opencode/tui.json AND
+  // ~/.config/opencode/tui.jsonc with the same path; that created
+  // duplicate plugin origins that the plugin loader couldn't tell apart.
+  // We now write only tui.jsonc (and migrate any old tui.json by
+  // reading from it but writing to tui.jsonc).
   try {
     const tuiPluginPath = join(REPO_DIR, "plugin", "tui-plugin.ts")
     const tuiJsonPath = join(homedir(), ".config", "opencode", "tui.jsonc")
-    const tuiJsonAlt = join(homedir(), ".config", "opencode", "tui.json")
+    const tuiJsonLegacy = join(homedir(), ".config", "opencode", "tui.json")
     let existing: string | undefined
     try { existing = readFileSync(tuiJsonPath, "utf8") } catch {}
     if (existing === undefined) {
-      try { existing = readFileSync(tuiJsonAlt, "utf8") } catch {}
+      try { existing = readFileSync(tuiJsonLegacy, "utf8") } catch {}
     }
     let parsed: any = {}
     if (existing) {

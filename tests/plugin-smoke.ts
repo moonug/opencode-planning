@@ -779,6 +779,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
   const updates: any[] = []
+  const logs: any[] = []
   let handlerFn: any = null
   const fakeApi = {
     client: {
@@ -792,6 +793,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
           { name: "plan", mode: "primary" },
           { name: "build", mode: "primary" },
         ] }),
+        log: async (opts: any) => { logs.push(opts); return {} },
       },
     },
     keymap: {
@@ -811,6 +813,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const second = updates[1].body.metadata.planReviewTabSwitchTo
   if (first !== "plan") throw new Error("first Tab should switch to plan, got: " + first)
   if (second !== "build") throw new Error("second Shift+Tab should switch back to build, got: " + second)
+  // verify diagnostic logs are emitted: 'plugin loaded' + 2 'intercept tab' entries
+  const loaded = logs.find((l: any) => l.message?.includes("plan-review-TUI: plugin loaded"))
+  if (!loaded) throw new Error("missing diagnostic 'plugin loaded' log: " + logs.map((l:any)=>l.message).join("\n"))
+  const interceptLogs = logs.filter((l: any) => l.message?.includes("plan-review-TUI: intercept"))
+  if (interceptLogs.length < 2) throw new Error("expected 2 intercept diagnostic logs, got: " + interceptLogs.length)
   console.log("[39] TUI plugin cycles agents and forwards updates: ok")
 }
 

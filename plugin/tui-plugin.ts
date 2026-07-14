@@ -48,20 +48,20 @@ interface TuiClient {
     list: (input: { query?: { limit?: number } }) => Promise<{ data?: Array<{ id?: string; agent?: string }> }>
     get: (input: { path: { id: string } }) => Promise<{ data?: { agent?: string } }>
     update: (input: { path: { id: string }; body: { metadata?: Record<string, unknown> } }) => Promise<unknown>
+    prompt: (input: { path: { id: string }; body: { agent?: string; noReply?: boolean; parts?: Array<{ type: string; text?: string }> } }) => Promise<unknown>
   }
-  // v2 SDK client (opencode 1.17+). Optional — older plugin hosts may
-  // not expose it. When present, switchAgent is the right way to inform
-  // the server of an agent switch: it goes through setAgentModel() in
-  // packages/core/src/session.ts:393 which publishes
-  // SessionV1.Event.Updated with info.agent. session.update({metadata})
-  // is silently dropped because it does not run setAgentModel.
+  // v2 SDK client (opencode 1.17+). Kept for potential future use but not
+  // currently called — v2.session.switchAgent's event hits the server
+  // plugin's location filter and is silently dropped
+  // (packages/opencode/src/plugin/index.ts:252). Switch to v1
+  // session.prompt instead.
   v2?: {
     session: {
       switchAgent: (input: { path: { sessionID: string }; body: { agent: string } }) => Promise<unknown>
     }
   }
   app: {
-    agents: () => Promise<{ data?: Array<{ name: string; mode?: string; builtIn?: boolean }> }>
+    agents: () => Promise<{ data?: Array<{ name: string; mode?: string; builtIn?: boolean; hidden?: boolean }> }>
     log: (input: { service?: string; level?: "info" | "warn" | "error" | "debug"; message: string }) => Promise<unknown>
   }
 }
@@ -165,53 +165,61 @@ const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
 
   // Forward the agent switch to the server. We need the server plugin's
   // lastSessionAgent cache to know which agent the user is in, so the
-  // model.json watcher can attribute picker changes correctly. The v2
-  // SDK's switchAgent is the right endpoint: it runs setAgentModel()
-  // which patches the session row and publishes SessionV1.Event.Updated
-  // carrying the new info.agent (packages/core/src/session.ts:393-416).
-  // session.update({body:{metadata:{...}}}) does NOT do this — it
-  // persists metadata silently and no event fires, which is why the
-  // previous attempt reached the server but nothing happened.
+  // model.json watcher can attribute picker changes correctly.
   //
-  // Fall back to session.update metadata if v2 is not exposed on this
-  // TUI client (older host versions), so we degrade gracefully.
+  // The naive path is v2.session.switchAgent({agent}) which is the
+  // documented "right" way. We tried it in 00ebea7 and saw the call
+  // go through ("plan-review-TUI: switchAgent build -> plan") but the
+  // server plugin's event hook never received the corresponding
+  // session.next.agent.switched event.
+  //
+  // Root cause (from opencode source):
+  // - packages/opencode/src/plugin/index.ts:251: server plugin's
+  //   event hook filters by event.location.directory === ctx.directory
+  // - packages/core/src/session.ts:393: v2 switchAgent publishes via
+  //   EventV2.Service (without a location context, so InstanceRef is
+  //   not set when the bridge forwards it)
+  // - packages/opencode/src/event-v2-bridge.ts:39: the bridge emits
+  //   with directory: undefined, which the plugin filter then drops.
+  //   plugin.added works because PluginV2.Service is location-aware.
+  //
+  // Workaround without patching opencode: instead of v2.switchAgent
+  // (whose event is dropped by the server plugin's location filter),
+  // use v1 client.session.prompt({body:{noReply: true, agent: to,
+  // parts: [{type:"text", text: "."}]}}).
+  // - packages/opencode/src/session/prompt.ts:635-689: createUserMessage
+  //   runs through location-aware middleware and calls
+  //   sessions.setAgentModel({agent, ...}) which patches the session
+  //   row AND publishes SessionV1.Event.Updated with the new info.agent.
+  //   That event passes through the server plugin's filter (correct
+  //   location) and triggers the existing handler at plugin/index.ts
+  //   that sets lastSessionAgent = info.agent.
+  // - noReply: true means the server does NOT call the provider LLM;
+  //   only a tiny "." user message is recorded in session history
+  //   so the picker-watcher attribution is correct on the next cycle.
+  //
+  // Trade-off: each Tab cycle creates a 1-character "." user message
+  // in the session history. Acceptable given the alternative (no
+  // picker attribution at all when the user cycles agents without
+  // sending a message in each).
   const forward = (from: string | undefined, to: string | undefined) => {
     if (!sessionID) return
     if (!to) return
-    const v2 = (api.client as any).v2
-    if (v2?.session?.switchAgent) {
-      void v2.session
-        .switchAgent({ path: { sessionID }, body: { agent: to } })
-        .catch(() => {
-          // fall through to metadata write below
-        })
-      void api.client.app
-        .log({
-          service: "plan-review-tui",
-          level: "info",
-          message: `plan-review-TUI: switchAgent ${from ?? "?"} -> ${to}`,
-        })
-        .catch(() => {})
-      return
-    }
+    void api.client.session
+      .prompt({
+        path: { id: sessionID },
+        body: {
+          agent: to,
+          noReply: true,
+          parts: [{ type: "text", text: "." }],
+        },
+      })
+      .catch(() => {})
     void api.client.app
       .log({
         service: "plan-review-tui",
-        level: "warn",
-        message: "plan-review-TUI: v2.switchAgent not exposed; falling back to metadata write (server may not see this)",
-      })
-      .catch(() => {})
-    void api.client.session
-      .update({
-        path: { id: sessionID },
-        body: {
-          metadata: {
-            planReviewTabSwitchFrom: from ?? "",
-            planReviewTabSwitchTo: to,
-            planReviewTabSwitchAt: Date.now(),
-            planReviewTabSwitchCount: cycleCount,
-          },
-        },
+        level: "info",
+        message: `plan-review-TUI: forwardTab ${from ?? "?"} -> ${to}`,
       })
       .catch(() => {})
   }

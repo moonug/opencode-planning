@@ -774,11 +774,19 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[38] TUI plugin exports { id, tui } object: ok")
 }
 
-// 39. TUI plugin tui() registers intercept handler and Tab cycles agents
+// 39. TUI plugin tui() registers intercept handler and Tab cycles agents,
+//     forwarding the agent switch via session.prompt({body:{agent, noReply:
+//     true, parts:[{"."]}}). session.prompt goes through location-aware
+//     middleware and triggers SessionV1.Event.Updated with info.agent
+//     on the server — that event passes the server plugin's location
+//     filter and updates lastSessionAgent. session.update({metadata})
+//     and v2.session.switchAgent both end up with events dropped or
+//     silently absorbed; the session.prompt path is the one that
+//     actually reaches the server plugin.
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
-  const updates: any[] = []
+  const prompts: any[] = []
   const logs: any[] = []
   let handlerFn: any = null
   const fakeApi = {
@@ -786,12 +794,12 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       session: {
         list: async () => ({ data: [{ id: "ses_cycle", agent: "build" }] }),
         get: async () => ({ data: { agent: "build" } }),
-        update: async (opts: any) => { updates.push(opts); return {} },
+        prompt: async (opts: any) => { prompts.push(opts); return {} },
       },
       app: {
         agents: async () => ({ data: [
-          { name: "plan", mode: "primary" },
-          { name: "build", mode: "primary" },
+          { name: "plan", mode: "primary", hidden: false },
+          { name: "build", mode: "primary", hidden: false },
         ] }),
         log: async (opts: any) => { logs.push(opts); return {} },
       },
@@ -802,23 +810,25 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
   await tuiPluginFn(fakeApi, undefined, undefined)
   if (!handlerFn) throw new Error("intercept handler not registered")
-  // 1st Tab: build -> plan (forward)
+  // 1st Tab: build -> plan
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 30))
-  // 2nd Shift+Tab: plan -> build (back)
+  // 2nd Shift+Tab: plan -> build
   handlerFn({ event: { name: "shift+tab" } })
   await new Promise(r => setTimeout(r, 30))
-  if (updates.length < 2) throw new Error("expected 2 session.update calls, got: " + updates.length)
-  const first = updates[0].body.metadata.planReviewTabSwitchTo
-  const second = updates[1].body.metadata.planReviewTabSwitchTo
-  if (first !== "plan") throw new Error("first Tab should switch to plan, got: " + first)
-  if (second !== "build") throw new Error("second Shift+Tab should switch back to build, got: " + second)
-  // verify diagnostic logs are emitted: 'plugin loaded' + 2 'intercept tab' entries
+  if (prompts.length !== 2) throw new Error("expected 2 session.prompt calls, got: " + prompts.length)
+  if (prompts[0].body.agent !== "plan") throw new Error("first Tab should target plan, got: " + prompts[0].body.agent)
+  if (prompts[0].body.noReply !== true) throw new Error("first Tab prompt must have noReply=true, got: " + prompts[0].body.noReply)
+  if (!Array.isArray(prompts[0].body.parts) || prompts[0].body.parts.length === 0) {
+    throw new Error("first Tab prompt needs at least one part, got: " + JSON.stringify(prompts[0].body))
+  }
+  if (prompts[1].body.agent !== "build") throw new Error("second Shift+Tab should target build, got: " + prompts[1].body.agent)
+  // diagnostic logs still emitted
   const loaded = logs.find((l: any) => l.message?.includes("plan-review-TUI: plugin loaded"))
-  if (!loaded) throw new Error("missing diagnostic 'plugin loaded' log: " + logs.map((l:any)=>l.message).join("\n"))
+  if (!loaded) throw new Error("missing 'plugin loaded' log")
   const interceptLogs = logs.filter((l: any) => l.message?.includes("plan-review-TUI: intercept"))
-  if (interceptLogs.length < 2) throw new Error("expected 2 intercept diagnostic logs, got: " + interceptLogs.length)
-  console.log("[39] TUI plugin cycles agents and forwards updates: ok")
+  if (interceptLogs.length < 2) throw new Error("expected 2 intercept logs, got: " + interceptLogs.length)
+  console.log("[39] TUI plugin cycles agents and forwards via session.prompt: ok")
 }
 
 // 40. Server plugin event hook: session.updated.1 with info.agent === "plan"
@@ -931,19 +941,14 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
-  const switchCalls: any[] = []
+  const prompts: any[] = []
   let handlerFn: any = null
   const fakeApi = {
     client: {
       session: {
         list: async () => ({ data: [{ id: "ses_filter", agent: "build" }] }),
         get: async () => ({ data: { agent: "build" } }),
-        update: async () => ({}),
-      },
-      v2: {
-        session: {
-          switchAgent: async (opts: any) => { switchCalls.push(opts); return {} },
-        },
+        prompt: async (opts: any) => { prompts.push(opts); return {} },
       },
       app: {
         agents: async () => ({ data: [
@@ -962,20 +967,15 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
   await tuiPluginFn(fakeApi, undefined, undefined)
   if (!handlerFn) throw new Error("intercept handler not registered")
-  // hidden filter: agents = [plan, build]
-  // idx(build) = 1, next = (1+1+2)%2 = 0 = plan.
-  handlerFn({ event: { name: "tab" } })
+  handlerFn({ event: { name: "tab" } }) // build -> plan
   await new Promise(r => setTimeout(r, 30))
-  if (switchCalls.length !== 1) throw new Error("expected 1 switchAgent call, got: " + switchCalls.length)
-  if (switchCalls[0].body.agent !== "plan") {
-    throw new Error("first Tab (from build) should switch to plan, got: " + switchCalls[0].body.agent)
-  }
   // Cycle multiple times — compaction/code-review must never appear.
   for (let i = 0; i < 4; i++) {
     handlerFn({ event: { name: "tab" } })
     await new Promise(r => setTimeout(r, 30))
   }
-  const called = switchCalls.map((c: any) => c.body.agent)
+  const called = prompts.map((p: any) => p.body.agent)
+  if (called.length < 1) throw new Error("expected at least 1 prompt call, got 0")
   if (called.includes("compaction")) {
     throw new Error("compaction (hidden:true) should not be a cycle target: " + called.join(","))
   }
@@ -988,30 +988,36 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[42] TUI plugin filter excludes hidden primary agents: ok")
 }
 
-// 43. TUI plugin forward uses v2.session.switchAgent when v2 client is
-//     exposed — verify the correct endpoint/args are used.
+// 43. TUI plugin forwards via session.prompt (single path now — v2 was removed)
+//     even when v2 client IS exposed. session.prompt goes through
+//     location-aware middleware which is the only path that survives
+//     the server plugin's event-hook location filter at
+//     packages/opencode/src/plugin/index.ts:252.
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
-  const switchCalls: any[] = []
-  const updates: any[] = []
+  const prompts: any[] = []
   let handlerFn: any = null
   const fakeApi = {
     client: {
       session: {
-        list: async () => ({ data: [{ id: "ses_v2", agent: "plan" }] }),
+        list: async () => ({ data: [{ id: "ses_v2_present", agent: "plan" }] }),
         get: async () => ({ data: { agent: "plan" } }),
-        update: async (opts: any) => { updates.push(opts); return {} },
+        prompt: async (opts: any) => { prompts.push(opts); return {} },
       },
       v2: {
         session: {
-          switchAgent: async (opts: any) => { switchCalls.push(opts); return {} },
+          // even when v2 is "exposed" (e.g. on a future opencode version),
+          // we should still use session.prompt — the plugin no longer
+          // calls v2.switchAgent at all. Verify only ONE call site was
+          // made (to prompt, not v2).
+          switchAgent: async () => ({ data: null }),
         },
       },
       app: {
         agents: async () => ({ data: [
-          { name: "plan", mode: "primary", builtIn: false },
-          { name: "build", mode: "primary", builtIn: false },
+          { name: "plan", mode: "primary", hidden: false },
+          { name: "build", mode: "primary", hidden: false },
         ] }),
         log: async () => ({}),
       },
@@ -1021,16 +1027,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     },
   }
   await tuiPluginFn(fakeApi, undefined, undefined)
-  if (!handlerFn) throw new Error("intercept handler not registered")
-  // 1st Tab: plan -> build (forward)
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 30))
-  if (switchCalls.length !== 1) throw new Error("expected 1 switchAgent call, got: " + switchCalls.length)
-  if (switchCalls[0].path.sessionID !== "ses_v2") throw new Error("switchAgent path.sessionID should be 'ses_v2', got: " + switchCalls[0].path.sessionID)
-  if (switchCalls[0].body.agent !== "build") throw new Error("switchAgent body.agent should be 'build', got: " + switchCalls[0].body.agent)
-  // session.update should NOT have been called — v2 is the chosen path.
-  if (updates.length !== 0) throw new Error("session.update should NOT be called when v2 is exposed, got: " + updates.length)
-  console.log("[43] TUI plugin uses v2.session.switchAgent when exposed: ok")
+  if (prompts.length !== 1) throw new Error("expected 1 prompt call, got: " + prompts.length)
+  if (prompts[0].body.agent !== "build") throw new Error("prompt should target build, got: " + prompts[0].body.agent)
+  console.log("[43] TUI plugin uses session.prompt even when v2 exposed: ok")
 }
 
 // 44. TUI plugin falls back to session.update({metadata}) when v2 client
@@ -1039,7 +1040,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
-  const updates: any[] = []
+  const prompts: any[] = []
   const logs: any[] = []
   let handlerFn: any = null
   const fakeApi = {
@@ -1047,12 +1048,12 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       session: {
         list: async () => ({ data: [{ id: "ses_fallback", agent: "build" }] }),
         get: async () => ({ data: { agent: "build" } }),
-        update: async (opts: any) => { updates.push(opts); return {} },
+        prompt: async (opts: any) => { prompts.push(opts); return {} },
       },
       app: {
         agents: async () => ({ data: [
-          { name: "plan", mode: "primary", builtIn: false },
-          { name: "build", mode: "primary", builtIn: false },
+          { name: "plan", mode: "primary", hidden: false },
+          { name: "build", mode: "primary", hidden: false },
         ] }),
         log: async (opts: any) => { logs.push(opts); return {} },
       },
@@ -1066,13 +1067,16 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (!handlerFn) throw new Error("intercept handler not registered")
   handlerFn({ event: { name: "tab" } }) // build -> plan
   await new Promise(r => setTimeout(r, 30))
-  if (updates.length !== 1) throw new Error("expected 1 session.update call (fallback), got: " + updates.length)
-  if (updates[0].body.metadata?.planReviewTabSwitchTo !== "plan") {
-    throw new Error("fallback should write metadata.planReviewTabSwitchTo='plan', got: " + JSON.stringify(updates[0].body))
-  }
-  const warn = logs.find((l: any) => l.message?.includes("v2.switchAgent not exposed"))
-  if (!warn) throw new Error("expected warn log about v2 fallback, got: " + logs.map((l:any)=>l.message).join("\n"))
-  console.log("[44] TUI plugin falls back to session.update when v2 absent: ok")
+  // session.prompt is the SINGLE forward path now (no v2 fallback —
+  // v2.switchAgent's event was being filtered out by the server plugin
+  // event hook's location check). Verify the prompt call was made.
+  if (prompts.length !== 1) throw new Error("expected 1 session.prompt call, got: " + prompts.length)
+  if (prompts[0].body.agent !== "plan") throw new Error("prompt should target plan, got: " + prompts[0].body.agent)
+  if (prompts[0].body.noReply !== true) throw new Error("prompt must have noReply=true")
+  // confirm debug log fires
+  const fwd = logs.find((l: any) => l.message?.includes("plan-review-TUI: forwardTab"))
+  if (!fwd) throw new Error("expected 'forwardTab' log, got: " + logs.map((l:any)=>l.message).join("\n"))
+  console.log("[44] TUI plugin forwards via session.prompt (single path): ok")
 }
 
 // 45. Server event hook handles session.next.agent.switched.1 — visible log

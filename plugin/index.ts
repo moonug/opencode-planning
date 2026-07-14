@@ -1,5 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync } from "node:fs"
+import { existsSync, readFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, chmodSync, statSync, copyFileSync, watch } from "node:fs"
 import { dirname, resolve, join, basename } from "node:path"
 import { homedir } from "node:os"
 import { rememberBuildModel, type ModelRef } from "./model-memory"
@@ -100,6 +100,21 @@ async function getPlanAgentModel(client: any): Promise<ModelRef | undefined> {
   return undefined
 }
 
+function readPickerState(filePath?: string): ModelRef | undefined {
+  try {
+    const path = filePath ?? `${homedir()}/.local/state/opencode/model.json`
+    const raw = readFileSync(path, "utf8")
+    const data = JSON.parse(raw) as { recent?: Array<{ providerID?: string; modelID?: string }> }
+    if (Array.isArray(data.recent) && data.recent.length > 0) {
+      const entry = data.recent[0]!
+      if (typeof entry.providerID === "string" && typeof entry.modelID === "string") {
+        return { providerID: entry.providerID, modelID: entry.modelID }
+      }
+    }
+  } catch {}
+  return undefined
+}
+
 async function getGlobalModel(client: any): Promise<ModelRef | undefined> {
   try {
     const res = await client.config.get()
@@ -154,6 +169,7 @@ async function exitPlanMode(
   buildModels: Map<string, ModelRef>,
   chatMessageMemory: Map<string, Map<string, ModelRef>>,
   lastResolution: { target?: ModelRef; source?: string },
+  lastGlobalPicker: (() => ModelRef | undefined) | undefined,
   sessionID: string | undefined,
   summary: string,
 ): Promise<void> {
@@ -170,6 +186,10 @@ async function exitPlanMode(
   ])
 
   const fromChatPlan = perAgent?.get("plan")
+  // lastGlobalPicker is populated by fs.watch on model.json (set in
+  // plugin init). In tests the default is undefined so the picker
+  // source does not leak across test runs.
+  const fromPicker = lastGlobalPicker?.()
 
   let source: string
   let target: ModelRef | undefined
@@ -178,6 +198,7 @@ async function exitPlanMode(
   else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
+  else if (fromPicker)   { target = fromPicker;   source = "picker (model.json recent[0])" }
   else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }
   else                  { source = "opencode default" }
 
@@ -253,6 +274,23 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
   const lastResolution: { target?: ModelRef; source?: string } = {}
   const lastShownModels = new Map<string, ProviderListEntry[]>()
   const chatMessageMemory = new Map<string, Map<string, ModelRef>>()
+  const MODEL_JSON_PATH = process.env.PLAN_REVIEW_MODEL_JSON
+    ?? `${homedir()}/.local/state/opencode/model.json`
+  let lastGlobalPicker: ModelRef | undefined = readPickerState(MODEL_JSON_PATH)
+
+  // Watch model.json so we pick up TUI picker changes even when no message
+  // is sent. TUI writes its selection to recent[0]; we read it eagerly.
+  try {
+    if (existsSync(MODEL_JSON_PATH)) {
+      watch(MODEL_JSON_PATH, { persistent: false }, () => {
+        const m = readPickerState(MODEL_JSON_PATH)
+        if (m && (!lastGlobalPicker || lastGlobalPicker.providerID !== m.providerID || lastGlobalPicker.modelID !== m.modelID)) {
+          lastGlobalPicker = m
+          log(client, "info", `plan-review: model.json changed, recent[0]=${m.providerID}/${m.modelID}`).catch(() => {})
+        }
+      })
+    }
+  } catch {}
 
   const plan_review = tool({
     description:
@@ -272,7 +310,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -561,7 +599,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})

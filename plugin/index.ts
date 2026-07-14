@@ -695,23 +695,16 @@ Do NOT proceed with implementation until the plan is approved.
             }
             if (sid) lastSessionID = sid
           }
-          // TUI-side plugin (plugin/tui-plugin.ts) writes
-          // metadata.planReviewTabSwitchTo when the user cycles agents
-          // via Tab/Shift+Tab. The opencode TUI's local agent state is
-          // purely in-memory (no server publication), so without this
-          // metadata bridge the server cannot know which agent the user
-          // just switched to until the next chat.message fires.
-          // session.updated.1 fires whenever the session row is patched,
-          // including via session.update({body:{metadata:{...}}}), so
-          // this handler picks up the TUI plugin's notifications.
-          const meta = info?.metadata ?? {}
-          const tabSwitchTo = (meta as any)?.planReviewTabSwitchTo
-          if (typeof tabSwitchTo === "string" && tabSwitchTo && sid) {
-            lastSessionAgent = tabSwitchTo
-            await log(client, "info",
-              `plan-review: tab switch forwarded by TUI plugin: session=${sid} -> ${tabSwitchTo}`,
-            ).catch(() => {})
-          }
+          // TUI-side plugin (plugin/tui-plugin.ts) calls the v2 SDK's
+          // switchAgent endpoint when the user cycles agents via Tab/
+          // Shift+Tab. switchAgent runs setAgentModel() which patches
+          // the session row and publishes SessionV1.Event.Updated
+          // carrying the new info.agent — so the existing handler
+          // above already updated lastSessionAgent from info.agent.
+          // No metadata parsing needed here. (Earlier we tried reading
+          // metadata.planReviewTabSwitchTo, but session.update({body:
+          // {metadata:{...}}}) does NOT run setAgentModel and so the
+          // event never fires — that path was dead-end.)
         }
       } catch {}
 

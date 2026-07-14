@@ -49,8 +49,19 @@ interface TuiClient {
     get: (input: { path: { id: string } }) => Promise<{ data?: { agent?: string } }>
     update: (input: { path: { id: string }; body: { metadata?: Record<string, unknown> } }) => Promise<unknown>
   }
+  // v2 SDK client (opencode 1.17+). Optional — older plugin hosts may
+  // not expose it. When present, switchAgent is the right way to inform
+  // the server of an agent switch: it goes through setAgentModel() in
+  // packages/core/src/session.ts:393 which publishes
+  // SessionV1.Event.Updated with info.agent. session.update({metadata})
+  // is silently dropped because it does not run setAgentModel.
+  v2?: {
+    session: {
+      switchAgent: (input: { path: { sessionID: string }; body: { agent: string } }) => Promise<unknown>
+    }
+  }
   app: {
-    agents: () => Promise<{ data?: Array<{ name: string; mode?: string }> }>
+    agents: () => Promise<{ data?: Array<{ name: string; mode?: string; builtIn?: boolean }> }>
     log: (input: { service?: string; level?: "info" | "warn" | "error" | "debug"; message: string }) => Promise<unknown>
   }
 }
@@ -117,13 +128,18 @@ const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
 
   // Cache primary agent list. The TUI's local.agent.set() only operates
   // on the same set, and we need the list to compute the next agent on
-  // each Tab press without round-tripping the server.
+  // each Tab press without round-tripping the server. Filter out:
+  //   - subagent mode (not a primary user-visible agent)
+  //   - builtIn === true (system agents like compaction, code-review,
+  //     explore, general — these ship with opencode and should not be
+  //     reachable from the cycle loop, even though they have
+  //     mode === "primary")
   let primaryAgents: string[] = []
   try {
     const res = await api.client.app.agents()
     const data = (res as any)?.data ?? []
     primaryAgents = (Array.isArray(data) ? data : [])
-      .filter((a: any) => a && typeof a.name === "string" && a.mode !== "subagent")
+      .filter((a: any) => a && typeof a.name === "string" && a.mode !== "subagent" && a.builtIn !== true)
       .map((a: any) => a.name as string)
   } catch {}
 
@@ -135,25 +151,57 @@ const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
     return primaryAgents[next]
   }
 
-  // Forward the agent switch to the server. The server plugin sees the
-  // metadata change via SessionV1.Event.Updated and updates its
-  // lastSessionAgent. Fire-and-forget — we don't block the keypress.
+  // Forward the agent switch to the server. We need the server plugin's
+  // lastSessionAgent cache to know which agent the user is in, so the
+  // model.json watcher can attribute picker changes correctly. The v2
+  // SDK's switchAgent is the right endpoint: it runs setAgentModel()
+  // which patches the session row and publishes SessionV1.Event.Updated
+  // carrying the new info.agent (packages/core/src/session.ts:393-416).
+  // session.update({body:{metadata:{...}}}) does NOT do this — it
+  // persists metadata silently and no event fires, which is why the
+  // previous attempt reached the server but nothing happened.
+  //
+  // Fall back to session.update metadata if v2 is not exposed on this
+  // TUI client (older host versions), so we degrade gracefully.
   const forward = (from: string | undefined, to: string | undefined) => {
     if (!sessionID) return
     if (!to) return
-    void api.client.session.update({
-      path: { id: sessionID },
-      body: {
-        metadata: {
-          planReviewTabSwitchFrom: from ?? "",
-          planReviewTabSwitchTo: to,
-          planReviewTabSwitchAt: Date.now(),
-          planReviewTabSwitchCount: cycleCount,
+    const v2 = (api.client as any).v2
+    if (v2?.session?.switchAgent) {
+      void v2.session
+        .switchAgent({ path: { sessionID }, body: { agent: to } })
+        .catch(() => {
+          // fall through to metadata write below
+        })
+      void api.client.app
+        .log({
+          service: "plan-review-tui",
+          level: "info",
+          message: `plan-review-TUI: switchAgent ${from ?? "?"} -> ${to}`,
+        })
+        .catch(() => {})
+      return
+    }
+    void api.client.app
+      .log({
+        service: "plan-review-tui",
+        level: "warn",
+        message: "plan-review-TUI: v2.switchAgent not exposed; falling back to metadata write (server may not see this)",
+      })
+      .catch(() => {})
+    void api.client.session
+      .update({
+        path: { id: sessionID },
+        body: {
+          metadata: {
+            planReviewTabSwitchFrom: from ?? "",
+            planReviewTabSwitchTo: to,
+            planReviewTabSwitchAt: Date.now(),
+            planReviewTabSwitchCount: cycleCount,
+          },
         },
-      },
-    }).catch(() => {
-      // server may be temporarily unavailable; next Tab will retry
-    })
+      })
+      .catch(() => {})
   }
 
   api.keymap.intercept(

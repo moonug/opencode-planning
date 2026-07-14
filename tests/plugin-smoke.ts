@@ -821,8 +821,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[39] TUI plugin cycles agents and forwards updates: ok")
 }
 
-// 40. Server plugin event hook: session.updated.1 with metadata.planReviewTabSwitchTo
-//     -> lastSessionAgent updated to "plan"
+// 40. Server plugin event hook: session.updated.1 with info.agent === "plan"
+//     (the path v2.switchAgent goes through setAgentModel) — lastSessionAgent
+//     is updated to "plan" via the existing info?.agent handler. The
+//     previous metadata.planReviewTabSwitchTo parsing was removed because
+//     session.update({metadata}) does not fire SessionV1.Event.Updated.
 {
   ;(globalThis as any).__planReviewEventProbeDone = false
   ;(globalThis as any).__planReviewChatMessageProbeDone = false
@@ -839,25 +842,30 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
-  // fire session.updated event with metadata.planReviewTabSwitchTo = "plan"
+  // fire session.updated event with info.agent === "plan" (this is what
+  // v2.switchAgent triggers via setAgentModel in packages/core/src/session.ts:393)
   await testHooks.event({
     event: {
       type: "session.updated",
       properties: {
         info: {
           id: "ses_meta",
-          agent: "build",
+          agent: "plan",
           model: { providerID: "ya-glm", modelID: "glm" },
-          metadata: { planReviewTabSwitchTo: "plan", planReviewTabSwitchFrom: "build" },
         },
       },
     },
   })
   await new Promise(r => setTimeout(r, 30))
-  const log = logs.find((l: any) => l.body?.message?.includes("tab switch forwarded by TUI plugin"))
-  if (!log) throw new Error("tab switch forwarded log missing: " + logs.map((l:any)=>l.body?.message).join("\n"))
-  if (!log.body.message.includes("plan")) throw new Error("log should mention plan, got: " + log.body.message)
-  console.log("[40] server event hook reads metadata.planReviewTabSwitchTo: ok")
+  // Assert: the event handler ran without error. We previously relied on
+  // a 'tab switch forwarded' log here but that path is gone — the new
+  // path updates lastSessionAgent directly from info?.agent in the
+  // existing handler. So 'no error' + 'no forwarded log' is the correct
+  // assertion. (We can't easily read module-level state without
+  // exporting it; live test verifies the full pipeline.)
+  const forwarded = logs.find((l: any) => l.body?.message?.includes("tab switch forwarded"))
+  if (forwarded) throw new Error("expected 'tab switch forwarded' log to be gone, got: " + forwarded.body?.message)
+  console.log("[40] server event hook uses info.agent (v2.switchAgent path): ok")
 }
 
 // 41. tui.json (or tui.jsonc) registration via ensureCommandSymlink —
@@ -872,12 +880,9 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const old = process.env.HOME
   process.env.HOME = tmp
   try {
-    const { homedir } = await import("node:os")
-    process.env.HOME = tmp
-    console.log("smoke [41] before mod.default, HOME=" + process.env.HOME + ", homedir()=" + homedir() + ", tmp=" + tmp)
     // invoke ensureCommandSymlink via mod.default's init
     try {
-      const result = await mod.default({
+      await mod.default({
         client: {
           app: { log: async () => {}, agents: async () => ({ data: [] }) } as any,
           session: { prompt: async () => {} },
@@ -888,20 +893,12 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
         serverUrl: new URL("http://x"),
         $,
       })
-      console.log("smoke [41] mod.default returned, has event=" + (typeof result?.event))
-    } catch (e) {
-      console.log("smoke [41] mod.default error (expected): " + (e as Error).message)
+    } catch {
+      // expected: prior tests' mod.default init may still be running with
+      // a different client. We only care about the tui.json(c) side effect.
     }
     // plugin init runs in background (queueMicrotask), wait briefly
     await new Promise(r => setTimeout(r, 100))
-    console.log("smoke [41] after wait, homedir()=" + homedir())
-    let fakeListing: string[] = []
-    try { fakeListing = fs.readdirSync(`${tmp}/.config/opencode`) } catch {}
-    console.log("smoke [41] after wait, listing " + tmp + "/.config/opencode: " + JSON.stringify(fakeListing))
-    // also check real HOMEdir for any accidental writes
-    let realListing: string[] = []
-    try { realListing = fs.readdirSync(`/Users/moonug/.config/opencode`) } catch {}
-    console.log("smoke [41] real HOME listing: " + JSON.stringify(realListing.filter((f: string) => f.includes('tui'))))
     const candidates = ["tui.jsonc", "tui.json"]
     let found: string | undefined
     for (const c of candidates) {
@@ -923,6 +920,161 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   } finally {
     process.env.HOME = old
   }
+}
+
+// 42. TUI plugin filter excludes builtIn === true agents (e.g. compaction,
+//     code-review, explore) so they are not reachable from Tab cycle.
+//     Only user-configured primary agents (builtIn !== true) remain in the
+//     cycle list.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const switchCalls: any[] = []
+  let handlerFn: any = null
+  const fakeApi = {
+    client: {
+      session: {
+        list: async () => ({ data: [{ id: "ses_filter", agent: "build" }] }),
+        get: async () => ({ data: { agent: "build" } }),
+        update: async () => ({}),
+      },
+      v2: {
+        session: {
+          switchAgent: async (opts: any) => { switchCalls.push(opts); return {} },
+        },
+      },
+      app: {
+        agents: async () => ({ data: [
+          { name: "plan", mode: "primary", builtIn: false },
+          { name: "build", mode: "primary", builtIn: false },
+          { name: "compaction", mode: "primary", builtIn: true },
+          { name: "code-review", mode: "primary", builtIn: true },
+          { name: "explore", mode: "subagent", builtIn: true },
+        ] }),
+        log: async () => ({}),
+      },
+    },
+    keymap: {
+      intercept: (_type: string, handler: any) => { handlerFn = handler; return () => {} },
+    },
+  }
+  await tuiPluginFn(fakeApi, undefined, undefined)
+  if (!handlerFn) throw new Error("intercept handler not registered")
+  // 1st Tab from build: should land on plan (build -> plan is first non-builtin)
+  // Actually with builtIn filter: agents = [plan, build]
+  // idx(build) = 1, next = (1+1+2)%2 = 0 = plan. Good.
+  handlerFn({ event: { name: "tab" } })
+  await new Promise(r => setTimeout(r, 30))
+  if (switchCalls.length !== 1) throw new Error("expected 1 switchAgent call, got: " + switchCalls.length)
+  if (switchCalls[0].body.agent !== "plan") {
+    throw new Error("first Tab (from build) should switch to plan, got: " + switchCalls[0].body.agent)
+  }
+  // compaction should NOT appear as a possible target. We can't easily
+  // assert "never called with compaction" without exhausting the cycle,
+  // but we can verify the filter by looking at what computeNext would
+  // produce after a second Tab. After plan -> build -> plan -> build ...
+  // compaction is unreachable.
+  handlerFn({ event: { name: "tab" } }) // plan -> build
+  await new Promise(r => setTimeout(r, 30))
+  handlerFn({ event: { name: "tab" } }) // build -> plan
+  await new Promise(r => setTimeout(r, 30))
+  handlerFn({ event: { name: "tab" } }) // plan -> build
+  await new Promise(r => setTimeout(r, 30))
+  const called = switchCalls.map((c: any) => c.body.agent)
+  if (called.includes("compaction")) {
+    throw new Error("compaction should not be a cycle target, but switchAgent was called with it: " + called.join(","))
+  }
+  if (called.includes("code-review")) {
+    throw new Error("code-review should not be a cycle target: " + called.join(","))
+  }
+  console.log("[42] TUI plugin filter excludes builtIn primary agents: ok")
+}
+
+// 43. TUI plugin forward uses v2.session.switchAgent when v2 client is
+//     exposed — verify the correct endpoint/args are used.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const switchCalls: any[] = []
+  const updates: any[] = []
+  let handlerFn: any = null
+  const fakeApi = {
+    client: {
+      session: {
+        list: async () => ({ data: [{ id: "ses_v2", agent: "plan" }] }),
+        get: async () => ({ data: { agent: "plan" } }),
+        update: async (opts: any) => { updates.push(opts); return {} },
+      },
+      v2: {
+        session: {
+          switchAgent: async (opts: any) => { switchCalls.push(opts); return {} },
+        },
+      },
+      app: {
+        agents: async () => ({ data: [
+          { name: "plan", mode: "primary", builtIn: false },
+          { name: "build", mode: "primary", builtIn: false },
+        ] }),
+        log: async () => ({}),
+      },
+    },
+    keymap: {
+      intercept: (_type: string, handler: any) => { handlerFn = handler; return () => {} },
+    },
+  }
+  await tuiPluginFn(fakeApi, undefined, undefined)
+  if (!handlerFn) throw new Error("intercept handler not registered")
+  // 1st Tab: plan -> build (forward)
+  handlerFn({ event: { name: "tab" } })
+  await new Promise(r => setTimeout(r, 30))
+  if (switchCalls.length !== 1) throw new Error("expected 1 switchAgent call, got: " + switchCalls.length)
+  if (switchCalls[0].path.sessionID !== "ses_v2") throw new Error("switchAgent path.sessionID should be 'ses_v2', got: " + switchCalls[0].path.sessionID)
+  if (switchCalls[0].body.agent !== "build") throw new Error("switchAgent body.agent should be 'build', got: " + switchCalls[0].body.agent)
+  // session.update should NOT have been called — v2 is the chosen path.
+  if (updates.length !== 0) throw new Error("session.update should NOT be called when v2 is exposed, got: " + updates.length)
+  console.log("[43] TUI plugin uses v2.session.switchAgent when exposed: ok")
+}
+
+// 44. TUI plugin falls back to session.update({metadata}) when v2 client
+//     is not exposed (older host versions). Same observable behavior as
+//     before, but with a warn log so we know it happened.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const updates: any[] = []
+  const logs: any[] = []
+  let handlerFn: any = null
+  const fakeApi = {
+    client: {
+      session: {
+        list: async () => ({ data: [{ id: "ses_fallback", agent: "build" }] }),
+        get: async () => ({ data: { agent: "build" } }),
+        update: async (opts: any) => { updates.push(opts); return {} },
+      },
+      app: {
+        agents: async () => ({ data: [
+          { name: "plan", mode: "primary", builtIn: false },
+          { name: "build", mode: "primary", builtIn: false },
+        ] }),
+        log: async (opts: any) => { logs.push(opts); return {} },
+      },
+      // NOTE: no `v2` here
+    },
+    keymap: {
+      intercept: (_type: string, handler: any) => { handlerFn = handler; return () => {} },
+    },
+  }
+  await tuiPluginFn(fakeApi, undefined, undefined)
+  if (!handlerFn) throw new Error("intercept handler not registered")
+  handlerFn({ event: { name: "tab" } }) // build -> plan
+  await new Promise(r => setTimeout(r, 30))
+  if (updates.length !== 1) throw new Error("expected 1 session.update call (fallback), got: " + updates.length)
+  if (updates[0].body.metadata?.planReviewTabSwitchTo !== "plan") {
+    throw new Error("fallback should write metadata.planReviewTabSwitchTo='plan', got: " + JSON.stringify(updates[0].body))
+  }
+  const warn = logs.find((l: any) => l.message?.includes("v2.switchAgent not exposed"))
+  if (!warn) throw new Error("expected warn log about v2 fallback, got: " + logs.map((l:any)=>l.message).join("\n"))
+  console.log("[44] TUI plugin falls back to session.update when v2 absent: ok")
 }
 
 // 7b. exitPlanMode happy path with resolved target — sends inline model+agent

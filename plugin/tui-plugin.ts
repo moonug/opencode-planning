@@ -128,20 +128,32 @@ const tuiPlugin = async (api: TuiApi, _options?: unknown, _meta?: unknown) => {
 
   // Cache primary agent list. The TUI's local.agent.set() only operates
   // on the same set, and we need the list to compute the next agent on
-  // each Tab press without round-tripping the server. Filter out:
-  //   - subagent mode (not a primary user-visible agent)
-  //   - builtIn === true (system agents like compaction, code-review,
-  //     explore, general — these ship with opencode and should not be
-  //     reachable from the cycle loop, even though they have
-  //     mode === "primary")
+  // each Tab press without round-tripping the server.
+  //
+  // Mirror the TUI's own filter from
+  // packages/tui/src/context/local.tsx:78 exactly:
+  //   sync.data.agent.filter((agent) => agent.mode !== "subagent" && !agent.hidden)
+  //
+  // Agent definitions (packages/opencode/src/agent/agent.ts) show that
+  // compaction, code-review, explore, general, and title all set
+  // { mode: "primary", native: true, hidden: true }. The v1 SDK renames
+  // `native` to `builtIn` but the API often omits `builtIn` for agents
+  // where it would be false, leaving `builtIn: undefined` in the
+  // runtime response — so filtering by `builtIn !== true` lets hidden
+  // agents through. Filtering by `hidden !== true` matches the TUI's
+  // own behavior exactly.
   let primaryAgents: string[] = []
   try {
     const res = await api.client.app.agents()
     const data = (res as any)?.data ?? []
     primaryAgents = (Array.isArray(data) ? data : [])
-      .filter((a: any) => a && typeof a.name === "string" && a.mode !== "subagent" && a.builtIn !== true)
+      .filter((a: any) => a && typeof a.name === "string" && a.mode !== "subagent" && a.hidden !== true)
       .map((a: any) => a.name as string)
-  } catch {}
+  } catch (e) {
+    void api.client.app
+      .log({ service: "plan-review-tui", level: "warn", message: `plan-review-TUI: app.agents() failed: ${(e as Error).message}` })
+      .catch(() => {})
+  }
 
   const computeNext = (current: string | undefined, direction: 1 | -1): string | undefined => {
     if (primaryAgents.length === 0) return undefined

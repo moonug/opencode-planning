@@ -126,6 +126,33 @@ function log(client: any, level: "debug" | "info" | "warn" | "error", message: s
   return client.app.log({ body: { service: "plan-review", level, message } })
 }
 
+// logged() — fire-and-forget variant of log() that never swallows an
+// error silently. Per AGENTS.md: `catch {}` — нельзя. This is the only
+// place in this file where a catch is allowed to fail open — it routes
+// the failure through console.error so it lands in terminal stderr
+// even when the server log API is unreachable.
+function logged(client: any, level: "debug" | "info" | "warn" | "error", message: string): Promise<void> {
+  return log(client, level, message)
+    .then(() => undefined)
+    .catch((e: unknown) => {
+      const errText = (e as Error)?.message ?? String(e)
+      console.error(`plan-review: log(${level}) call failed: ${errText}; original=${message}`)
+    })
+}
+
+// visibleErr() — helper for replacing `.catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L143): ${(e as Error)?.message ?? String(e)}`) })` on non-log
+// promises. Records the error on the server log first, falls back to
+// console.error if server is unreachable. Use this everywhere instead
+// of bare `.catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L146): ${(e as Error)?.message ?? String(e)}`) })` so we never silently lose a fail signal.
+async function visibleErr(client: any, context: string, e: unknown): Promise<void> {
+  const errText = (e as Error)?.message ?? String(e)
+  try {
+    await log(client, "warn", `swallowed error in ${context}: ${errText}`)
+  } catch {
+    console.error(`plan-review: swallowed error in ${context}: ${errText}`)
+  }
+}
+
 async function getBuildAgentModel(client: any): Promise<ModelRef | undefined> {
   try {
     const res = await client.app.agents()
@@ -229,7 +256,7 @@ async function exitPlanMode(
   summary: string,
 ): Promise<void> {
   if (!sessionID) return
-  await log(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`).catch(() => {})
+  await log(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L259): ${(e as Error)?.message ?? String(e)}`) })
 
   const overridden = buildModels.get(sessionID)
   const perAgent = chatMessageMemory.get(sessionID)
@@ -271,10 +298,10 @@ async function exitPlanMode(
     client,
     "info",
     `plan-review: exitPlanMode resolution: session=${sessionID} target=${target ? `${target.providerID}/${target.modelID}` : "undefined"} source=${source}`,
-  ).catch(() => {})
+  ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L301): ${(e as Error)?.message ?? String(e)}`) })
 
   if (!target) {
-    await log(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`).catch(() => {})
+    await log(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L304): ${(e as Error)?.message ?? String(e)}`) })
     try {
       await client.session.prompt({
         path: { id: sessionID },
@@ -294,7 +321,7 @@ async function exitPlanMode(
     client,
     "info",
     `auto-exit to build. model=${target.providerID}/${target.modelID} source=${source}`,
-  ).catch(() => {})
+  ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L324): ${(e as Error)?.message ?? String(e)}`) })
 
   try {
     await client.session.prompt({
@@ -310,7 +337,7 @@ async function exitPlanMode(
       },
     })
   } catch (err) {
-    await log(client, "error", `failed to send build-exit prompt: ${(err as Error).message}`).catch(() => {})
+    await log(client, "error", `failed to send build-exit prompt: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L340): ${(e as Error)?.message ?? String(e)}`) })
   }
 }
 
@@ -322,14 +349,14 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
-  await log(client, "info", "plan-review: plugin init v0.1.0").catch(() => {})
+  await log(client, "info", "plan-review: plugin init v0.1.0").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L352): ${(e as Error)?.message ?? String(e)}`) })
 
   // diagnostic: log serverUrl so we can probe it with curl from outside
   // the plugin. opencode 1.17.18 has no plugin hook for picker changes,
   // so we need a server-side way to learn the current agent — the server
   // is the only piece of state that might have it.
   queueMicrotask(() => {
-    void log(client, "info", `diag.init.serverUrl: ${serverUrl.toString()}`).catch(() => {})
+    void log(client, "info", `diag.init.serverUrl: ${serverUrl.toString()}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L359): ${(e as Error)?.message ?? String(e)}`) })
   })
 
   // Diagnostic: probe v1 SDK responses to see what fields are actually
@@ -344,9 +371,9 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       try {
         const list = await (client as any).session.list({ query: { limit: 1 } })
         const first = (list as any)?.data?.[0]
-        await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch(() => {})
-        await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch(() => {})
-        await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch(() => {})
+        await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L374): ${(e as Error)?.message ?? String(e)}`) })
+        await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L375): ${(e as Error)?.message ?? String(e)}`) })
+        await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L376): ${(e as Error)?.message ?? String(e)}`) })
         // Populate fallback state from session.list[0]. The runtime response
         // carries `agent` and `model` even though the v1 SDK Session type
         // doesn't declare them — see diag logs above. This is the most
@@ -365,9 +392,9 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         if (typeof firstID === "string" && firstID) {
           lastSessionID = firstID
         }
-        await log(client, "info", `diag.session.list.first.populated: agent=${lastSessionAgent ?? "?"} model=${lastSessionModel?.providerID ?? "?"}/${lastSessionModel?.modelID ?? "?"}`).catch(() => {})
+        await log(client, "info", `diag.session.list.first.populated: agent=${lastSessionAgent ?? "?"} model=${lastSessionModel?.providerID ?? "?"}/${lastSessionModel?.modelID ?? "?"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L395): ${(e as Error)?.message ?? String(e)}`) })
       } catch (e) {
-        await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch(() => {})
+        await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L397): ${(e as Error)?.message ?? String(e)}`) })
       }
     })()
   })
@@ -378,13 +405,13 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         const res = await (client as any).app.agents()
         const data = (res as any)?.data ?? res
         const agents = Array.isArray(data) ? data : []
-        await log(client, "info", `diag.app.agents.count: ${agents.length}`).catch(() => {})
+        await log(client, "info", `diag.app.agents.count: ${agents.length}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L408): ${(e as Error)?.message ?? String(e)}`) })
         if (agents.length > 0) {
-          await log(client, "info", `diag.app.agents[0].keys: ${JSON.stringify(Object.keys(agents[0]))}`).catch(() => {})
-          await log(client, "info", `diag.app.agents[0]: ${JSON.stringify(agents[0])}`).catch(() => {})
+          await log(client, "info", `diag.app.agents[0].keys: ${JSON.stringify(Object.keys(agents[0]))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L410): ${(e as Error)?.message ?? String(e)}`) })
+          await log(client, "info", `diag.app.agents[0]: ${JSON.stringify(agents[0])}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L411): ${(e as Error)?.message ?? String(e)}`) })
         }
       } catch (e) {
-        await log(client, "warn", `diag.app.agents failed: ${(e as Error).message}`).catch(() => {})
+        await log(client, "warn", `diag.app.agents failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L414): ${(e as Error)?.message ?? String(e)}`) })
       }
     })()
   })
@@ -464,10 +491,10 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
                     lastSessionAgent = fresh
                     log(client, "info",
                       `plan-review: session.get probe updated agent: session=${lastSessionID} ${lastSessionAgent} -> ${fresh}`,
-                    ).catch(() => {})
+                    ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L494): ${(e as Error)?.message ?? String(e)}`) })
                   }
                 } catch (e) {
-                  log(client, "warn", `diag.session.get failed: ${(e as Error).message}`).catch(() => {})
+                  log(client, "warn", `diag.session.get failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L497): ${(e as Error)?.message ?? String(e)}`) })
                 }
               })()
             })
@@ -493,7 +520,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
             : `, lastActiveAgents empty (no chat.message or session.updated.1 yet), recent[]=[${recentStr}]`
           log(client, "info",
             `plan-review: model.json changed, recent[0]=${m.providerID}/${m.modelID} (was ${oldStr})${ctx}`,
-          ).catch(() => {})
+          ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L523): ${(e as Error)?.message ?? String(e)}`) })
         }
       })
     }
@@ -524,7 +551,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
     },
   })
 
-  await log(client, "info", `plan-review: tool 'plan_review' created, args: ${Object.keys(plan_review.args).join(",")}`).catch(() => {})
+  await log(client, "info", `plan-review: tool 'plan_review' created, args: ${Object.keys(plan_review.args).join(",")}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L554): ${(e as Error)?.message ?? String(e)}`) })
 
   return {
     tool: { plan_review },
@@ -533,7 +560,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
     // tool visible to primary agents even when an `agent.tools` map would
     // otherwise filter it out.
     config: async (opencodeConfig) => {
-      await log(client, "info", "plan-review: config hook fired").catch(() => {})
+      await log(client, "info", "plan-review: config hook fired").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L563): ${(e as Error)?.message ?? String(e)}`) })
       try {
         const exp = (opencodeConfig as any).experimental ?? {}
         const tools: string[] = exp.primary_tools ?? []
@@ -542,10 +569,10 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
             ...exp,
             primary_tools: [...tools, "plan_review"],
           }
-          await log(client, "info", `plan-review: config hook added plan_review to primary_tools (count=${tools.length + 1})`).catch(() => {})
+          await log(client, "info", `plan-review: config hook added plan_review to primary_tools (count=${tools.length + 1})`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L572): ${(e as Error)?.message ?? String(e)}`) })
         }
       } catch (err) {
-        await log(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`).catch(() => {})
+        await log(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L575): ${(e as Error)?.message ?? String(e)}`) })
       }
     },
 
@@ -554,7 +581,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         client,
         "info",
         `plan-review: chat.message HOOK FIRED: session=${input.sessionID ?? "?"} agent=${input.agent ?? "?"} model=${input.model?.providerID ?? "?"}/${input.model?.modelID ?? "?"}`,
-      ).catch(() => {})
+      ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L584): ${(e as Error)?.message ?? String(e)}`) })
 
       // one-shot probe: on first chat.message, dump input keys + app.agents count.
       // chat.message is the most reliable hook — it fires on every prompt, and
@@ -562,10 +589,10 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       if (!(globalThis as any).__planReviewChatMessageProbeDone) {
         ;(globalThis as any).__planReviewChatMessageProbeDone = true
         try {
-          await log(client, "info", `diag.chat.message.input.keys: ${JSON.stringify(Object.keys(input ?? {}))}`).catch(() => {})
-          await log(client, "info", `diag.chat.message.input.agent: ${(input as any)?.agent ?? "<undefined>"}`).catch(() => {})
-          await log(client, "info", `diag.chat.message.input.model: ${JSON.stringify((input as any)?.model)}`).catch(() => {})
-          await log(client, "info", `diag.chat.message.input.variant: ${JSON.stringify((input as any)?.variant)}`).catch(() => {})
+          await log(client, "info", `diag.chat.message.input.keys: ${JSON.stringify(Object.keys(input ?? {}))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L592): ${(e as Error)?.message ?? String(e)}`) })
+          await log(client, "info", `diag.chat.message.input.agent: ${(input as any)?.agent ?? "<undefined>"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L593): ${(e as Error)?.message ?? String(e)}`) })
+          await log(client, "info", `diag.chat.message.input.model: ${JSON.stringify((input as any)?.model)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L594): ${(e as Error)?.message ?? String(e)}`) })
+          await log(client, "info", `diag.chat.message.input.variant: ${JSON.stringify((input as any)?.variant)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L595): ${(e as Error)?.message ?? String(e)}`) })
         } catch {}
         queueMicrotask(() => {
           void (async () => {
@@ -573,12 +600,12 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
               const res = await (client as any).app.agents()
               const data = (res as any)?.data ?? res
               const agents = Array.isArray(data) ? data : []
-              await log(client, "info", `diag.chat.message.app.agents.count: ${agents.length}`).catch(() => {})
+              await log(client, "info", `diag.chat.message.app.agents.count: ${agents.length}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L603): ${(e as Error)?.message ?? String(e)}`) })
               if (agents.length > 0) {
-                await log(client, "info", `diag.chat.message.app.agents[0]: ${JSON.stringify(agents[0])}`).catch(() => {})
+                await log(client, "info", `diag.chat.message.app.agents[0]: ${JSON.stringify(agents[0])}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L605): ${(e as Error)?.message ?? String(e)}`) })
               }
             } catch (e) {
-              await log(client, "warn", `diag.chat.message.app.agents failed: ${(e as Error).message}`).catch(() => {})
+              await log(client, "warn", `diag.chat.message.app.agents failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L608): ${(e as Error)?.message ?? String(e)}`) })
             }
           })()
         })
@@ -598,7 +625,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
           client,
           "info",
           `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
-        ).catch(() => {})
+        ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L628): ${(e as Error)?.message ?? String(e)}`) })
       }
     },
 
@@ -607,7 +634,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         client,
         "info",
         `plan-review: system.transform HOOK FIRED: session=${input.sessionID ?? "?"} system_blocks=${output.system.length}`,
-      ).catch(() => {})
+      ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L637): ${(e as Error)?.message ?? String(e)}`) })
       const joined = output.system.join("\n").toLowerCase()
       if (joined.includes("title generator") || joined.includes("generate a title")) return
       // Skip injection for the build agent (mirrors plannotator's skip).
@@ -632,7 +659,7 @@ If your plan is rejected, you will receive feedback — revise the plan and call
 
 Do NOT proceed with implementation until the plan is approved.
 `)
-      await log(client, "info", `plan-review: system prompt injected (${output.system.length} blocks, ${output.system[output.system.length - 1]!.length} chars)`).catch(() => {})
+      await log(client, "info", `plan-review: system prompt injected (${output.system.length} blocks, ${output.system[output.system.length - 1]!.length} chars)`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L662): ${(e as Error)?.message ?? String(e)}`) })
     },
 
     event: async ({ event }) => {
@@ -645,9 +672,9 @@ Do NOT proceed with implementation until the plan is approved.
         ;(globalThis as any).__planReviewEventProbeDone = true
         try {
           const info = e.properties?.info ?? e.data?.info ?? {}
-          await log(client, "info", `diag.event.${e.type}.info.keys: ${JSON.stringify(Object.keys(info))}`).catch(() => {})
-          await log(client, "info", `diag.event.${e.type}.info.agent: ${(info as any)?.agent ?? "<undefined>"}`).catch(() => {})
-          await log(client, "info", `diag.event.${e.type}.info.model: ${JSON.stringify((info as any)?.model)}`).catch(() => {})
+          await log(client, "info", `diag.event.${e.type}.info.keys: ${JSON.stringify(Object.keys(info))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L675): ${(e as Error)?.message ?? String(e)}`) })
+          await log(client, "info", `diag.event.${e.type}.info.agent: ${(info as any)?.agent ?? "<undefined>"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L676): ${(e as Error)?.message ?? String(e)}`) })
+          await log(client, "info", `diag.event.${e.type}.info.model: ${JSON.stringify((info as any)?.model)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L677): ${(e as Error)?.message ?? String(e)}`) })
         } catch {}
       }
 
@@ -655,11 +682,41 @@ Do NOT proceed with implementation until the plan is approved.
       if (e.type === "session.updated" || e.type === "session.updated.1") {
         const info = e.properties?.info ?? e.data?.info
         if (info) {
-          await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch(() => {})
+          await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L685): ${(e as Error)?.message ?? String(e)}`) })
         }
       }
       if (e.type === "session.next.model.switched.1" || e.type === "session.next.agent.switched.1") {
-        await log(client, "debug", `${e.type}: ${JSON.stringify({ sessionID: e.sessionID, model: e.model, agent: e.agent })}`).catch(() => {})
+        await log(client, "debug", `${e.type}: ${JSON.stringify({ sessionID: e.sessionID, model: e.model, agent: e.agent })}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L689): ${(e as Error)?.message ?? String(e)}`) })
+      }
+      // session.next.* events are published by V2 SDK calls
+      // (client.v2.session.switchAgent / switchModel). Even though
+      // v2.session.update({metadata}) silently drops on the server,
+      // switchAgent/switchModel go through setAgentModel/setAgentModel
+      // and DO publish session.next.agent.switched.1 and
+      // session.next.model.switched.1 events. We receive them via the
+      // plugin event hook (which subscribes to EventV2Bridge.GlobalBus),
+      // so we must update lastSessionAgent / lastSessionModel here.
+      if (e.type === "session.next.agent.switched.1") {
+        const nextAgent = (e as any).agent
+        const nextSid = (e as any).sessionID
+        if (typeof nextAgent === "string" && nextAgent && typeof nextSid === "string" && nextSid) {
+          lastSessionAgent = nextAgent
+          lastSessionID = nextSid
+          await log(client, "info",
+            `plan-review: tab switch via session.next.agent.switched: session=${nextSid} -> ${nextAgent}`,
+          ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L707): ${(e as Error)?.message ?? String(e)}`) })
+        }
+      }
+      if (e.type === "session.next.model.switched.1") {
+        const nextModel = (e as any).model
+        const nextSid = (e as any).sessionID
+        if (nextModel && nextModel.providerID && nextModel.modelID && typeof nextSid === "string" && nextSid) {
+          lastSessionModel = { providerID: nextModel.providerID, modelID: nextModel.modelID }
+          lastSessionID = nextSid
+          await log(client, "info",
+            `plan-review: tab switch via session.next.model.switched: session=${nextSid} -> ${nextModel.providerID}/${nextModel.modelID}`,
+          ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L718): ${(e as Error)?.message ?? String(e)}`) })
+        }
       }
 
       try {
@@ -670,7 +727,7 @@ Do NOT proceed with implementation until the plan is approved.
           const sid = info?.id
           if (info?.agent === "build" && sid && buildModels.has(sid)) {
             const m = buildModels.get(sid)!
-            await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch(() => {})
+            await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L730): ${(e as Error)?.message ?? String(e)}`) })
           }
           // Track last active agent per session so picker changes in
           // model.json can be attributed to a specific agent. Used by the
@@ -717,7 +774,7 @@ Do NOT proceed with implementation until the plan is approved.
 
       if (name === "set-build-model") {
         if (!sessionID) {
-          await log(client, "error", "set-build-model: no active session").catch(() => {})
+          await log(client, "error", "set-build-model: no active session").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L777): ${(e as Error)?.message ?? String(e)}`) })
           return
         }
         const arg = rawArgs.trim()
@@ -737,7 +794,7 @@ Do NOT proceed with implementation until the plan is approved.
                   text: `set-build-model: index ${numIdx} out of range (last list had ${list.length} entries). Run \`/set-build-model\` to refresh.`,
                 }],
               },
-            }).catch(() => {})
+            }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L797): ${(e as Error)?.message ?? String(e)}`) })
             return
           }
           buildModels.set(sessionID, { providerID: entry.providerID, modelID: entry.modelID })
@@ -750,7 +807,7 @@ Do NOT proceed with implementation until the plan is approved.
                 text: `Build model for this session set to: \`${entry.providerID}/${entry.modelID}\` (picked #${numIdx} from list). On the next plan approval, the session will switch to this model before build executes.`,
               }],
             },
-          }).catch(() => {})
+          }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L810): ${(e as Error)?.message ?? String(e)}`) })
           return
         }
 
@@ -758,7 +815,7 @@ Do NOT proceed with implementation until the plan is approved.
         if (arg !== "") {
           const parsed = parseModelString(arg)
           if (!parsed) {
-            await log(client, "error", `set-build-model: invalid format "${arg}". Expected "provider/model-id".`).catch(() => {})
+            await log(client, "error", `set-build-model: invalid format "${arg}". Expected "provider/model-id".`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L818): ${(e as Error)?.message ?? String(e)}`) })
             return
           }
           buildModels.set(sessionID, parsed)
@@ -771,7 +828,7 @@ Do NOT proceed with implementation until the plan is approved.
                 text: `Build model for this session set to: \`${parsed.providerID}/${parsed.modelID}\`. On the next plan approval, the session will switch to this model before build executes.`,
               }],
             },
-          }).catch(() => {})
+          }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L831): ${(e as Error)?.message ?? String(e)}`) })
           return
         }
 
@@ -787,13 +844,13 @@ Do NOT proceed with implementation until the plan is approved.
               text: `# set-build-model picker\n\nAvailable models (${entries.length}):\n\n${formatProviderList(entries)}\n\nReply with:\n- \`/set-build-model <number>\` to pick from this list (e.g. \`/set-build-model 5\`)\n- \`/set-build-model <provider>/<model-id>\` to set directly (e.g. \`/set-build-model ya-glm/glm\`)\n\nStored in this plugin's in-memory session memory — lost on opencode restart. For runtime model picker use the opencode UI (Ctrl-X M).`,
             }],
           },
-        }).catch(() => {})
+        }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L847): ${(e as Error)?.message ?? String(e)}`) })
         return
       }
 
       if (name === "plan-diag") {
         if (!sessionID) {
-          await log(client, "error", "plan-diag: no active session").catch(() => {})
+          await log(client, "error", "plan-diag: no active session").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L853): ${(e as Error)?.message ?? String(e)}`) })
           return
         }
         const subCmd = rawArgs.trim()
@@ -808,7 +865,7 @@ Do NOT proceed with implementation until the plan is approved.
                 text: `plan-diag: build-event memory cleared. Next session.updated will repopulate it.`,
               }],
             },
-          }).catch(() => {})
+          }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L868): ${(e as Error)?.message ?? String(e)}`) })
           return
         }
         const memEntries = Array.from(buildModels.entries()).map(([sid, m]) => `  ${sid.slice(0, 16)}… → ${m.providerID}/${m.modelID}`).join("\n") || "  (empty)"
@@ -845,7 +902,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
 `,
             }],
           },
-        }).catch(() => {})
+        }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L905): ${(e as Error)?.message ?? String(e)}`) })
         return
       }
 
@@ -853,17 +910,17 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
 
       const filePath = rawArgs.trim()
       if (!filePath) {
-        await log(client, "error", "Usage: /plan-review <path-to-plan.md>").catch(() => {})
+        await log(client, "error", "Usage: /plan-review <path-to-plan.md>").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L913): ${(e as Error)?.message ?? String(e)}`) })
         return
       }
       if (!sessionID) {
-        await log(client, "error", "plan-review: no active session").catch(() => {})
+        await log(client, "error", "plan-review: no active session").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L917): ${(e as Error)?.message ?? String(e)}`) })
         return
       }
 
       const absolutePath = resolve(filePath)
       if (!existsSync(absolutePath)) {
-        await log(client, "error", `plan-review: file not found: ${absolutePath}`).catch(() => {})
+        await log(client, "error", `plan-review: file not found: ${absolutePath}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L923): ${(e as Error)?.message ?? String(e)}`) })
         return
       }
 
@@ -884,7 +941,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
           await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, () => ({ agent: lastSessionAgent, model: lastSessionModel }), sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
-        await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch(() => {})
+        await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L944): ${(e as Error)?.message ?? String(e)}`) })
       }
     },
   }

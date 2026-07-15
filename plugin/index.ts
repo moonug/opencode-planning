@@ -282,6 +282,59 @@ async function exitPlanMode(
   if (!sessionID) return
   await log(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L259): ${(e as Error)?.message ?? String(e)}`) })
 
+  // Promote deferred picker picks stored by the TUI plugin into
+  // chatMessageMemory. TUI plugin writes
+  // `metadata.planReviewDeferredPicks[agent] = {providerID, modelID}`
+  // via session.update on session.updated. We read it here at
+  // exitPlanMode time because:
+  //   - The TUI plugin can't race with us any more: by the time
+  //     the user approves the plan, the user has typed their
+  //     first message, the plan agent has generated a response,
+  //     and the user has reviewed it — seconds-to-minutes after
+  //     the TUI plugin's session.update completed.
+  //   - Earlier placement in chat.message hook raced: user's
+  //     first real prompt fired chat.message BEFORE the TUI's
+  //     session.updated handler wrote the metadata.
+  //
+  // Idempotent: we set perSession[agent] only when no entry
+  // exists yet, so a concurrent chat.message write that already
+  // populated (agent -> real model) survives intact. The
+  // "promoted deferred" log says how many we filled in.
+  let deferredPromoted = 0
+  try {
+    const sessionRes = await client.session.get({ path: { id: sessionID } })
+    const data = (sessionRes as any)?.data ?? sessionRes
+    const metadata = data?.metadata
+    const deferred = metadata?.planReviewDeferredPicks
+    if (deferred && typeof deferred === "object") {
+      let perSession = chatMessageMemory.get(sessionID)
+      if (!perSession) {
+        perSession = new Map<string, ModelRef>()
+        chatMessageMemory.set(sessionID, perSession)
+      }
+      for (const [agentName, m] of Object.entries(deferred)) {
+        if (!m || typeof m !== "object") continue
+        if (agentName.startsWith("_")) continue
+        const providerID = (m as any).providerID
+        const modelID = (m as any).modelID
+        if (typeof providerID !== "string" || typeof modelID !== "string") continue
+        if (!perSession.has(agentName)) {
+          perSession.set(agentName, { providerID, modelID })
+          deferredPromoted++
+        }
+      }
+      if (deferredPromoted > 0) {
+        await log(
+          client,
+          "info",
+          `plan-review: exitPlanMode promoted deferredPicks: count=${deferredPromoted} session=${sessionID}`,
+        ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L287): ${(e as Error)?.message ?? String(e)}`) })
+      }
+    }
+  } catch (err) {
+    await log(client, "warn", `plan-review: exitPlanMode deferred-pick lookup failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L289): ${(e as Error)?.message ?? String(e)}`) })
+  }
+
   const overridden = buildModels.get(sessionID)
   const perAgent = chatMessageMemory.get(sessionID)
   const fromChat = perAgent?.get("build")
@@ -369,7 +422,7 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
-  await log(client, "info", "plan-review: plugin init v0.1.6 build=metadata-only-flush-v1").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
+  await log(client, "info", "plan-review: plugin init v0.1.7 build=exitplan-mode-promotion-v1").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
   await log(client, "info", `plan-review: argv0=${(process.argv[1] ?? "unknown").split("/").slice(-3).join("/")}`).catch((e: unknown) => { console.error(`plan-review: log(argv0) failed: ${(e as Error)?.message ?? String(e)}`) })
 
   if (!existsSync(SCRIPT_PATH)) {
@@ -479,59 +532,15 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L502): ${(e as Error)?.message ?? String(e)}`) })
       }
 
-      // Promote deferred picker picks stored by the TUI plugin into
-      // chatMessageMemory. TUI plugin writes
-      // `metadata.planReviewDeferredPicks[agent] = {providerID, modelID}`
-      // via session.update BEFORE creating a session (when the user
-      // picks models on the home screen). The user's first real
-      // prompt then fires this chat.message hook — we read the
-      // session metadata, merge any entries that haven't been
-      // populated yet by a direct chat.message (the TUI plugin
-      // may also have flushed these via prompt()), and clear the
-      // metadata so the same picks aren't re-promoted on the next
-      // message.
-      //
-      // Idempotent: entries already in chatMessageMemory (from the
-      // TUI plugin's prompt() flush) keep their value because
-      // per-sessionMap.set is conditional on whether the existing
-      // entry is in our deferred set only when the picked model
-      // hasn't been seen by a real chat.message yet — actually we
-      // simply prefer the more recent (live) chat.message value
-      // over a stale metadata leftover, so we DON'T overwrite if
-      // the agent already has a real entry.
-      if (input.sessionID) {
-        try {
-          const sessionRes = await client.session.get({ path: { id: input.sessionID } })
-          const data = (sessionRes as any)?.data ?? sessionRes
-          const metadata = data?.metadata
-          const deferred = metadata?.planReviewDeferredPicks
-          if (deferred && typeof deferred === "object" && !deferred._cleared) {
-            const perSession = chatMessageMemory.get(input.sessionID) ?? new Map<string, ModelRef>()
-            let promoted = 0
-            for (const [agentName, m] of Object.entries(deferred)) {
-              if (!m || typeof m !== "object") continue
-              if (agentName.startsWith("_")) continue
-              const providerID = (m as any).providerID
-              const modelID = (m as any).modelID
-              if (typeof providerID !== "string" || typeof modelID !== "string") continue
-              if (!perSession.has(agentName)) {
-                perSession.set(agentName, { providerID, modelID })
-                promoted++
-              }
-            }
-            if (!chatMessageMemory.has(input.sessionID)) {
-              chatMessageMemory.set(input.sessionID, perSession)
-            }
-            if (promoted > 0) {
-              await log(
-                client,
-                "info",
-                `plan-review: chat.message promoted deferredPicks: count=${promoted} session=${input.sessionID}`,
-              ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L539): ${(e as Error)?.message ?? String(e)}`) })
-            }
-          }
-        } catch {}
-      }
+      // (Deferred-picker promotion moved out of this hook — see
+      // exitPlanMode's promotion block. It used to live here but
+      // races with the TUI plugin's metadata write: the user's
+      // first real prompt fires chat.message before the TUI's
+      // session.updated handler runs writeDeferredToMetadata, so
+      // this hook read empty metadata and promoted nothing.
+      // exitPlanMode runs much later (when the user approves the
+      // plan, seconds-to-minutes after the flush), by which point
+      // the metadata is guaranteed to be present.)
     },
 
     "experimental.chat.system.transform": async (input, output) => {

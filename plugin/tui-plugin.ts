@@ -9,8 +9,8 @@ import type { Event } from "@opencode-ai/sdk/v2"
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.1.6"
-const BUILD_TAG = "metadata-only-flush-v1"
+const VERSION = "0.1.7"
+const BUILD_TAG = "exitplan-mode-promotion-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app

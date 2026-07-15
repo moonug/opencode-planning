@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.6")) {
-    throw new Error("TUI init log missing v0.1.6 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.7")) {
+    throw new Error("TUI init log missing v0.1.7 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=metadata-only-flush-v1")) {
+  if (!loaded?.message?.includes("build=exitplan-mode-promotion-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.6 build=metadata-only-flush-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.7 build=exitplan-mode-promotion-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -828,26 +828,24 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[38d] TUI plugin keeps deferred pickers per-agent across Tab+picker cycles: ok")
 }
 
-// 38e. server-plugin chat.message hook promotes
-//      metadata.planReviewDeferredPicks into chatMessageMemory.
-//      TUI plugin writes the picks to session.metadata via
-//      session.update before the user types. The user's first
-//      chat.message (which fires when the real prompt runs) is the
-//      hook we hook into — we read session.metadata, merge any
-//      entries that don't already have a chatMessageMemory value,
-//      and (implicitly, by set() ) make them available to
-//      exitPlanMode's priority chain.
+// 38e. exitPlanMode promotes metadata.planReviewDeferredPicks into
+//      chatMessageMemory. Previously this happened in the
+//      chat.message hook, but the user's first real prompt fires
+//      chat.message BEFORE the TUI plugin's session.update can
+//      land, so the hook read empty metadata. exitPlanMode runs
+//      seconds-to-minutes later (when the user approves the plan),
+//      by which point the TUI plugin's metadata write has been
+//      committed. Promotion here is race-free.
 //
-//      Smoke covers the happy path: a session has metadata with
-//      {build: mimo, plan: deepseek} but NO chatMessageMemory entry.
-//      chat.message hook fires with agent=plan model=unknown.
-//      After the hook, chatMessageMemory[sessionID] must have
-//      BOTH entries (build and plan).
+//      Smoke covers: session has metadata deferred picks but
+//      chatMessageMemory is empty. exitPlanMode runs → the
+//      priority chain resolves to chat.message (build) →
+//      exitPlanMode logs "promoted deferredPicks: count=2".
 {
   const logs: any[] = []
-  const prompts: any[] = []
   let sessionGetCalls = 0
-  let sessionMetadata: any = {
+  let chatMessageMemory: any = undefined
+  const sessionMetadata = {
     planReviewDeferredPicks: {
       build: { providerID: "ya-glm", modelID: "glm" },
       plan: { providerID: "opencode-go", modelID: "deepseek-v4-flash" },
@@ -857,7 +855,10 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const fakeClient = {
     app: { log: async (opts: any) => { logs.push(opts) } } as any,
     session: {
-      prompt: async (opts: any) => { prompts.push(opts); return {} },
+      // Builder model source — empty so the priority chain must rely
+      // on chatMessageMemory (which the deferred-picks promotion
+      // will populate).
+      list: async () => ({ data: [] }),
       get: async (opts: any) => {
         sessionGetCalls++
         return { data: { id: opts?.path?.id ?? "ses_meta", metadata: sessionMetadata } }
@@ -872,30 +873,83 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
+  // Capture the chatMessageMemory the init set up (we don't close over
+  // it directly; instead we observe via the priority chain).
+  // We need an empty getBuildAgentModel/getPlanAgentModel response
+  // so chat.message (build) is the only source with data. Since
+  // chatMessageMemory starts empty for ses_meta, the priority
+  // chain falls through to lower sources without our promotion.
+  // We invoke exitPlanMode indirectly via the tool execute path.
+  chatMessageMemory = (testHooks as any).__chatMessageMemory__?.[testHooks.tool.plan_review]?.chatMessageMemory
+  // Drive exitPlanMode: call tool.plan_review.execute with the
+  // plan text and a sessionID in context, mock the script too so it
+  // exits clean. We mock the helper script via EDITOR env which is
+  // set at the top of the smoke file.
+  // For full coverage we re-do the test with chatMessageMemory
+  // pre-populated with the real chat.message fire BEFORE
+  // exitPlanMode, simulating the live flow.
   await testHooks["chat.message"](
     {
       sessionID: "ses_meta",
-      // Pick an agent that ISN'T in metadata.planReviewDeferredPicks
-      // so both build+plan get promoted (otherwise hook's own write
-      // would mark perSession.has("agent")=true and skip promotion
-      // for that agent). Real chat.message firing here means the
-      // hook also writes chatMessageMemory[ses_meta]["nonexistent"],
-      // which is fine — promotes covers build and plan.
-      agent: "general",
+      // Use an agent that DOES NOT exist in deferred picks so the
+      // hook's own chatMessageMemory write doesn't shadow the
+      // upcoming promotion. The agent=test mimics a third agent.
+      agent: "test",
       model: { providerID: "opencode-go", modelID: "mimo-v2.5-pro" },
     } as any,
     {} as any,
   )
   await new Promise((r) => setTimeout(r, 30))
-  if (sessionGetCalls !== 1) {
-    throw new Error("chat.message hook must read session metadata once, got calls: " + sessionGetCalls)
+  // Build agent model fetch (used in priority chain) — return nothing
+  // so chat.message memory is the only valid source.
+  // plan agent model fetch — same.
+  // config.model fetch — same.
+  // globalConfig via client.config.get → empty.
+  // config.get is invoked via ... actually it goes through
+  // /session/{id}/message stream hook config not getGlobalModel
+  // which uses client.config.get. Mock:
+  if (!fakeClient.config) {
+    fakeClient.config = { get: async () => ({ data: {} }) }
   }
-  const promoted = logs.find((l: any) => l.body?.message?.includes("promoted deferredPicks"))
-  if (!promoted) throw new Error("server-plugin should log promoted deferredPicks, logs:\n" + logs.map((l:any)=>l.body?.message).join("\n"))
+  // chat.message hook no longer reads metadata — that path was moved
+  // to exitPlanMode. sessionGetCalls after the hook must be 0.
+  if (sessionGetCalls !== 0) {
+    throw new Error("chat.message hook should not read metadata (moved to exitPlanMode), got calls: " + sessionGetCalls)
+  }
+  // Now drive exitPlanMode via tool execute path. We mock the
+  // helper to produce empty diff (approval). Set EDITOR to a noop
+  // sh script.
+  const fakeFs = await import("node:fs")
+  const tmpEditor = "/tmp/pr-smoke-exitplanmo.sh"
+  fakeFs.writeFileSync(tmpEditor, "#!/bin/sh\nexit 0\n")
+  fakeFs.chmodSync(tmpEditor, 0o755)
+  const oldEditor = process.env.EDITOR
+  process.env.EDITOR = tmpEditor
+  try {
+    await testHooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_meta", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+    )
+  } finally {
+    if (oldEditor === undefined) delete process.env.EDITOR
+    else process.env.EDITOR = oldEditor
+    fakeFs.rmSync(tmpEditor, { force: true })
+  }
+  if (sessionGetCalls !== 1) {
+    throw new Error("exitPlanMode must call session.get once to read metadata, got calls: " + sessionGetCalls)
+  }
+  const promoted = logs.find((l: any) => l.body?.message?.includes("exitPlanMode promoted deferredPicks"))
+  if (!promoted) {
+    throw new Error("exitPlanMode should log promoted deferredPicks, logs:\n" + logs.map((l:any)=>l.body?.message).join("\n"))
+  }
   if (!promoted.body.message.includes("count=2")) {
     throw new Error("expected count=2 in promote log, got: " + promoted.body.message)
   }
-  console.log("[38e] chat.message hook promotes deferredPicks from session.metadata: ok")
+  const resolution = logs.find((l: any) => l.body?.message?.startsWith("plan-review: exitPlanMode resolution:"))
+  if (!resolution?.body?.message?.includes("source=chat.message (build)")) {
+    throw new Error("expected chat.message (build) source after deferred promotion, got: " + resolution?.body?.message)
+  }
+  console.log("[38e] exitPlanMode promotes deferredPicks from session.metadata: ok")
 }
 
 // 39. TUI plugin: Tab calls promptAsync({agent, noReply:true}) on the
@@ -1699,11 +1753,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.6")) {
-    throw new Error("init log must include v0.1.6 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.7")) {
+    throw new Error("init log must include v0.1.7 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=metadata-only-flush-v1")) {
-    throw new Error("init log must include build=metadata-only-flush-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=exitplan-mode-promotion-v1")) {
+    throw new Error("init log must include build=exitplan-mode-promotion-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

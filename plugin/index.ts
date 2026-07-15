@@ -842,6 +842,11 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
         await log(client, "info", `plan-review: tool.definition fired for plan_review`).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L827): ${(e as Error)?.message ?? String(e)}`) })
         return
       }
+      // Suppress plan_exit — model sees two similar tools (plan_exit and
+      // plan_review) and often picks the wrong one. Redirect to plan_review.
+      if (input.toolID === "plan_exit") {
+        output.description = "Do not call this tool. Use plan_review to submit your plan for review."
+      }
       // Suppress todowrite during planning — the model should focus
       // on planning, not on writing todo items.
       if (input.toolID === "todowrite") {

@@ -873,6 +873,85 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[45] chat.message hook captures per-agent model: ok")
 }
 
+// 46. TUI plugin: writes to api.state.path.state/model.json trigger
+//     promptAsync with the current agent + picked model. The watcher
+//     lives in the TUI process (not the server plugin) so it's scoped
+//     to the active session and avoids the multi-instance duplication
+//     that the old server-side fs.watch produced.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const prompts: any[] = []
+  const logs: any[] = []
+  // Use a per-test tmp dir for state so we don't touch the real file.
+  const fakeStateDir = `/tmp/pr-state-${Date.now()}`
+  require("node:fs").mkdirSync(fakeStateDir, { recursive: true })
+  const modelJsonPath = `${fakeStateDir}/model.json`
+  require("node:fs").writeFileSync(
+    modelJsonPath,
+    JSON.stringify({ recent: [{ providerID: "old-prov", modelID: "old-model" }], favorite: [], variant: {} }),
+  )
+  const fakeApi: any = {
+    client: {
+      session: {
+        promptAsync: async (opts: any) => { prompts.push(opts); return { data: null } },
+      },
+      app: {
+        agents: async () => ({ data: [
+          { name: "plan", mode: "primary", hidden: false },
+          { name: "build", mode: "primary", hidden: false },
+        ] }),
+        log: async (opts: any) => { logs.push(opts); return {} },
+      },
+    },
+    state: {
+      session: { messages: () => [{ role: "user", agent: "build" }] },
+      path: { state: fakeStateDir, config: "/tmp/config.json", worktree: "/tmp", directory: "/tmp" },
+    },
+    route: { current: { name: "session", params: { sessionID: "ses_pick" } } },
+    keymap: { intercept: (_t: string, _h: any) => () => {} },
+    lifecycle: { signal: new AbortController().signal, onDispose: (_fn: any) => () => {} },
+    event: { on: (_t: string, _h: any) => () => {} },
+  }
+  await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
+  // give watcher init time to read current file
+  await new Promise((r) => setTimeout(r, 30))
+  // Simulate the picker writing a new model to recent[0]. fs.watch's
+  // callback fires with no args on macOS Darwin backend for writes —
+  // we trigger it by calling the registered callback directly via the
+  // global subscribers list built during fs.watch.
+  // Easier: rewrite the file; the watcher tick reads via fs.readFileSync
+  // and compares to lastModelJSON.
+  require("node:fs").writeFileSync(
+    modelJsonPath,
+    JSON.stringify({ recent: [{ providerID: "ya-glm", modelID: "glm" }], favorite: [], variant: {} }),
+  )
+  // The macOS fs-events backend fires within tens of ms.
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 25))
+    if (prompts.length >= 1) break
+  }
+  require("node:fs").rmSync(fakeStateDir, { recursive: true, force: true })
+  const pickerPrompt = prompts.find((p: any) => p.body?.model?.providerID === "ya-glm")
+  if (!pickerPrompt) {
+    throw new Error("watcher did not forward model.json change. prompts: " + JSON.stringify(prompts))
+  }
+  if (pickerPrompt.body?.agent !== "build") {
+    throw new Error("watcher must attach the current agent (build), got: " + pickerPrompt.body?.agent)
+  }
+  if (pickerPrompt.path?.id !== "ses_pick") {
+    throw new Error("watcher prompt path.id should be ses_pick, got: " + pickerPrompt.path?.id)
+  }
+  if (pickerPrompt.body?.noReply !== true) {
+    throw new Error("watcher must use noReply:true")
+  }
+  const pickerLog = logs.find((l: any) => l.message?.includes("picker changed"))
+  if (!pickerLog?.message?.includes("agent=build") || !pickerLog?.message?.includes("ya-glm/glm")) {
+    throw new Error("picker log missing or wrong: " + pickerLog?.message)
+  }
+  console.log("[46] TUI plugin watches model.json and forwards picker change: ok")
+}
+
 // 47. visibleErr helper exists and no silent .catch(() => {}) sites
 //     remain in index.ts. Per AGENTS.md: `catch {}` is not allowed.
 //     The bulk replace converted all .catch(() => {}) to either

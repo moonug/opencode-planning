@@ -369,7 +369,8 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
-  await log(client, "info", "plan-review: plugin init v0.1.0").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L352): ${(e as Error)?.message ?? String(e)}`) })
+  await log(client, "info", "plan-review: plugin init v0.1.1 build=picker-watch-v1").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
+  await log(client, "info", `plan-review: argv0=${(process.argv[1] ?? "unknown").split("/").slice(-3).join("/")}`).catch((e: unknown) => { console.error(`plan-review: log(argv0) failed: ${(e as Error)?.message ?? String(e)}`) })
 
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(

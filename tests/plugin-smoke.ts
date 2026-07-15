@@ -524,6 +524,43 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[38] TUI plugin exports { id, tui } object: ok")
 }
 
+// 38b. TUI plugin tui() logs version+build on init — required to
+//      distinguish cached module from a fresh build across runs.
+//      Bun caches dynamic imports, so the only reliable freshness
+//      signal is to compare this marker to the version on disk.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const logs: any[] = []
+  const fakeApi = {
+    client: {
+      session: { promptAsync: async () => ({ data: null }) },
+      app: {
+        agents: async () => ({ data: [] }),
+        log: async (opts: any) => { logs.push(opts); return {} },
+      },
+    },
+    state: {
+      session: { messages: () => [] },
+      path: { state: "/tmp", config: "/tmp", worktree: "/tmp", directory: "/tmp" },
+    },
+    route: { current: { name: "home" } },
+    keymap: { intercept: (_t: string, _h: any) => () => {} },
+    lifecycle: { signal: new AbortController().signal, onDispose: (_fn: any) => () => {} },
+    event: { on: (_t: string, _h: any) => () => {} },
+  }
+  await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
+  await new Promise((r) => setTimeout(r, 30))
+  const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
+  if (!loaded?.message?.includes("v0.1.1")) {
+    throw new Error("TUI init log missing v0.1.1 marker, got: " + loaded?.message)
+  }
+  if (!loaded?.message?.includes("build=picker-watch-v1")) {
+    throw new Error("TUI init log missing build marker, got: " + loaded?.message)
+  }
+  console.log("[38b] TUI plugin logs v0.1.1 build=picker-watch-v1: ok")
+}
+
 // 39. TUI plugin: Tab calls promptAsync({agent, noReply:true}) on the
 //     v2 SDK client. Verify the call reaches server via the SDK method
 //     (NOT through the absent v1 session.prompt). sessionID comes from
@@ -1312,7 +1349,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[14] priority order: chat.message wins over /set-build-model: ok")
 }
 
-// 15. plugin init logs: "plugin init v0.1.0" + "tool 'plan_review' created, args: ..."
+// 15. plugin init logs: "plugin init v0.1.x build=..." + "tool 'plan_review' created, args: ..."
 {
   const logs: any[] = []
   const testHooks = await mod.default({
@@ -1323,8 +1360,14 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
-  const initLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("plugin init v0.1.0"))
-  if (!initLog) throw new Error("init log 'plan-review: plugin init v0.1.0' missing")
+  const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
+  if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
+  if (!initLog.body.message.includes("v0.1.1")) {
+    throw new Error("init log must include v0.1.1 build marker, got: " + initLog.body.message)
+  }
+  if (!initLog.body.message.includes("build=picker-watch-v1")) {
+    throw new Error("init log must include build=picker-watch-v1 marker, got: " + initLog.body.message)
+  }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")
   if (!toolLog.body.message.includes("plan")) throw new Error("tool log missing arg name")

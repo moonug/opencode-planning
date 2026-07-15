@@ -5,20 +5,34 @@ import type {
 } from "@opencode-ai/plugin/tui"
 import type { Event } from "@opencode-ai/sdk/v2"
 
-const tui: TuiPlugin = async (api: TuiPluginApi) => {
+// Build-time markers. Bump BUILD_TAG when this file changes in a way that
+// must be observable across runs — Bun caches plugin module imports so the
+// only reliable way to confirm the new code is loaded is to log the marker
+// at startup and compare.
+const VERSION = "0.1.1"
+const BUILD_TAG = "picker-watch-v1"
+
+const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
-    .log({
-      service: "plan-review-tui",
-      level: "info",
-      message: "plan-review-TUI: plugin loaded",
-    })
+    .log({ service: "plan-review-tui", level: "info", message })
     .catch((e: unknown) =>
       api.client.app.log({
         service: "plan-review-tui",
         level: "warn",
-        message: `plan-review-TUI: load-log failed: ${(e as Error)?.message ?? String(e)}`,
+        message: `plan-review-TUI: log failed: ${(e as Error)?.message ?? String(e)}`,
       }),
     )
+}
+
+const tui: TuiPlugin = async (api: TuiPluginApi) => {
+  logInfo(api, `plan-review-TUI: plugin loaded v${VERSION} build=${BUILD_TAG}`)
+  // Smoke-friendly meta fingerprint line — useful when reading logs across
+  // multiple opencode processes; the spec carries the absolute path so we
+  // know which copy of tui-plugin.ts was activated.
+  try {
+    const processArg = (process.argv[1] ?? "unknown") as string
+    logInfo(api, `plan-review-TUI: argv0=${processArg.split("/").slice(-3).join("/")}`)
+  } catch {}
 
   const getActiveSessionID = (): string | undefined => {
     const current = api.route.current
@@ -46,6 +60,11 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   let sessionID: string | undefined = getActiveSessionID()
   if (sessionID) prevAgent = getLastUserAgent(sessionID)
 
+  logInfo(
+    api,
+    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG}`,
+  )
+
   // Read all primary agents (filter mirrors packages/tui/src/context/local.tsx:78).
   let primaryAgents: string[] = []
   try {
@@ -54,6 +73,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     primaryAgents = (Array.isArray(data) ? data : [])
       .filter((a: any) => a && typeof a.name === "string" && a.mode !== "subagent" && a.hidden !== true)
       .map((a: any) => a.name as string)
+    logInfo(api, `plan-review-TUI: agents=${primaryAgents.join(",") || "<none>"}`)
   } catch (e) {
     void api.client.app
       .log({
@@ -96,15 +116,15 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           parts: [{ type: "text", text: "." }],
         },
       })
-    } catch (e) {
-      void api.client.app
-        .log({
-          service: "plan-review-tui",
-          level: "warn",
-          message: `plan-review-TUI: forwardTab to=${to} failed: ${(e as Error)?.message ?? String(e)}`,
-        })
-        .catch(() => {})
-    }
+  } catch (e) {
+    void api.client.app
+      .log({
+        service: "plan-review-tui",
+        level: "warn",
+        message: `plan-review-TUI: forward to=${to} failed: ${(e as Error)?.message ?? String(e)}`,
+      })
+      .catch(() => {})
+  }
   }
 
   // Refresh prevAgent from real TUI events. `api.event.on` is typed against
@@ -137,13 +157,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       refresh()
       const direction: 1 | -1 = name === "tab" ? 1 : -1
       const next = computeNext(prevAgent, direction)
-      void api.client.app
-        .log({
-          service: "plan-review-tui",
-          level: "info",
-          message: `plan-review-TUI: intercept ${name}: prev=${prevAgent ?? "?"} next=${next ?? "?"} sessionID=${sid}`,
-        })
-        .catch(() => {})
+      logInfo(api, `plan-review-TUI: intercept ${name}: prev=${prevAgent ?? "?"} next=${next ?? "?"} sessionID=${sid}`)
       if (!next || next === prevAgent) return
       prevAgent = next
       void forward(next)
@@ -184,6 +198,10 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         lastModelJSON = ""
       }
       watcher = fs.watch(modelJsonPath, { persistent: false }, () => {
+        // Fires on every model.json mtime change. We only act when the
+        // file content actually differs from the last snapshot — saves
+        // the duplicate "change" events fs.watch emits when writes
+        // touch atime too.
         try {
           const raw = fs.readFileSync(modelJsonPath, "utf8")
           if (raw === lastModelJSON) return
@@ -203,13 +221,10 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           if (!sid) return
           refresh()
           if (!prevAgent) return
-          void api.client.app
-            .log({
-              service: "plan-review-tui",
-              level: "info",
-              message: `plan-review-TUI: picker changed agent=${prevAgent} model=${picked.providerID}/${picked.modelID} sessionID=${sid}`,
-            })
-            .catch(() => {})
+          logInfo(
+            api,
+            `plan-review-TUI: picker changed agent=${prevAgent} model=${picked.providerID}/${picked.modelID} sessionID=${sid}`,
+          )
           void forward(prevAgent, picked)
         } catch (e) {
           void api.client.app
@@ -232,11 +247,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
 
     if (watcher) {
+      logInfo(api, `plan-review-TUI: watcher ready path=${modelJsonPath} initialBytes=${lastModelJSON.length}`)
       api.lifecycle.onDispose(() => {
         try {
           watcher!.close()
         } catch {}
       })
+    } else {
+      logInfo(api, `plan-review-TUI: no watcher (stateDir=${stateDir ?? "?"})`)
     }
   }
 

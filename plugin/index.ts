@@ -144,7 +144,15 @@ function parseModelString(s: string): ModelRef | undefined {
 }
 
 function runPlanReview($: any, planText: string): Promise<string> {
-  return $`${SCRIPT_PATH} --plan-text ${$.escape(planText)}`.text()
+  // Write plan to a temp file and pass via --file so Bun Shell's
+  // $.escape() never touches the markdown content (backticks, $,
+  // etc.). The helper reads the file, opens it in $EDITOR, diffs,
+  // and prints the result on stdout.
+  const tmpPath = join(REPO_DIR, ".plan-review-tmp.md")
+  writeFileSync(tmpPath, planText, "utf8")
+  const promise = $`${SCRIPT_PATH} --file ${$.escape(tmpPath)}`.text()
+  promise.then(() => { try { unlinkSync(tmpPath) } catch {} }, () => { try { unlinkSync(tmpPath) } catch {} })
+  return promise
 }
 
 function log(client: any, level: "debug" | "info" | "warn" | "error", message: string): Promise<unknown> {

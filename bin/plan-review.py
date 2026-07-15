@@ -240,6 +240,15 @@ def run_plan_text(plan_text: str, use_color: bool = True) -> int:
     return 0
 
 
+def run_plan_text_stdin(use_color: bool = True) -> int:
+    """entry: plan content piped via stdin (avoids shell escaping of markdown)."""
+    plan_text = sys.stdin.read()
+    diff = review(plan_text)
+    if diff:
+        sys.stdout.write(colorize_diff(diff, use_color))
+    return 0
+
+
 def run_file(plan_file: Path, use_color: bool = True) -> int:
     """entry: plan content read from file (command mode)."""
     if not plan_file.exists():
@@ -257,6 +266,7 @@ def main() -> int:
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--plan-text", metavar="TEXT", help="plan markdown text (tool mode)")
+    group.add_argument("--plan-text-stdin", action="store_true", help="read plan markdown from stdin (avoids shell escaping)")
     group.add_argument("--file", metavar="PATH", help="path to plan markdown file (command mode)")
     parser.add_argument("--test", action="store_true", help="run unit tests and exit")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors in diff output")
@@ -269,6 +279,8 @@ def main() -> int:
 
     if args.plan_text is not None and args.file is not None:
         parser.error("--plan-text and --file are mutually exclusive")
+    if args.plan_text_stdin:
+        return run_plan_text_stdin(use_color)
     if args.plan_text is not None:
         return run_plan_text(args.plan_text, use_color)
     if args.file is not None:

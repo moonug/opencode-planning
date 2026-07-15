@@ -1,5 +1,5 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, lstatSync, chmodSync, statSync, copyFileSync, watch } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, lstatSync, chmodSync, statSync, copyFileSync } from "node:fs"
 import { dirname, resolve, join, basename } from "node:path"
 import { homedir as osHomedir } from "node:os"
 
@@ -109,9 +109,19 @@ function ensureCommandSymlink(): void {
     } catch {}
 
     let existing: string | undefined
-    try { existing = readFileSync(tuiJsonPath, "utf8") } catch {}
+    try { existing = readFileSync(tuiJsonPath, "utf8") } catch (err) {
+      // ENOENT expected on first run; log other errors so silent
+      // permission/parse failures don't recur.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`plan-review: failed to read ${tuiJsonPath}: ${(err as Error).message}`)
+      }
+    }
     if (existing === undefined) {
-      try { existing = readFileSync(tuiJsonLegacy, "utf8") } catch {}
+      try { existing = readFileSync(tuiJsonLegacy, "utf8") } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          console.error(`plan-review: failed to read ${tuiJsonLegacy}: ${(err as Error).message}`)
+        }
+      }
     }
     let parsed: any = {}
     if (existing) {
@@ -265,8 +275,7 @@ async function exitPlanMode(
   buildModels: Map<string, ModelRef>,
   chatMessageMemory: Map<string, Map<string, ModelRef>>,
   lastResolution: { target?: ModelRef; source?: string },
-  lastGlobalPicker: (() => ModelRef | undefined) | undefined,
-  lastSession: () => { agent?: string; model?: ModelRef } | undefined,
+  modelJsonPath: string,
   sessionID: string | undefined,
   summary: string,
 ): Promise<void> {
@@ -283,16 +292,13 @@ async function exitPlanMode(
   ])
 
   const fromChatPlan = perAgent?.get("plan")
-  // lastGlobalPicker is populated by fs.watch on model.json (set in
-  // plugin init). In tests the default is undefined so the picker
-  // source does not leak across test runs.
-  const fromPicker = lastGlobalPicker?.()
-  // lastSession is the session.list[0] probe populated at init, refreshed
-  // by session.updated.1 events. Use it as a fallback when neither
-  // chat.message nor session.updated.1 has given us a per-session agent
-  // (e.g. user changed picker without sending a message).
-  const sess = lastSession?.()
-  const fromLastSession = sess?.agent === "build" ? sess.model : undefined
+  // Read model.json synchronously when exitPlanMode fires. model.json is
+  // global (shared by every TUI), so attribution can't be precise — this
+  // is only the "no chat.message ever fired" fallback. The TUI plugin
+  // forces chat.message to fire on agent switches via promptAsync, so
+  // reaching this branch means the user clicked the picker without
+  // sending a message AND never tabbed.
+  const fromPicker = readPickerState(modelJsonPath)
 
   let source: string
   let target: ModelRef | undefined
@@ -301,8 +307,7 @@ async function exitPlanMode(
   else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
-  else if (fromPicker)   { target = fromPicker;   source = "picker (model.json recent[0])" }
-  else if (fromLastSession) { target = fromLastSession; source = "session.list[0] (build agent)" }
+  else if (fromPicker)  { target = fromPicker;  source = "picker (model.json recent[0])" }
   else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }
   else                  { source = "opencode default" }
 
@@ -366,71 +371,6 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   await log(client, "info", "plan-review: plugin init v0.1.0").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L352): ${(e as Error)?.message ?? String(e)}`) })
 
-  // diagnostic: log serverUrl so we can probe it with curl from outside
-  // the plugin. opencode 1.17.18 has no plugin hook for picker changes,
-  // so we need a server-side way to learn the current agent — the server
-  // is the only piece of state that might have it.
-  queueMicrotask(() => {
-    void log(client, "info", `diag.init.serverUrl: ${serverUrl.toString()}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L359): ${(e as Error)?.message ?? String(e)}`) })
-  })
-
-  // Diagnostic: probe v1 SDK responses to see what fields are actually
-  // returned. opencode 1.17.18 has no plugin hook for picker changes,
-  // so we need to find a server-side way to learn the current agent.
-  // These calls MUST be fire-and-forget — init cannot await HTTP calls,
-  // the client is not ready at this point and it would hang opencode startup.
-  // Probes also fire from event hook and chat.message hook (belt-and-suspenders)
-  // because init's queueMicrotask may race with server readiness.
-  queueMicrotask(() => {
-    void (async () => {
-      try {
-        const list = await (client as any).session.list({ query: { limit: 1 } })
-        const first = (list as any)?.data?.[0]
-        await log(client, "info", `diag.session.list.first.keys: ${JSON.stringify(Object.keys(first ?? {}))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L374): ${(e as Error)?.message ?? String(e)}`) })
-        await log(client, "info", `diag.session.list.first.agent: ${(first as any)?.agent ?? "<undefined>"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L375): ${(e as Error)?.message ?? String(e)}`) })
-        await log(client, "info", `diag.session.list.first.model: ${JSON.stringify((first as any)?.model)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L376): ${(e as Error)?.message ?? String(e)}`) })
-        // Populate fallback state from session.list[0]. The runtime response
-        // carries `agent` and `model` even though the v1 SDK Session type
-        // doesn't declare them — see diag logs above. This is the most
-        // recent session, so its agent is a reasonable proxy for "which
-        // agent the user is currently in" when no chat.message or
-        // session.updated.1 has fired yet.
-        const firstAgent = (first as any)?.agent
-        if (typeof firstAgent === "string" && firstAgent) {
-          lastSessionAgent = firstAgent
-        }
-        const m = (first as any)?.model
-        if (m && (m.providerID || m.id)) {
-          lastSessionModel = { providerID: m.providerID, modelID: m.id }
-        }
-        const firstID = (first as any)?.id
-        if (typeof firstID === "string" && firstID) {
-          lastSessionID = firstID
-        }
-        await log(client, "info", `diag.session.list.first.populated: agent=${lastSessionAgent ?? "?"} model=${lastSessionModel?.providerID ?? "?"}/${lastSessionModel?.modelID ?? "?"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L395): ${(e as Error)?.message ?? String(e)}`) })
-      } catch (e) {
-        await log(client, "warn", `diag.session.list failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L397): ${(e as Error)?.message ?? String(e)}`) })
-      }
-    })()
-  })
-
-  queueMicrotask(() => {
-    void (async () => {
-      try {
-        const res = await (client as any).app.agents()
-        const data = (res as any)?.data ?? res
-        const agents = Array.isArray(data) ? data : []
-        await log(client, "info", `diag.app.agents.count: ${agents.length}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L408): ${(e as Error)?.message ?? String(e)}`) })
-        if (agents.length > 0) {
-          await log(client, "info", `diag.app.agents[0].keys: ${JSON.stringify(Object.keys(agents[0]))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L410): ${(e as Error)?.message ?? String(e)}`) })
-          await log(client, "info", `diag.app.agents[0]: ${JSON.stringify(agents[0])}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L411): ${(e as Error)?.message ?? String(e)}`) })
-        }
-      } catch (e) {
-        await log(client, "warn", `diag.app.agents failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L414): ${(e as Error)?.message ?? String(e)}`) })
-      }
-    })()
-  })
-
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
       `plan-review: helper script not found at ${SCRIPT_PATH}. ` +
@@ -444,102 +384,17 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   const lastResolution: { target?: ModelRef; source?: string } = {}
   const lastShownModels = new Map<string, ProviderListEntry[]>()
   const chatMessageMemory = new Map<string, Map<string, ModelRef>>()
-  // sessionID -> { agent, model } — last known active agent and its model
-  // from session.updated.1 events. Used to attribute picker changes in
-  // model.json to a specific agent (model.json has no agent field).
-  const lastActiveAgents = new Map<string, { agent: string; model?: ModelRef }>()
-
-  // Fallback for when neither chat.message nor session.updated.1 has fired
-  // (e.g. user changed the picker in the TUI without sending a message).
-  // session.list({query:{limit:1}}) returns the most recent session in
-  // runtime response, and that session has an `agent` field — populated
-  // by the init probe below. Note: this is the LAST session's agent, not
-  // necessarily the CURRENT one, but in practice the user usually keeps
-  // working in the same session.
-  let lastSessionAgent: string | undefined
-  let lastSessionModel: ModelRef | undefined
-  let lastSessionID: string | undefined
+  // Reads the TUI's global picker history on demand inside exitPlanMode.
+  // Used as a best-effort fallback when no chat.message has set the
+  // per-session build model. The watcher that used to live here was
+  // removed: model.json is global (not per-workspace), and running
+  // fs.watch in every server-plugin instance produced duplicate
+  // "matched agent=build/explore" log lines whenever more than one
+  // opencode process shared $HOME. Tool attribution now relies on the
+  // chat.message hook (TUI plugin forwards agent switches via
+  // promptAsync), so the watcher added noise without adding accuracy.
   const MODEL_JSON_PATH = process.env.PLAN_REVIEW_MODEL_JSON
     ?? `${homedir()}/.local/state/opencode/model.json`
-  let lastGlobalPicker: ModelRef | undefined = readPickerState(MODEL_JSON_PATH)
-
-  // Watch model.json so we pick up TUI picker changes even when no message
-  // is sent. TUI writes its selection to recent[0]; we read it eagerly and
-  // cross-reference with lastActiveAgents to infer which agent the picker
-  // change was for.
-  try {
-    if (existsSync(MODEL_JSON_PATH)) {
-      watch(MODEL_JSON_PATH, { persistent: false }, () => {
-        const m = readPickerState(MODEL_JSON_PATH)
-        if (m && (!lastGlobalPicker || lastGlobalPicker.providerID !== m.providerID || lastGlobalPicker.modelID !== m.modelID)) {
-          const old = lastGlobalPicker
-          lastGlobalPicker = m
-          // Cross-reference: did the new picker match a known
-          // (agent, model) pair from session.updated.1? If so we can
-          // tell which agent the user was on when they picked.
-          let matchedAgent: string | undefined
-          for (const [, info] of lastActiveAgents) {
-            if (info.model && info.model.providerID === m.providerID && info.model.modelID === m.modelID) {
-              matchedAgent = info.agent
-            }
-          }
-          // Fallback: if no per-session match (no chat.message or
-          // session.updated.1 fired yet), use lastSessionAgent from the
-          // session.list[0] probe. This is the most recent session's
-          // agent, which is usually the agent the user is in now.
-          if (!matchedAgent && lastSessionAgent) {
-            matchedAgent = lastSessionAgent
-          }
-          // Probe client.session.get for current agent. The runtime
-          // response may carry an up-to-date `agent` field even when
-          // session.list[0] is stale (e.g. user switched agent tabs
-          // without sending a message). Fire-and-forget so the watcher
-          // log stays synchronous.
-          if (lastSessionID) {
-            queueMicrotask(() => {
-              void (async () => {
-                try {
-                  const got = await (client as any).session.get({ path: { id: lastSessionID } })
-                  const data = (got as any)?.data ?? got
-                  const fresh = (data as any)?.agent
-                  if (typeof fresh === "string" && fresh && fresh !== lastSessionAgent) {
-                    lastSessionAgent = fresh
-                    log(client, "info",
-                      `plan-review: session.get probe updated agent: session=${lastSessionID} ${lastSessionAgent} -> ${fresh}`,
-                    ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L494): ${(e as Error)?.message ?? String(e)}`) })
-                  }
-                } catch (e) {
-                  log(client, "warn", `diag.session.get failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L497): ${(e as Error)?.message ?? String(e)}`) })
-                }
-              })()
-            })
-          }
-          // Read full recent[] timeline from model.json. opencode stores
-          // picker history as an ordered array; recent[0] is current,
-          // recent[1..N] is the timeline. Without per-pickup agent
-          // metadata this is the best approximation we have for which
-          // picker happened on which agent — typically each agent
-          // switch flips the agent tab before the next picker click.
-          let recentStr = ""
-          try {
-            const raw = readFileSync(MODEL_JSON_PATH, "utf8")
-            const data = JSON.parse(raw) as { recent?: Array<{ providerID?: string; modelID?: string }> }
-            const recent = Array.isArray(data.recent) ? data.recent : []
-            recentStr = recent.slice(0, 5)
-              .map((r) => `${r.providerID ?? "?"}/${r.modelID ?? "?"}`)
-              .join(", ")
-          } catch {}
-          const oldStr = old ? `${old.providerID}/${old.modelID}` : "(none)"
-          const ctx = matchedAgent
-            ? `, matched agent=${matchedAgent}`
-            : `, lastActiveAgents empty (no chat.message or session.updated.1 yet), recent[]=[${recentStr}]`
-          log(client, "info",
-            `plan-review: model.json changed, recent[0]=${m.providerID}/${m.modelID} (was ${oldStr})${ctx}`,
-          ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L523): ${(e as Error)?.message ?? String(e)}`) })
-        }
-      })
-    }
-  } catch {}
 
   const plan_review = tool({
     description:
@@ -559,7 +414,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, () => ({ agent: lastSessionAgent, model: lastSessionModel }), context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, MODEL_JSON_PATH, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -598,54 +453,14 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         `plan-review: chat.message HOOK FIRED: session=${input.sessionID ?? "?"} agent=${input.agent ?? "?"} model=${input.model?.providerID ?? "?"}/${input.model?.modelID ?? "?"}`,
       ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L584): ${(e as Error)?.message ?? String(e)}`) })
 
-      // one-shot probe: on first chat.message, dump input keys + app.agents count.
-      // chat.message is the most reliable hook — it fires on every prompt, and
-      // the client is guaranteed to be ready here.
-      if (!(globalThis as any).__planReviewChatMessageProbeDone) {
-        ;(globalThis as any).__planReviewChatMessageProbeDone = true
-        try {
-          await log(client, "info", `diag.chat.message.input.keys: ${JSON.stringify(Object.keys(input ?? {}))}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L592): ${(e as Error)?.message ?? String(e)}`) })
-          await log(client, "info", `diag.chat.message.input.agent: ${(input as any)?.agent ?? "<undefined>"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L593): ${(e as Error)?.message ?? String(e)}`) })
-          await log(client, "info", `diag.chat.message.input.model: ${JSON.stringify((input as any)?.model)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L594): ${(e as Error)?.message ?? String(e)}`) })
-          await log(client, "info", `diag.chat.message.input.variant: ${JSON.stringify((input as any)?.variant)}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L595): ${(e as Error)?.message ?? String(e)}`) })
-        } catch {}
-        queueMicrotask(() => {
-          void (async () => {
-            try {
-              const res = await (client as any).app.agents()
-              const data = (res as any)?.data ?? res
-              const agents = Array.isArray(data) ? data : []
-              await log(client, "info", `diag.chat.message.app.agents.count: ${agents.length}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L603): ${(e as Error)?.message ?? String(e)}`) })
-              if (agents.length > 0) {
-                await log(client, "info", `diag.chat.message.app.agents[0]: ${JSON.stringify(agents[0])}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L605): ${(e as Error)?.message ?? String(e)}`) })
-              }
-            } catch (e) {
-              await log(client, "warn", `diag.chat.message.app.agents failed: ${(e as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L608): ${(e as Error)?.message ?? String(e)}`) })
-            }
-          })()
-        })
-      }
-
-      // Update the agent cache. The TUI plugin issues
-      // client.session.prompt({noReply:true, agent: to, parts: ["."]}) on
-      // every Tab/Shift+Tab cycle to inform the server of agent
-      // switches (because v2.session.switchAgent's event is dropped by
-      // the server plugin's location filter at
-      // packages/opencode/src/plugin/index.ts:252). That session.prompt
-      // call goes through packages/opencode/src/session/prompt.ts:999
-      // which fires the chat.message plugin hook for every user message
-      // — including programmatic ones with noReply: true (per source,
-      // createUserMessage always runs). So this handler is the
-      // REAL reliable sink for agent-switch notifications, even when
-      // the picker hasn't been touched yet. We update both
-      // chatMessageMemory[agent]=model (existing behavior) AND
-      // lastSessionAgent/lastSessionID (new — keeps the picker
-      // attribution cache in sync so model.json changes after a Tab
-      // cycle land on the right agent).
-      if (input.sessionID && input.agent) {
-        lastSessionAgent = input.agent
-        lastSessionID = input.sessionID
-      }
+      // chat.message is the ONLY server-plugin hook that reliably fires
+      // for both user-typed and programmatic prompts — see
+      // packages/opencode/src/session/prompt.ts:999. The TUI plugin
+      // calls promptAsync with noReply:true on every Tab cycle, which
+      // fires this hook for the new agent even though no real message
+      // reaches the LLM. Use this as the single source of truth for
+      // per-session, per-agent last-picked model. exitPlanMode()
+      // prioritises this map over any global file state.
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
         if (!perSession) {
@@ -660,7 +475,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
           client,
           "info",
           `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
-        ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L628): ${(e as Error)?.message ?? String(e)}`) })
+        ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L502): ${(e as Error)?.message ?? String(e)}`) })
       }
     },
 
@@ -711,70 +526,22 @@ Do NOT proceed with implementation until the plan is approved.
       // confirmed the chat.message handler is what we should rely on
       // for agent-switch notifications.
 
-      // diagnostic log: surface every session.updated variant we receive
-      if (e.type === "session.updated" || e.type === "session.updated.1") {
-        const info = e.properties?.info ?? e.data?.info
-        if (info) {
-           await log(client, "debug", `session.updated: agent=${info.agent ?? "?"} model=${info.model?.providerID ?? "?"}/${info.model?.id ?? info.model?.modelID ?? "?"} next_agent=${info.next?.agent ?? "-"} next_model=${info.next?.model?.providerID ?? "-"}/${info.next?.model?.id ?? "-"}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L685): ${(e as Error)?.message ?? String(e)}`) })
-         }
-       }
-      // Note: session.next.agent.switched and session.next.model.switched
-      // events are NOT handled here. They are published by v2 SDK calls
-      // (client.v2.session.switchAgent / switchModel) but the server
-      // plugin's event hook at packages/opencode/src/plugin/index.ts:252
-      // filters out events with undefined event.location.directory — and
-      // session.next.* events come through EventV2.Service (no location
-      // context), so they are silently dropped before reaching any plugin.
-      // The TUI plugin's session.prompt fallback (which fires the
-      // chat.message hook — see packages/opencode/src/session/prompt.ts:999)
-      // is what actually carries the agent-switch signal. Keep the
-      // chat.message handler in sync with the latest agent.
-
+      // rememberBuildModel takes session.updated events and stores
+      // per-session build models when the event carries a build agent
+      // line. It is the only event type the hook reliably receives.
       try {
         rememberBuildModel(e, buildModels)
-        // log when build agent model captured
-        if (e.type === "session.updated" || e.type === "session.updated.1") {
-          const info = e.properties?.info ?? e.data?.info
-          const sid = info?.id
-          if (info?.agent === "build" && sid && buildModels.has(sid)) {
-            const m = buildModels.get(sid)!
-            await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L730): ${(e as Error)?.message ?? String(e)}`) })
-          }
-          // Track last active agent per session so picker changes in
-          // model.json can be attributed to a specific agent. Used by the
-          // model.json watcher to log 'matched agent=X' for each change.
-          if (sid && info?.agent) {
-            const modelID = info.model?.modelID ?? info.model?.id
-            const providerID = info.model?.providerID
-            const prev = lastActiveAgents.get(sid)
-            if (!prev || prev.agent !== info.agent || (providerID && modelID && (!prev.model || prev.model.providerID !== providerID || prev.model.modelID !== modelID))) {
-              lastActiveAgents.set(sid, {
-                agent: info.agent,
-                model: providerID && modelID ? { providerID, modelID } : prev?.model,
-              })
-            }
-            // Keep lastSessionAgent/lastSessionModel fresh — they shadow
-            // the session.list[0] probe at init. When session.updated.1
-            // fires, the event's info object is more authoritative than
-            // the initial probe, so we update with it.
-            lastSessionAgent = info.agent
-            if (providerID && modelID) {
-              lastSessionModel = { providerID, modelID }
-            }
-            if (sid) lastSessionID = sid
-          }
-          // TUI-side plugin (plugin/tui-plugin.ts) calls the v2 SDK's
-          // switchAgent endpoint when the user cycles agents via Tab/
-          // Shift+Tab. switchAgent runs setAgentModel() which patches
-          // the session row and publishes SessionV1.Event.Updated
-          // carrying the new info.agent — so the existing handler
-          // above already updated lastSessionAgent from info.agent.
-          // No metadata parsing needed here. (Earlier we tried reading
-          // metadata.planReviewTabSwitchTo, but session.update({body:
-          // {metadata:{...}}}) does NOT run setAgentModel and so the
-          // event never fires — that path was dead-end.)
+      } catch (err) {
+        await log(client, "warn", `plan-review: rememberBuildModel failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L556): ${(e as Error)?.message ?? String(e)}`) })
+      }
+      if (e.type === "session.updated" || e.type === "session.updated.1") {
+        const info = e.properties?.info ?? e.data?.info
+        const sid = info?.id
+        if (info?.agent === "build" && sid && buildModels.has(sid)) {
+          const m = buildModels.get(sid)!
+          await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L560): ${(e as Error)?.message ?? String(e)}`) })
         }
-      } catch {}
+      }
 
       if (e.type !== "command.executed" && e.type !== "tui.command.execute") return
 
@@ -949,7 +716,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, () => lastGlobalPicker, () => ({ agent: lastSessionAgent, model: lastSessionModel }), sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, MODEL_JSON_PATH, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L944): ${(e as Error)?.message ?? String(e)}`) })

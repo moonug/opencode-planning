@@ -9,8 +9,8 @@ import type { Event } from "@opencode-ai/sdk/v2"
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.1.4"
-const BUILD_TAG = "picker-defer-metadata-v1"
+const VERSION = "0.1.5"
+const BUILD_TAG = "v2-sdk-shape-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
@@ -114,18 +114,19 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     return primaryAgents[next]
   }
 
-  // Forward agent/model change to the server. Use the v2 SDK
-  // (client.session.promptAsync). The TUI host injects an `OpencodeClient`
-  // from @opencode-ai/sdk/v2 which has `promptAsync(...)` as the no-stream
-  // sibling of `prompt(...)` — see
-  // packages/sdk/js/src/v2/gen/sdk.gen.ts:4095. plugin hook `chat.message`
-  // fires for every prompt via `packages/opencode/src/session/prompt.ts:999`,
-  // so this single noReply call carries the agent/model to the server-side
-  // picker watcher (which routes through exitPlanMode).
+  // Forward agent/model change to the server. The TUI host injects an
+  // `OpencodeClient` from @opencode-ai/sdk/v2 — confirmed by
+  // packages/tui/src/component/prompt/move.tsx which uses the v2
+  // parameter shape `{sessionID, noReply, parts, ...}` directly.
+  // We had been using the v1 shape `{path: {id}, body: {...}}` which
+  // silently failed: the v2 SDK's buildClientParams reads top-level
+  // fields and ignores `path`/`body` wrappers, so `parameters
+  // .sessionID` was always undefined and the server rejected the
+  // request. Fixed in this commit.
   //
-  // forward() = fire-and-forget (uses promptAsync). Use for interactive
-  // paths (Tab cycle, mid-session picker) where the user doesn't
-  // need to wait for the server to acknowledge.
+  // forward() = fire-and-forget (uses promptAsync). Use for
+  // interactive paths (Tab cycle, mid-session picker) where the
+  // user doesn't need to wait for the server to acknowledge.
   const forward = async (
     to: string,
     model?: { providerID: string; modelID: string },
@@ -134,13 +135,11 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (!sid) return
     try {
       await api.client.session.promptAsync({
-        path: { id: sid },
-        body: {
-          agent: to,
-          ...(model ? { model } : {}),
-          noReply: true,
-          parts: [{ type: "text", text: "." }],
-        },
+        sessionID: sid,
+        agent: to,
+        ...(model ? { model } : {}),
+        noReply: true,
+        parts: [{ type: "text", text: "." }],
       })
     } catch (e) {
       void api.client.app
@@ -167,24 +166,21 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // Use ONLY for the deferred-picker flush in refresh(). Interactive
   // paths (Tab, mid-session picker) keep promptAsync via
   // forward() because they don't need acknowledgement.
+  //
+  // Parameter shape: v2 SDK takes `{sessionID, agent, model,
+  // noReply, parts}` directly (not `{path: {id}, body: {...}}`).
   const forwardSync = async (
     to: string,
     model: { providerID: string; modelID: string },
     sid: string,
   ): Promise<void> => {
     try {
-      // We pass the sessionID explicitly instead of calling
-      // getActiveSessionID() again — the flush runs from refresh()
-      // which already validated sid. This avoids a window where the
-      // route could have changed mid-flush.
       await api.client.session.prompt({
-        path: { id: sid },
-        body: {
-          agent: to,
-          model,
-          noReply: true,
-          parts: [{ type: "text", text: "." }],
-        },
+        sessionID: sid,
+        agent: to,
+        model,
+        noReply: true,
+        parts: [{ type: "text", text: "." }],
       })
     } catch (e) {
       void api.client.app
@@ -214,13 +210,11 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   ): Promise<void> => {
     try {
       await api.client.session.update({
-        path: { id: sid },
-        body: {
-          metadata: {
-            planReviewDeferredPicks: {
-              ...picks,
-              _writtenAt: new Date().toISOString(),
-            },
+        sessionID: sid,
+        metadata: {
+          planReviewDeferredPicks: {
+            ...picks,
+            _writtenAt: new Date().toISOString(),
           },
         },
       })

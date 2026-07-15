@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.4")) {
-    throw new Error("TUI init log missing v0.1.4 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.5")) {
+    throw new Error("TUI init log missing v0.1.5 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=picker-defer-metadata-v1")) {
+  if (!loaded?.message?.includes("build=v2-sdk-shape-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.4 build=picker-defer-metadata-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.5 build=v2-sdk-shape-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -779,7 +779,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("expected 2 session.prompt calls (chat.message flush), got: " + prompts.length + "\n" + JSON.stringify(prompts))
   }
   // session.update must carry both deferred picks keyed by agent.
-  const meta = updates[0].body?.metadata?.planReviewDeferredPicks
+  // v2 SDK shape: top-level fields on the parameter object.
+  const meta = (updates[0] as any).metadata?.planReviewDeferredPicks
   if (!meta || typeof meta !== "object") {
     throw new Error("session.update missing metadata.planReviewDeferredPicks, got: " + JSON.stringify(updates[0]))
   }
@@ -787,21 +788,22 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (metaValues.length !== 2) {
     throw new Error("metadata.planReviewDeferredPicks must have 2 entries (build+plan), got: " + JSON.stringify(metaValues))
   }
-  const metaHasMimo = metaValues.some(([_, m]: any) => m.modelID === "mimo-v2.5")
-  const metaHasDs = metaValues.some(([_, m]: any) => m.modelID === "deepseek-v4-flash")
+  const metaHasMimo = metaValues.some(([_, m]: any) => (m as any).modelID === "mimo-v2.5")
+  const metaHasDs = metaValues.some(([_, m]: any) => (m as any).modelID === "deepseek-v4-flash")
   if (!metaHasMimo || !metaHasDs) {
     throw new Error("metadata must carry BOTH mimo-v2.5 and deepseek-v4-flash, got: " + JSON.stringify(metaValues))
   }
   // Each prompt must carry its own (agent, model) — per-agent keying
   // works correctly when the prompt for agent="plan" carries mimo
   // and the prompt for agent="build" carries deepseek, OR vice versa.
-  const mimoPrompt = prompts.find((p: any) => p.body?.model?.modelID === "mimo-v2.5")
-  const dsPrompt = prompts.find((p: any) => p.body?.model?.modelID === "deepseek-v4-flash")
+  // v2 SDK shape: top-level fields on the parameter object.
+  const mimoPrompt = prompts.find((p: any) => (p as any).model?.modelID === "mimo-v2.5")
+  const dsPrompt = prompts.find((p: any) => (p as any).model?.modelID === "deepseek-v4-flash")
   if (!mimoPrompt || !dsPrompt) {
     throw new Error("expected both mimo-v2.5 and deepseek-v4-flash prompts, got: " + JSON.stringify(prompts))
   }
-  const mimoAgent = mimoPrompt.body?.agent
-  const dsAgent = dsPrompt.body?.agent
+  const mimoAgent = (mimoPrompt as any).agent
+  const dsAgent = (dsPrompt as any).agent
   if (!["build", "plan"].includes(mimoAgent) || !["build", "plan"].includes(dsAgent)) {
     throw new Error("agent in flush must be one of build/plan, got: mimo=" + mimoAgent + " ds=" + dsAgent)
   }
@@ -809,30 +811,31 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("flushed prompts must have DIFFERENT agents — per-agent keying still broken")
   }
   for (const p of prompts) {
-    if (p.body?.noReply !== true) throw new Error("flushed prompt must use noReply:true")
-    if (p.path?.id !== "ses_peragent") throw new Error("flushed prompt path.id should be ses_peragent")
+    const pp = p as any
+    if (pp.noReply !== true) throw new Error("flushed prompt must use noReply:true, got: " + JSON.stringify(p))
+    if (pp.sessionID !== "ses_peragent") {
+      throw new Error("flushed prompt sessionID should be ses_peragent, got: " + pp.sessionID)
+    }
   }
   // First pick → firstAgent, second pick → secondAgent. They must
   // survive intact through the flush.
-  const firstAgentExpected = firstAgent
-  const secondAgentExpected = secondAgent
-  if (mimoPrompt.body.agent !== firstAgentExpected && mimoPrompt.body.agent !== secondAgentExpected) {
-    throw new Error("mimo prompt agent " + mimoPrompt.body.agent + " doesn't match either deferred pick")
+  if (mimoAgent !== firstAgent && mimoAgent !== secondAgent) {
+    throw new Error("mimo prompt agent " + mimoAgent + " doesn't match either deferred pick")
   }
   // Find which agent picked which model in the watcher logs — we
   // snapshotted them into `deferredLogs` before clearing.
   const mimoAgentInLog = (deferredLogs.find((l: any) =>
     l.message?.includes("picker deferred") && l.message?.includes("mimo-v2.5"),
   )?.message.match(/agent=(\S+)/) ?? [])[1]
-  if (mimoPrompt.body.agent !== mimoAgentInLog) {
-    throw new Error("mimo prompt agent " + mimoPrompt.body.agent +
+  if ((mimoPrompt as any).agent !== mimoAgentInLog) {
+    throw new Error("mimo prompt agent " + (mimoPrompt as any).agent +
       " does not match defer log agent " + mimoAgentInLog + " — per-agent keying lost attribution")
   }
   const dsAgentInLog = (deferredLogs.find((l: any) =>
     l.message?.includes("picker deferred") && l.message?.includes("deepseek-v4-flash"),
   )?.message.match(/agent=(\S+)/) ?? [])[1]
-  if (dsPrompt.body.agent !== dsAgentInLog) {
-    throw new Error("ds prompt agent " + dsPrompt.body.agent +
+  if ((dsPrompt as any).agent !== dsAgentInLog) {
+    throw new Error("ds prompt agent " + (dsPrompt as any).agent +
       " does not match flush log agent " + dsAgentInLog)
   }
   // After flush the deferred state is cleared — a second session.updated
@@ -946,7 +949,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       session: {
         promptAsync: async (opts: any) => {
           prompts.push(opts)
-          const newAgent = opts.body?.agent
+          const newAgent = opts.agent
           if (newAgent) {
             currentAgent = newAgent
             currentMessages = [
@@ -999,15 +1002,15 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   handlerFn({ event: { name: "shift+tab" } })
   await new Promise(r => setTimeout(r, 50))
   if (prompts.length !== 2) throw new Error("expected 2 promptAsync calls, got: " + prompts.length)
-  if (prompts[0].body?.agent !== "plan") throw new Error("first Tab should target plan, got: " + prompts[0].body?.agent)
-  if (prompts[0].body?.noReply !== true) throw new Error("first Tab prompt must have noReply=true")
-  if (!Array.isArray(prompts[0].body?.parts) || prompts[0].body.parts.length === 0) {
-    throw new Error("first Tab prompt needs at least one part, got: " + JSON.stringify(prompts[0].body))
+  if ((prompts[0] as any).agent !== "plan") throw new Error("first Tab should target plan, got: " + (prompts[0] as any).agent)
+  if ((prompts[0] as any).noReply !== true) throw new Error("first Tab prompt must have noReply=true")
+  if (!Array.isArray((prompts[0] as any).parts) || (prompts[0] as any).parts.length === 0) {
+    throw new Error("first Tab prompt needs at least one part, got: " + JSON.stringify(prompts[0]))
   }
-  if (prompts[0].path?.id !== "ses_route") {
-    throw new Error("first Tab prompt must use route.params.sessionID, got: " + JSON.stringify(prompts[0].path))
+  if ((prompts[0] as any).sessionID !== "ses_route") {
+    throw new Error("first Tab prompt must use route.params.sessionID, got: " + JSON.stringify(prompts[0]))
   }
-  if (prompts[1].body?.agent !== "build") throw new Error("second Shift+Tab should target build, got: " + prompts[1].body?.agent)
+  if ((prompts[1] as any).agent !== "build") throw new Error("second Shift+Tab should target build, got: " + (prompts[1] as any).agent)
   const loaded = logs.find((l: any) => l.message?.includes("plan-review-TUI: plugin loaded"))
   if (!loaded) throw new Error("missing 'plugin loaded' log")
   const interceptLogs = logs.filter((l: any) => l.message?.includes("plan-review-TUI: intercept"))
@@ -1142,7 +1145,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     handlerFn({ event: { name: "tab" } })
     await new Promise(r => setTimeout(r, 30))
   }
-  const called = prompts.map((p: any) => p.body?.agent).filter(Boolean)
+  const called = prompts.map((p: any) => (p as any).agent).filter(Boolean)
   if (called.length < 1) throw new Error("expected at least 1 promptAsync call, got 0")
   for (const bad of ["compaction", "code-review", "explore"]) {
     if (called.includes(bad)) {
@@ -1230,8 +1233,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 30))
   if (prompts.length !== 1) throw new Error("expected 1 promptAsync call, got: " + prompts.length)
-  if (prompts[0].body?.agent !== "plan") throw new Error("prompt should target plan, got: " + prompts[0].body?.agent)
-  if (prompts[0].body?.noReply !== true) throw new Error("prompt must have noReply=true")
+  if ((prompts[0] as any).agent !== "plan") throw new Error("prompt should target plan, got: " + (prompts[0] as any).agent)
+  if ((prompts[0] as any).noReply !== true) throw new Error("prompt must have noReply=true")
   const interceptLog = logs.find((l: any) => l.message?.includes("plan-review-TUI: intercept"))
   if (!interceptLog?.message?.includes("ses_log44")) {
     throw new Error("intercept log must mention sessionID=ses_log44, got: " + interceptLog?.message)
@@ -1327,17 +1330,17 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     if (prompts.length >= 1) break
   }
   require("node:fs").rmSync(fakeStateDir, { recursive: true, force: true })
-  const pickerPrompt = prompts.find((p: any) => p.body?.model?.providerID === "ya-glm")
+  const pickerPrompt = prompts.find((p: any) => (p as any).model?.providerID === "ya-glm")
   if (!pickerPrompt) {
     throw new Error("watcher did not forward model.json change. prompts: " + JSON.stringify(prompts))
   }
-  if (pickerPrompt.body?.agent !== "build") {
-    throw new Error("watcher must attach the current agent (build), got: " + pickerPrompt.body?.agent)
+  if ((pickerPrompt as any).agent !== "build") {
+    throw new Error("watcher must attach the current agent (build), got: " + (pickerPrompt as any).agent)
   }
-  if (pickerPrompt.path?.id !== "ses_pick") {
-    throw new Error("watcher prompt path.id should be ses_pick, got: " + pickerPrompt.path?.id)
+  if ((pickerPrompt as any).sessionID !== "ses_pick") {
+    throw new Error("watcher prompt sessionID should be ses_pick, got: " + (pickerPrompt as any).sessionID)
   }
-  if (pickerPrompt.body?.noReply !== true) {
+  if ((pickerPrompt as any).noReply !== true) {
     throw new Error("watcher must use noReply:true")
   }
   const pickerLog = logs.find((l: any) => l.message?.includes("picker changed"))
@@ -1720,11 +1723,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.4")) {
-    throw new Error("init log must include v0.1.4 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.5")) {
+    throw new Error("init log must include v0.1.5 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=picker-defer-metadata-v1")) {
-    throw new Error("init log must include build=picker-defer-metadata-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=v2-sdk-shape-v1")) {
+    throw new Error("init log must include build=v2-sdk-shape-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

@@ -370,6 +370,14 @@ async function exitPlanMode(
   // sending a message AND never tabbed.
   const fromPicker = readPickerState(modelJsonPath)
 
+  // DIAG: log all priority chain sources so we can trace why a
+  // particular model was picked (user reports build got wrong model).
+  await log(
+    client,
+    "info",
+    `plan-review: exitPlanMode chain: session=${sessionID} fromChat=${fromChat ? `${fromChat.providerID}/${fromChat.modelID}` : "∅"} fromChatPlan=${fromChatPlan ? `${fromChatPlan.providerID}/${fromChatPlan.modelID}` : "∅"} overridden=${overridden ? `${overridden.providerID}/${overridden.modelID}` : "∅"} agentCfg=${agentCfg ? `${agentCfg.providerID}/${agentCfg.modelID}` : "∅"} planCfg=${planCfg ? `${planCfg.providerID}/${planCfg.modelID}` : "∅"} globalCfg=${globalCfg ? `${globalCfg.providerID}/${globalCfg.modelID}` : "∅"} fromPicker=${fromPicker ? `${fromPicker.providerID}/${fromPicker.modelID}` : "∅"}`,
+  ).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L375): ${(e as Error)?.message ?? String(e)}`) })
+
   let source: string
   let target: ModelRef | undefined
   if (fromChat)         { target = fromChat;    source = "chat.message (build)" }

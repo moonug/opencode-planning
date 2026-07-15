@@ -56,16 +56,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     return undefined
   }
 
-  let prevAgent: string | undefined
-  let sessionID: string | undefined = getActiveSessionID()
-  if (sessionID) prevAgent = getLastUserAgent(sessionID)
-
-  logInfo(
-    api,
-    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG}`,
-  )
-
   // Read all primary agents (filter mirrors packages/tui/src/context/local.tsx:78).
+  // Loaded before prevAgent init so the fallback below has something to
+  // default to when there are no prior user messages in this session.
   let primaryAgents: string[] = []
   try {
     const res = await api.client.app.agents()
@@ -83,6 +76,22 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       })
       .catch(() => {})
   }
+
+  let prevAgent: string | undefined
+  let sessionID: string | undefined = getActiveSessionID()
+  if (sessionID) prevAgent = getLastUserAgent(sessionID)
+  // Default prevAgent to the first primary agent when there is no last
+  // user message (fresh session / home route). Mirrors
+  // packages/tui/src/context/local.tsx:97 where local.agent.current()
+  // falls back to agents().at(0). Without this default the watcher
+  // silently bails on its first tick when the user opens a brand-new
+  // session and the picker changes before they type anything.
+  if (!prevAgent && primaryAgents[0]) prevAgent = primaryAgents[0] as string
+
+  logInfo(
+    api,
+    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG}`,
+  )
 
   const computeNext = (current: string | undefined, direction: 1 | -1): string | undefined => {
     if (primaryAgents.length === 0) return undefined
@@ -137,7 +146,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (!sid) return
     sessionID = sid
     const agent = getLastUserAgent(sid)
-    if (typeof agent === "string" && agent) prevAgent = agent
+    if (typeof agent === "string" && agent) {
+      prevAgent = agent
+    } else if (primaryAgents[0]) {
+      // No last user message yet (fresh session, just opened). Fall
+      // back to the first primary agent so subsequent picker changes
+      // can attribute without waiting for the user to type.
+      prevAgent = primaryAgents[0]
+    }
   }
 
   const subs: Array<() => void> = []
@@ -218,9 +234,21 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           } catch {}
           if (!picked) return
           const sid = getActiveSessionID()
-          if (!sid) return
+          if (!sid) {
+            logInfo(api, `plan-review-TUI: picker skipped reason=no-session`)
+            return
+          }
           refresh()
-          if (!prevAgent) return
+          if (!prevAgent) {
+            // Fall back to the first primary agent — mirrors local.agent
+            // fallback in packages/tui/src/context/local.tsx:97.
+            prevAgent = primaryAgents[0]
+            if (!prevAgent) {
+              logInfo(api, `plan-review-TUI: picker skipped reason=no-agent`)
+              return
+            }
+            logInfo(api, `plan-review-TUI: picker using default agent=${prevAgent}`)
+          }
           logInfo(
             api,
             `plan-review-TUI: picker changed agent=${prevAgent} model=${picked.providerID}/${picked.modelID} sessionID=${sid}`,

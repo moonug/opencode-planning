@@ -561,6 +561,54 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[38b] TUI plugin logs v0.1.1 build=picker-watch-v1: ok")
 }
 
+// 38c. TUI plugin: prevAgent defaults to first primary agent when no
+//      last user message exists (fresh session / home route at init).
+//      Without this default the model.json watcher silently bails on
+//      its first tick. Live test confirmed: route="home" at plugin
+//      init + empty messages() = picker forward path silently skipped.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const logs: any[] = []
+  const fakeApi = {
+    client: {
+      session: { promptAsync: async () => ({ data: null }) },
+      app: {
+        agents: async () => ({ data: [
+          { name: "plan", mode: "primary", hidden: false },
+          { name: "build", mode: "primary", hidden: false },
+        ] }),
+        log: async (opts: any) => { logs.push(opts); return {} },
+      },
+    },
+    state: {
+      // Empty messages — fresh session, no user-typed agent yet.
+      session: { messages: () => [] },
+      path: { state: "/tmp", config: "/tmp", worktree: "/tmp", directory: "/tmp" },
+    },
+    route: { current: { name: "home" } }, // no active session at init
+    keymap: { intercept: (_t: string, _h: any) => () => {} },
+    lifecycle: { signal: new AbortController().signal, onDispose: (_fn: any) => () => {} },
+    event: { on: (_t: string, _h: any) => () => {} },
+  }
+  await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
+  await new Promise((r) => setTimeout(r, 30))
+  const ready = logs.find((l: any) => l.message?.includes("plan-review-TUI: ready sessionID=none"))
+  if (!ready) {
+    throw new Error("ready log missing for home route, got: " + logs.map((l:any)=>l.message).join("\n"))
+  }
+  // prevAgent must default to one of the primary agents when no last
+  // user message exists — mirrors local.agent fallback. Don't pin to
+  // a specific name (server returned them as [plan, build] historically
+  // but order is not guaranteed across opencode versions).
+  const match = ready.message?.match(/prevAgent=(\S+)/)
+  if (!match) throw new Error("ready log missing prevAgent=: " + ready.message)
+  if (!["build", "plan"].includes(match[1])) {
+    throw new Error("prevAgent must be a primary agent name, got: " + match[1])
+  }
+  console.log(`[38c] TUI plugin defaults prevAgent to first primary agent (${match[1]}) when no session: ok`)
+}
+
 // 39. TUI plugin: Tab calls promptAsync({agent, noReply:true}) on the
 //     v2 SDK client. Verify the call reaches server via the SDK method
 //     (NOT through the absent v1 session.prompt). sessionID comes from

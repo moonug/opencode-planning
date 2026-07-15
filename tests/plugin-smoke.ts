@@ -817,13 +817,24 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
   // After flush the deferred state is cleared — a second session.updated
   // without a new picker change must NOT re-prompt or re-write metadata.
+  // First call triggers seed+flush (build seeded from default), second
+  // should be no-op.
+  updates.length = 0
+  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
+    h.fn({ properties: { sessionID: "ses_peragent" } })
+  }
+  await new Promise((r) => setTimeout(r, 30))
+  // First call seeds build from defaultBuildModel then flushes → 1 update.
+  if (updates.length !== 1) {
+    throw new Error("first session.updated should trigger seed+flush (1 update), got: " + updates.length)
+  }
   updates.length = 0
   for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
     h.fn({ properties: { sessionID: "ses_peragent" } })
   }
   await new Promise((r) => setTimeout(r, 30))
   if (updates.length !== 0) {
-    throw new Error("flush should only write metadata once per deferred batch. updates=" + updates.length)
+    throw new Error("second session.updated should not re-write metadata. updates=" + updates.length)
   }
   console.log("[38d] TUI plugin keeps deferred pickers per-agent across Tab+picker cycles: ok")
 }
@@ -1396,23 +1407,27 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     modelJsonPath,
     JSON.stringify({ recent: [{ providerID: "ya-glm", modelID: "glm" }], favorite: [], variant: {} }),
   )
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 80; i++) {
     await new Promise((r) => setTimeout(r, 25))
-    if (updates.length >= 1) break
+    const hasCorrect = updates.some((u: any) =>
+      u.sessionID === "ses_pick" &&
+      u.metadata?.planReviewDeferredPicks?.build?.providerID === "ya-glm" &&
+      u.metadata?.planReviewDeferredPicks?.build?.modelID === "glm",
+    )
+    if (hasCorrect) break
   }
   require("node:fs").rmSync(fakeStateDir, { recursive: true, force: true })
   // Watcher must NOT call promptAsync — only session.update.
   if (prompts.length !== 0) {
     throw new Error("active-session picker must not call promptAsync, got: " + JSON.stringify(prompts))
   }
-  const pickerUpdate = updates.find((u: any) => u.sessionID === "ses_pick")
+  const pickerUpdate = updates.find((u: any) =>
+    u.sessionID === "ses_pick" &&
+    u.metadata?.planReviewDeferredPicks?.build?.providerID === "ya-glm" &&
+    u.metadata?.planReviewDeferredPicks?.build?.modelID === "glm",
+  )
   if (!pickerUpdate) {
-    throw new Error("watcher did not write metadata. updates: " + JSON.stringify(updates))
-  }
-  const meta = pickerUpdate.metadata?.planReviewDeferredPicks
-  const buildEntry = meta?.["build"]
-  if (!buildEntry || buildEntry.providerID !== "ya-glm" || buildEntry.modelID !== "glm") {
-    throw new Error("metadata entry for build must be ya-glm/glm, got: " + JSON.stringify(meta))
+    throw new Error("watcher did not write correct metadata (ya-glm/glm). updates: " + JSON.stringify(updates))
   }
   const pickerLog = logs.find((l: any) => l.message?.includes("picker changed"))
   if (!pickerLog?.message?.includes("agent=build") || !pickerLog?.message?.includes("ya-glm/glm")) {

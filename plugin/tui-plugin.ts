@@ -101,9 +101,44 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // the agent that was active when the pick was made.
   const lastPickedModels = new Map<string, { providerID: string; modelID: string }>()
 
+  // Seed the build model's pick from model.json recent[0] at startup.
+  // The common opencode flow: user opens opencode on agent=build,
+  // sees the current model, doesn't change it (because it's fine),
+  // tabs to plan and picks a model there. Without this seed, the
+  // build entry never exists in lastPickedModels (the watcher only
+  // fires on picker changes), so exitPlanMode has no build pick to
+  // promote and falls through to chat.message (plan) — build ends
+  // up running on the plan's model.
+  //
+  // model.json recent[0] is the most-recent picker choice globally.
+  // If the user ever picked a model (whether for build or plan), it
+  // is in recent[0]. If the user never changed anything, recent[0]
+  // is whatever the TUI initialized with — still the "current
+  // model" the user sees and is happy with. Either way, using it
+  // as the default build pick matches the user's intent.
+  let defaultBuildModel: { providerID: string; modelID: string } | undefined
+  let defaultBuildUsed = false
+  try {
+    const stateDir = api.state?.path?.state
+    if (stateDir && typeof stateDir === "string") {
+      const fs = await import("node:fs")
+      const modelJsonPath = `${stateDir}/model.json`
+      const raw = fs.readFileSync(modelJsonPath, "utf8")
+      const parsed = JSON.parse(raw) as {
+        recent?: Array<{ providerID?: string; modelID?: string }>
+      }
+      const first = Array.isArray(parsed.recent) ? parsed.recent[0] : undefined
+      if (first && typeof first.providerID === "string" && typeof first.modelID === "string") {
+        defaultBuildModel = { providerID: first.providerID, modelID: first.modelID }
+      }
+    }
+  } catch {
+    // model.json may not exist on a fresh install — fine.
+  }
+
   logInfo(
     api,
-    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG}`,
+    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG} defaultBuildModel=${defaultBuildModel ? `${defaultBuildModel.providerID}/${defaultBuildModel.modelID}` : "<none>"}`,
   )
 
   const computeNext = (current: string | undefined, direction: 1 | -1): string | undefined => {
@@ -169,21 +204,39 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       // can attribute without waiting for the user to type.
       prevAgent = primaryAgents[0]
     }
-    if (lastPickedModels.size > 0) {
-      // First chance to push the deferred picks through to the server:
-      // sessionID is now real. Each pick was keyed by the agent that
-      // was active when the user made it (built-up state across
-      // Tab + Ctrl-X M cycles on the home screen). Server plugin's
-      // chat.message hook reads session.metadata on the user's first
-      // real message and merges deferredPicks into chatMessageMemory.
-      // No prompt() calls needed — synthetic "." messages would show
-      // up in the TUI as actual user messages and trigger vim edit.
-      const entries = Array.from(lastPickedModels.entries())
-      lastPickedModels.clear()
-      logInfo(
-        api,
-        `plan-review-TUI: flush deferred pickers count=${entries.length} sessionID=${sid}`,
-      )
+    // Seed build entry from defaultBuildModel if user never made an
+    // explicit build pick. model.json recent[0] at startup captures
+    // whatever model is visible on the home screen — if the user is
+    // happy with the default and never opened the picker, we still
+    // have a build pick for exitPlanMode to promote.
+    //
+      // One-shot: defaultBuildModel is cleared after the first seed so
+      // a second session.updated (e.g. message.updated races) does
+      // not re-flush the same model. The seed is for the session's
+      // initial state, captured once.
+      if (defaultBuildModel && !lastPickedModels.has("build") && !defaultBuildUsed) {
+        lastPickedModels.set("build", defaultBuildModel)
+        defaultBuildUsed = true
+        logInfo(
+          api,
+          `plan-review-TUI: build seeded from defaultBuildModel=${defaultBuildModel.providerID}/${defaultBuildModel.modelID}`,
+        )
+      }
+      if (lastPickedModels.size > 0) {
+        // First chance to push the deferred picks through to the server:
+        // sessionID is now real. Each pick was keyed by the agent that
+        // was active when the user made it (built-up state across
+        // Tab + Ctrl-X M cycles on the home screen). Server plugin's
+        // chat.message hook reads session.metadata on the user's first
+        // real message and merges deferredPicks into chatMessageMemory.
+        // No prompt() calls needed — synthetic "." messages would show
+        // up in the TUI as actual user messages and trigger vim edit.
+        const entries = Array.from(lastPickedModels.entries())
+        lastPickedModels.clear()
+        logInfo(
+          api,
+          `plan-review-TUI: flush deferred pickers count=${entries.length} sessionID=${sid}`,
+        )
       const picksRecord: Record<string, { providerID: string; modelID: string }> = {}
       for (const [agentName, model] of entries) {
         picksRecord[agentName] = model

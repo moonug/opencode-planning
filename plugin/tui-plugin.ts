@@ -9,8 +9,8 @@ import type { Event } from "@opencode-ai/sdk/v2"
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.1.5"
-const BUILD_TAG = "v2-sdk-shape-v1"
+const VERSION = "0.1.6"
+const BUILD_TAG = "metadata-only-flush-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
@@ -152,47 +152,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   }
 
-  // forwardSync() = blocking variant that uses the streaming
-  // `session.prompt()` SDK method. The server-side handler awaits
-  // `createUserMessage` (which fires the `chat.message` plugin
-  // hook) before returning 200 — see
-  // packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
-  // the `prompt` function forks nothing and waits on
-  // Effect.gen. With noReply:true the prompt returns the
-  // message immediately after createUserMessage completes, so
-  // by the time the await resolves, chatMessageMemory on the
-  // server already contains the (sessionID, agent) entry.
-  //
-  // Use ONLY for the deferred-picker flush in refresh(). Interactive
-  // paths (Tab, mid-session picker) keep promptAsync via
-  // forward() because they don't need acknowledgement.
-  //
-  // Parameter shape: v2 SDK takes `{sessionID, agent, model,
-  // noReply, parts}` directly (not `{path: {id}, body: {...}}`).
-  const forwardSync = async (
-    to: string,
-    model: { providerID: string; modelID: string },
-    sid: string,
-  ): Promise<void> => {
-    try {
-      await api.client.session.prompt({
-        sessionID: sid,
-        agent: to,
-        model,
-        noReply: true,
-        parts: [{ type: "text", text: "." }],
-      })
-    } catch (e) {
-      void api.client.app
-        .log({
-          service: "plan-review-tui",
-          level: "warn",
-          message: `plan-review-TUI: forwardSync to=${to} failed: ${(e as Error)?.message ?? String(e)}`,
-        })
-        .catch(() => {})
-    }
-  }
-
   // writeDeferredToMetadata stores the pending picks directly on the
   // session row via session.update({metadata:{planReviewDeferredPicks}}).
   // The server-plugin's `chat.message` hook reads this metadata on
@@ -253,33 +212,11 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       // First chance to push the deferred picks through to the server:
       // sessionID is now real. Each pick was keyed by the agent that
       // was active when the user made it (built-up state across
-      // Tab + Ctrl-X M cycles on the home screen). We intentionally
-      // forward EACH (agent, model) pair separately so the server
-      // sees input.agent=build+model=X and input.agent=plan+model=Y
-      // in distinct chat.message events — chatMessageMemory is per
-      // (sessionID, agent) so all four (plan+model, build+model)
-      // combinations land in the right slots.
-      //
-      // CRITICAL: flush uses forwardSync() (blocking session.prompt())
-      // instead of the fire-and-forget forward() (promptAsync). The
-      // server's promptAsync handler forks the prompt and returns
-      // 204 before createUserMessage runs — so chatMessageMemory
-      // could be empty when exitPlanMode reads it a few hundred ms
-      // later. forwardSync() awaits the server's response and the
-      // streaming prompt handler awaits createUserMessage before
-      // returning 200, so the await resolving guarantees the hook
-      // has fired and the (sessionID, agent) entry is in memory.
-      //
-      // refresh() returns void — the TuiEventBus handler signature
-      // doesn't accept a Promise — so we attach the flush to the
-      // event-loop via queueMicrotask. The user's Tab/typing work
-      // is gated on the flush's promptAsync resolving before any
-      // subsequent session.updated handler runs, in practice, because
-      // both happen inside the same Effect.task pool. If the user
-      // approves the plan before the flush's prompts complete, the
-      // chatMessageMemory entry may still lag — at that point we
-      // wait on the server's createUserMessage synchronously (the
-      // flush's prompt() SDK call blocks until 200).
+      // Tab + Ctrl-X M cycles on the home screen). Server plugin's
+      // chat.message hook reads session.metadata on the user's first
+      // real message and merges deferredPicks into chatMessageMemory.
+      // No prompt() calls needed — synthetic "." messages would show
+      // up in the TUI as actual user messages and trigger vim edit.
       const entries = Array.from(lastPickedModels.entries())
       lastPickedModels.clear()
       logInfo(
@@ -294,24 +231,18 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           `plan-review-TUI: flush deferred picker agent=${agentName} model=${model.providerID}/${model.modelID} sessionID=${sid}`,
         )
       }
-      // Two complementary channels — prompt() for chat.message and
-      // session.update for metadata. The metadata write is the
-      // authoritative source because it cannot race with the server
-      // handler — once the 200 response arrives the server row is
-      // committed. The chat.message path populates
-      // chatMessageMemory normally for the next plan_review call.
-      // If writeDeferredToMetadata fails the picks are still
-      // delivered via prompt(); if prompt() fails the metadata
-      // write survives and the server's chat.message hook reads
-      // metadata and promotes deferredPicks into chatMessageMemory.
+      // Single channel: session.update(metadata) only. No prompt()
+      // calls — those would create visible "." user messages in the
+      // session and trigger vim's edit-mode popup. The server
+      // plugin's chat.message hook reads this metadata on the user's
+      // first real message and merges deferredPicks into
+      // chatMessageMemory. Race-free because session.update is a
+      // synchronous server write (no fork, no createUserMessage).
       void (async () => {
         await writeDeferredToMetadata(
           sid,
           Object.fromEntries(entries.map(([a, m]) => [a, m])),
         )
-        for (const [agentName, model] of entries) {
-          await forwardSync(agentName, model, sid)
-        }
       })()
     }
   }

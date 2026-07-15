@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.5")) {
-    throw new Error("TUI init log missing v0.1.5 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.6")) {
+    throw new Error("TUI init log missing v0.1.6 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=v2-sdk-shape-v1")) {
+  if (!loaded?.message?.includes("build=metadata-only-flush-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.5 build=v2-sdk-shape-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.6 build=metadata-only-flush-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -771,12 +771,14 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("expect flush deferred pickers count=2. logs:\n" +
       logs.map((l: any) => l.message).join("\n"))
   }
-  // Both channels must fire: session.update(metadata) AND prompt(prompt)
+  // Only the metadata channel fires — no prompt() calls, those would
+  // create visible "." user messages in the TUI and trigger the
+  // vim edit-mode popup.
   if (updates.length !== 1) {
     throw new Error("expected 1 session.update call (metadata write), got: " + updates.length + "\n" + JSON.stringify(updates))
   }
-  if (prompts.length !== 2) {
-    throw new Error("expected 2 session.prompt calls (chat.message flush), got: " + prompts.length + "\n" + JSON.stringify(prompts))
+  if (prompts.length !== 0) {
+    throw new Error("expected 0 session.prompt calls (metadata-only flush), got: " + prompts.length + "\n" + JSON.stringify(prompts))
   }
   // session.update must carry both deferred picks keyed by agent.
   // v2 SDK shape: top-level fields on the parameter object.
@@ -788,66 +790,40 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (metaValues.length !== 2) {
     throw new Error("metadata.planReviewDeferredPicks must have 2 entries (build+plan), got: " + JSON.stringify(metaValues))
   }
-  const metaHasMimo = metaValues.some(([_, m]: any) => (m as any).modelID === "mimo-v2.5")
-  const metaHasDs = metaValues.some(([_, m]: any) => (m as any).modelID === "deepseek-v4-flash")
-  if (!metaHasMimo || !metaHasDs) {
+  // The two (agent, model) pairs must be keyed correctly — the
+  // first pick (mimo-v2.5) goes to whichever agent had it
+  // snapshotted at picker time, and same for deepseek-v4-flash.
+  // Per-agent keying is verified by reading the watcher logs that
+  // we snapshotted into `deferredLogs` before clearing logs[].
+  const mimoMetaEntry = metaValues.find(([_, m]: any) => (m as any).modelID === "mimo-v2.5")
+  const dsMetaEntry = metaValues.find(([_, m]: any) => (m as any).modelID === "deepseek-v4-flash")
+  if (!mimoMetaEntry || !dsMetaEntry) {
     throw new Error("metadata must carry BOTH mimo-v2.5 and deepseek-v4-flash, got: " + JSON.stringify(metaValues))
   }
-  // Each prompt must carry its own (agent, model) — per-agent keying
-  // works correctly when the prompt for agent="plan" carries mimo
-  // and the prompt for agent="build" carries deepseek, OR vice versa.
-  // v2 SDK shape: top-level fields on the parameter object.
-  const mimoPrompt = prompts.find((p: any) => (p as any).model?.modelID === "mimo-v2.5")
-  const dsPrompt = prompts.find((p: any) => (p as any).model?.modelID === "deepseek-v4-flash")
-  if (!mimoPrompt || !dsPrompt) {
-    throw new Error("expected both mimo-v2.5 and deepseek-v4-flash prompts, got: " + JSON.stringify(prompts))
-  }
-  const mimoAgent = (mimoPrompt as any).agent
-  const dsAgent = (dsPrompt as any).agent
-  if (!["build", "plan"].includes(mimoAgent) || !["build", "plan"].includes(dsAgent)) {
-    throw new Error("agent in flush must be one of build/plan, got: mimo=" + mimoAgent + " ds=" + dsAgent)
-  }
-  if (mimoAgent === dsAgent) {
-    throw new Error("flushed prompts must have DIFFERENT agents — per-agent keying still broken")
-  }
-  for (const p of prompts) {
-    const pp = p as any
-    if (pp.noReply !== true) throw new Error("flushed prompt must use noReply:true, got: " + JSON.stringify(p))
-    if (pp.sessionID !== "ses_peragent") {
-      throw new Error("flushed prompt sessionID should be ses_peragent, got: " + pp.sessionID)
-    }
-  }
-  // First pick → firstAgent, second pick → secondAgent. They must
-  // survive intact through the flush.
-  if (mimoAgent !== firstAgent && mimoAgent !== secondAgent) {
-    throw new Error("mimo prompt agent " + mimoAgent + " doesn't match either deferred pick")
-  }
-  // Find which agent picked which model in the watcher logs — we
-  // snapshotted them into `deferredLogs` before clearing.
   const mimoAgentInLog = (deferredLogs.find((l: any) =>
     l.message?.includes("picker deferred") && l.message?.includes("mimo-v2.5"),
   )?.message.match(/agent=(\S+)/) ?? [])[1]
-  if ((mimoPrompt as any).agent !== mimoAgentInLog) {
-    throw new Error("mimo prompt agent " + (mimoPrompt as any).agent +
-      " does not match defer log agent " + mimoAgentInLog + " — per-agent keying lost attribution")
-  }
   const dsAgentInLog = (deferredLogs.find((l: any) =>
     l.message?.includes("picker deferred") && l.message?.includes("deepseek-v4-flash"),
   )?.message.match(/agent=(\S+)/) ?? [])[1]
-  if ((dsPrompt as any).agent !== dsAgentInLog) {
-    throw new Error("ds prompt agent " + (dsPrompt as any).agent +
-      " does not match flush log agent " + dsAgentInLog)
+  if (mimoMetaEntry[0] !== mimoAgentInLog) {
+    throw new Error("mimo metadata agent=" + mimoMetaEntry[0] +
+      " does not match defer log agent=" + mimoAgentInLog +
+      " — per-agent keying lost attribution")
+  }
+  if (dsMetaEntry[0] !== dsAgentInLog) {
+    throw new Error("ds metadata agent=" + dsMetaEntry[0] +
+      " does not match defer log agent=" + dsAgentInLog)
   }
   // After flush the deferred state is cleared — a second session.updated
   // without a new picker change must NOT re-prompt or re-write metadata.
-  prompts.length = 0
   updates.length = 0
   for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
     h.fn({ properties: { sessionID: "ses_peragent" } })
   }
   await new Promise((r) => setTimeout(r, 30))
-  if (prompts.length !== 0 || updates.length !== 0) {
-    throw new Error("flush should only fire once per deferred batch. prompts=" + prompts.length + " updates=" + updates.length)
+  if (updates.length !== 0) {
+    throw new Error("flush should only write metadata once per deferred batch. updates=" + updates.length)
   }
   console.log("[38d] TUI plugin keeps deferred pickers per-agent across Tab+picker cycles: ok")
 }
@@ -1723,11 +1699,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.5")) {
-    throw new Error("init log must include v0.1.5 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.6")) {
+    throw new Error("init log must include v0.1.6 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=v2-sdk-shape-v1")) {
-    throw new Error("init log must include build=v2-sdk-shape-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=metadata-only-flush-v1")) {
+    throw new Error("init log must include build=metadata-only-flush-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

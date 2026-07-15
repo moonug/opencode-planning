@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.1")) {
-    throw new Error("TUI init log missing v0.1.1 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.2")) {
+    throw new Error("TUI init log missing v0.1.2 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=picker-watch-v1")) {
+  if (!loaded?.message?.includes("build=picker-defer-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.1 build=picker-watch-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.2 build=picker-defer-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -607,6 +607,120 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("prevAgent must be a primary agent name, got: " + match[1])
   }
   console.log(`[38c] TUI plugin defaults prevAgent to first primary agent (${match[1]}) when no session: ok`)
+}
+
+// 38d. TUI plugin: when the watcher fires on the home route (no
+//      active session), the picker choice is stashed as deferred.
+//      When session.updated fires later with a real sessionID, the
+//      plugin forwards the deferred pick as a single promptAsync so
+//      the server's chat.message hook can attribute it to the active
+//      agent. This handles the common opencode-planning flow where
+//      the user picks a model on the home screen, switches the agent
+//      tab, then types — without ever sending the picker through a
+//      session-scoped prompt before the session exists.
+{
+  const mod = await import("../plugin/tui-plugin.ts" as any)
+  const tuiPluginFn = (mod.default as any).tui
+  const prompts: any[] = []
+  const logs: any[] = []
+  const eventHandlers: Array<{ type: string; fn: any }> = []
+  const fakeApi: any = {
+    client: {
+      session: {
+        promptAsync: async (opts: any) => { prompts.push(opts); return { data: null } },
+      },
+      app: {
+        agents: async () => ({ data: [
+          { name: "plan", mode: "primary", hidden: false },
+          { name: "build", mode: "primary", hidden: false },
+        ] }),
+        log: async (opts: any) => { logs.push(opts); return {} },
+      },
+    },
+    state: {
+      session: { messages: () => [] },
+      path: { state: `/tmp/pr-deferred-${Date.now()}`, config: "/tmp", worktree: "/tmp", directory: "/tmp" },
+    },
+    route: { current: { name: "home" } }, // home at init
+    keymap: { intercept: (_t: string, _h: any) => () => {} },
+    lifecycle: { signal: new AbortController().signal, onDispose: (_fn: any) => () => {} },
+    event: {
+      on: (type: string, fn: any) => { eventHandlers.push({ type, fn }); return () => {} },
+    },
+  }
+  // fs.watch requires the file to exist before subscribing — seed
+  // an initial model.json BEFORE invoking tui() so the plugin's
+  // init watcher read picks up "starting" and registers fs.watch
+  // successfully.
+  const fs = await import("node:fs")
+  const stateDir = fakeApi.state.path.state
+  fs.mkdirSync(stateDir, { recursive: true })
+  const modelJsonPath = `${stateDir}/model.json`
+  fs.writeFileSync(modelJsonPath, JSON.stringify({
+    recent: [{ providerID: "starting", modelID: "model" }],
+    favorite: [], variant: {},
+  }))
+  await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
+  await new Promise((r) => setTimeout(r, 30))
+  // Now write the "real" picker change — watcher should fire.
+  fs.writeFileSync(modelJsonPath, JSON.stringify({
+    recent: [{ providerID: "ya-glm", modelID: "glm" }],
+    favorite: [], variant: {},
+  }))
+  // give watcher a tick
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 25))
+    if (logs.find((l: any) => l.message?.includes("picker deferred"))) break
+  }
+  fs.rmSync(stateDir, { recursive: true, force: true })
+  const deferred = logs.find((l: any) => l.message?.includes("picker deferred model=ya-glm/glm"))
+  if (!deferred) {
+    throw new Error("watcher should defer picker on home route.\nplugin logs:\n" +
+      logs.map((l: any) => l.message).join("\n") + "\nprompts:\n" + JSON.stringify(prompts))
+  }
+  // No promptAsync should have fired yet — we haven't created a session.
+  if (prompts.length !== 0) {
+    throw new Error("no promptAsync expected before session, got: " + prompts.length)
+  }
+
+  // Now simulate session.updated firing (user typed first message,
+  // session created). The real TUI route changes from home to session
+  // at the same moment — mirror it on the fakeApi so refresh() picks
+  // up the sessionID.
+  fakeApi.route = { current: { name: "session", params: { sessionID: "ses_deferred" } } }
+  fakeApi.state.session.messages = () => [{ role: "user", agent: "plan" }]
+  prompts.length = 0
+  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
+    h.fn({ properties: { sessionID: "ses_deferred" } })
+  }
+  // let any async forward complete
+  await new Promise((r) => setTimeout(r, 50))
+
+  const flush = logs.find((l: any) => l.message?.includes("flush deferred picker"))
+  if (!flush) {
+    throw new Error("deferred pick did not flush on session.updated. logs: " + logs.map((l:any)=>l.message).join("\n"))
+  }
+  const flushed = prompts.find((p: any) => p.body?.model?.providerID === "ya-glm")
+  if (!flushed) {
+    throw new Error("flush did not produce a promptAsync with the deferred model. prompts: " + JSON.stringify(prompts))
+  }
+  if (flushed.body?.noReply !== true) {
+    throw new Error("flushed promptAsync must use noReply:true")
+  }
+  if (flushed.path?.id !== "ses_deferred") {
+    throw new Error("flushed promptAsync path.id should be ses_deferred, got: " + flushed.path?.id)
+  }
+  // After flush the deferred state is cleared — a second session.updated
+  // without a new picker change should NOT re-prompt.
+  prompts.length = 0
+  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
+    h.fn({ properties: { sessionID: "ses_deferred" } })
+  }
+  await new Promise((r) => setTimeout(r, 30))
+  if (prompts.find((p: any) => p.body?.model?.providerID === "ya-glm")) {
+    throw new Error("flush should only fire once per deferred pick")
+  }
+  console.log("[38d] TUI plugin defers picker on home and flushes on first session.updated: ok")
 }
 
 // 39. TUI plugin: Tab calls promptAsync({agent, noReply:true}) on the
@@ -1410,11 +1524,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.1")) {
-    throw new Error("init log must include v0.1.1 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.2")) {
+    throw new Error("init log must include v0.1.2 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=picker-watch-v1")) {
-    throw new Error("init log must include build=picker-watch-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=picker-defer-v1")) {
+    throw new Error("init log must include build=picker-defer-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

@@ -9,8 +9,8 @@ import type { Event } from "@opencode-ai/sdk/v2"
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.1.1"
-const BUILD_TAG = "picker-watch-v1"
+const VERSION = "0.1.2"
+const BUILD_TAG = "picker-defer-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
@@ -88,6 +88,13 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // session and the picker changes before they type anything.
   if (!prevAgent && primaryAgents[0]) prevAgent = primaryAgents[0] as string
 
+  // Deferred picker state — when the user picks a model on the home
+  // screen there is no sessionID to forward to. We stash the choice
+  // here and flush it via promptAsync the first time refresh() sees
+  // an active session. Cleared after consumption so we only pay one
+  // extra promptAsync per pre-session picker change.
+  let lastPickedModel: { providerID: string; modelID: string } | undefined
+
   logInfo(
     api,
     `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG}`,
@@ -140,7 +147,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // the v2 Event union, which has `message.updated`, `session.updated`,
   // `session.status`, etc. — but no `chat.message` (that is a server-side
   // plugin hook name, not a TUI bus name). Subscribe to `message.updated`
-  // and re-read the latest user message on every change.
+  // and re-read the latest user message on every change. Also flushes
+  // any deferred picker pick that landed while there was no sessionID
+  // (home-screen picker selections made before the user typed anything).
   const refresh = (): void => {
     const sid = getActiveSessionID()
     if (!sid) return
@@ -153,6 +162,20 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       // back to the first primary agent so subsequent picker changes
       // can attribute without waiting for the user to type.
       prevAgent = primaryAgents[0]
+    }
+    if (lastPickedModel && prevAgent) {
+      // First chance to push the deferred pick through to the server:
+      // sessionID is now real, prevAgent is real (either from messages
+      // or the default fallback). Forward as a single noReply prompt
+      // so the server's chat.message hook can write the per-agent
+      // model into chatMessageMemory before the user actually types.
+      const m = lastPickedModel
+      lastPickedModel = undefined
+      logInfo(
+        api,
+        `plan-review-TUI: flush deferred picker agent=${prevAgent} model=${m.providerID}/${m.modelID} sessionID=${sid}`,
+      )
+      void forward(prevAgent, m)
     }
   }
 
@@ -235,7 +258,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           if (!picked) return
           const sid = getActiveSessionID()
           if (!sid) {
-            logInfo(api, `plan-review-TUI: picker skipped reason=no-session`)
+            // Home-screen picker: stash the choice and let refresh()
+            // forward it the first time session.updated fires with a
+            // real sessionID (after the user types their first message).
+            lastPickedModel = picked
+            logInfo(
+              api,
+              `plan-review-TUI: picker deferred model=${picked.providerID}/${picked.modelID} reason=no-session`,
+            )
             return
           }
           refresh()

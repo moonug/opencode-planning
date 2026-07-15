@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.3")) {
-    throw new Error("TUI init log missing v0.1.3 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.4")) {
+    throw new Error("TUI init log missing v0.1.4 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=picker-defer-per-agent-v1")) {
+  if (!loaded?.message?.includes("build=picker-defer-metadata-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.3 build=picker-defer-per-agent-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.4 build=picker-defer-metadata-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -609,23 +609,25 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log(`[38c] TUI plugin defaults prevAgent to first primary agent (${match[1]}) when no session: ok`)
 }
 
-// 38d. TUI plugin: per-agent deferred pickers. The home route has no
-//      sessionID so watcher ticks stash the choice keyed by the
-//      agent that was active when the pick was made. The user can
-//      pick a model per agent (e.g. build → mimo-v2.5, then Tab to
-//      plan → deepseek-v4-flash) before any session exists, and
-//      refresh() flushes each (agent, model) pair separately when
-//      session.updated finally fires. This is the canonical
-//      opencode-planning flow — user picks models before typing.
-//
+// 38d. TUI plugin: per-agent deferred pickers + metadata write on flush.
+//      The home route has no sessionID so watcher ticks stash the choice
+//      keyed by the agent that was active when the pick was made. The
+//      user can pick a model per agent (e.g. build → mimo-v2.5, then
+//      Tab to plan → deepseek-v4-flash) before any session exists, and
+//      refresh() flushes via two channels on session.updated:
+//        1. session.update({metadata: {planReviewDeferredPicks}})
+//           — synchronous server write that survives a race against
+//           exitPlanMode reading chatMessageMemory.
+//        2. session.prompt({noReply:true, agent, model}) — also via
+//           chat.message hook, redundant safety.
 //      Smoke covers two staggered picks before session appears, then
-//      session.updated → two promptAsync calls with the right
-//      (agent, model) on each. Verifies no promptAsync leaks until
-//      the session opens.
+//      session.updated → both channels fire with the right (agent,
+//      model) on each.
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
   const prompts: any[] = []
+  const updates: any[] = []
   const logs: any[] = []
   const eventHandlers: Array<{ type: string; fn: any }> = []
   let keymapHandler: any = null
@@ -633,6 +635,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     client: {
       session: {
         promptAsync: async (opts: any) => { prompts.push(opts); return { data: null } },
+        prompt: async (opts: any) => { prompts.push(opts); return { data: null } },
+        update: async (opts: any) => { updates.push(opts); return { data: null } },
       },
       app: {
         agents: async () => ({ data: [
@@ -737,9 +741,9 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       logs.filter((l: any) => l.message?.includes("picker deferred")).map((l: any) => l.message).join("\n"))
   }
 
-  // No promptAsync should have fired yet — no session exists.
-  if (prompts.length !== 0) {
-    throw new Error("no promptAsync expected before session.created, got: " + prompts.length)
+  // No flush should have fired yet — no session exists.
+  if (prompts.length !== 0 || updates.length !== 0) {
+    throw new Error("no flush expected before session.created. prompts=" + prompts.length + " updates=" + updates.length)
   }
 
   // Step 3: simulate session.updated. The route swaps from home to
@@ -754,11 +758,12 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   // only see flush lines).
   const deferredLogs = logs.slice()
   prompts.length = 0
+  updates.length = 0
   logs.length = 0
   for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
     h.fn({ properties: { sessionID: "ses_peragent" } })
   }
-  await new Promise((r) => setTimeout(r, 50))
+  await new Promise((r) => setTimeout(r, 80))
   fs.rmSync(stateDir, { recursive: true, force: true })
 
   const flushHeader = logs.find((l: any) => l.message?.includes("flush deferred pickers count=2"))
@@ -766,10 +771,28 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("expect flush deferred pickers count=2. logs:\n" +
       logs.map((l: any) => l.message).join("\n"))
   }
-  if (prompts.length !== 2) {
-    throw new Error("expected 2 promptAsync after flush, got: " + prompts.length + "\n" + JSON.stringify(prompts))
+  // Both channels must fire: session.update(metadata) AND prompt(prompt)
+  if (updates.length !== 1) {
+    throw new Error("expected 1 session.update call (metadata write), got: " + updates.length + "\n" + JSON.stringify(updates))
   }
-  // Each promptAsync must carry its own (agent, model) — per-agent keying
+  if (prompts.length !== 2) {
+    throw new Error("expected 2 session.prompt calls (chat.message flush), got: " + prompts.length + "\n" + JSON.stringify(prompts))
+  }
+  // session.update must carry both deferred picks keyed by agent.
+  const meta = updates[0].body?.metadata?.planReviewDeferredPicks
+  if (!meta || typeof meta !== "object") {
+    throw new Error("session.update missing metadata.planReviewDeferredPicks, got: " + JSON.stringify(updates[0]))
+  }
+  const metaValues = Object.entries(meta).filter(([k]) => !k.startsWith("_"))
+  if (metaValues.length !== 2) {
+    throw new Error("metadata.planReviewDeferredPicks must have 2 entries (build+plan), got: " + JSON.stringify(metaValues))
+  }
+  const metaHasMimo = metaValues.some(([_, m]: any) => m.modelID === "mimo-v2.5")
+  const metaHasDs = metaValues.some(([_, m]: any) => m.modelID === "deepseek-v4-flash")
+  if (!metaHasMimo || !metaHasDs) {
+    throw new Error("metadata must carry BOTH mimo-v2.5 and deepseek-v4-flash, got: " + JSON.stringify(metaValues))
+  }
+  // Each prompt must carry its own (agent, model) — per-agent keying
   // works correctly when the prompt for agent="plan" carries mimo
   // and the prompt for agent="build" carries deepseek, OR vice versa.
   const mimoPrompt = prompts.find((p: any) => p.body?.model?.modelID === "mimo-v2.5")
@@ -810,9 +833,90 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   )?.message.match(/agent=(\S+)/) ?? [])[1]
   if (dsPrompt.body.agent !== dsAgentInLog) {
     throw new Error("ds prompt agent " + dsPrompt.body.agent +
-      " does not match defer log agent " + dsAgentInLog)
+      " does not match flush log agent " + dsAgentInLog)
+  }
+  // After flush the deferred state is cleared — a second session.updated
+  // without a new picker change must NOT re-prompt or re-write metadata.
+  prompts.length = 0
+  updates.length = 0
+  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
+    h.fn({ properties: { sessionID: "ses_peragent" } })
+  }
+  await new Promise((r) => setTimeout(r, 30))
+  if (prompts.length !== 0 || updates.length !== 0) {
+    throw new Error("flush should only fire once per deferred batch. prompts=" + prompts.length + " updates=" + updates.length)
   }
   console.log("[38d] TUI plugin keeps deferred pickers per-agent across Tab+picker cycles: ok")
+}
+
+// 38e. server-plugin chat.message hook promotes
+//      metadata.planReviewDeferredPicks into chatMessageMemory.
+//      TUI plugin writes the picks to session.metadata via
+//      session.update before the user types. The user's first
+//      chat.message (which fires when the real prompt runs) is the
+//      hook we hook into — we read session.metadata, merge any
+//      entries that don't already have a chatMessageMemory value,
+//      and (implicitly, by set() ) make them available to
+//      exitPlanMode's priority chain.
+//
+//      Smoke covers the happy path: a session has metadata with
+//      {build: mimo, plan: deepseek} but NO chatMessageMemory entry.
+//      chat.message hook fires with agent=plan model=unknown.
+//      After the hook, chatMessageMemory[sessionID] must have
+//      BOTH entries (build and plan).
+{
+  const logs: any[] = []
+  const prompts: any[] = []
+  let sessionGetCalls = 0
+  let sessionMetadata: any = {
+    planReviewDeferredPicks: {
+      build: { providerID: "ya-glm", modelID: "glm" },
+      plan: { providerID: "opencode-go", modelID: "deepseek-v4-flash" },
+      _writtenAt: "2026-07-15T09:00:00.000Z",
+    },
+  }
+  const fakeClient = {
+    app: { log: async (opts: any) => { logs.push(opts) } } as any,
+    session: {
+      prompt: async (opts: any) => { prompts.push(opts); return {} },
+      get: async (opts: any) => {
+        sessionGetCalls++
+        return { data: { id: opts?.path?.id ?? "ses_meta", metadata: sessionMetadata } }
+      },
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+  await testHooks["chat.message"](
+    {
+      sessionID: "ses_meta",
+      // Pick an agent that ISN'T in metadata.planReviewDeferredPicks
+      // so both build+plan get promoted (otherwise hook's own write
+      // would mark perSession.has("agent")=true and skip promotion
+      // for that agent). Real chat.message firing here means the
+      // hook also writes chatMessageMemory[ses_meta]["nonexistent"],
+      // which is fine — promotes covers build and plan.
+      agent: "general",
+      model: { providerID: "opencode-go", modelID: "mimo-v2.5-pro" },
+    } as any,
+    {} as any,
+  )
+  await new Promise((r) => setTimeout(r, 30))
+  if (sessionGetCalls !== 1) {
+    throw new Error("chat.message hook must read session metadata once, got calls: " + sessionGetCalls)
+  }
+  const promoted = logs.find((l: any) => l.body?.message?.includes("promoted deferredPicks"))
+  if (!promoted) throw new Error("server-plugin should log promoted deferredPicks, logs:\n" + logs.map((l:any)=>l.body?.message).join("\n"))
+  if (!promoted.body.message.includes("count=2")) {
+    throw new Error("expected count=2 in promote log, got: " + promoted.body.message)
+  }
+  console.log("[38e] chat.message hook promotes deferredPicks from session.metadata: ok")
 }
 
 // 39. TUI plugin: Tab calls promptAsync({agent, noReply:true}) on the
@@ -1616,11 +1720,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.3")) {
-    throw new Error("init log must include v0.1.3 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.4")) {
+    throw new Error("init log must include v0.1.4 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=picker-defer-per-agent-v1")) {
-    throw new Error("init log must include build=picker-defer-per-agent-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=picker-defer-metadata-v1")) {
+    throw new Error("init log must include build=picker-defer-metadata-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

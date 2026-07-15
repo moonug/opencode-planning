@@ -369,7 +369,7 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
-  await log(client, "info", "plan-review: plugin init v0.1.3 build=picker-defer-per-agent-v1").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
+  await log(client, "info", "plan-review: plugin init v0.1.4 build=picker-defer-metadata-v1").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
   await log(client, "info", `plan-review: argv0=${(process.argv[1] ?? "unknown").split("/").slice(-3).join("/")}`).catch((e: unknown) => { console.error(`plan-review: log(argv0) failed: ${(e as Error)?.message ?? String(e)}`) })
 
   if (!existsSync(SCRIPT_PATH)) {
@@ -477,6 +477,60 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
           "info",
           `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
         ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L502): ${(e as Error)?.message ?? String(e)}`) })
+      }
+
+      // Promote deferred picker picks stored by the TUI plugin into
+      // chatMessageMemory. TUI plugin writes
+      // `metadata.planReviewDeferredPicks[agent] = {providerID, modelID}`
+      // via session.update BEFORE creating a session (when the user
+      // picks models on the home screen). The user's first real
+      // prompt then fires this chat.message hook — we read the
+      // session metadata, merge any entries that haven't been
+      // populated yet by a direct chat.message (the TUI plugin
+      // may also have flushed these via prompt()), and clear the
+      // metadata so the same picks aren't re-promoted on the next
+      // message.
+      //
+      // Idempotent: entries already in chatMessageMemory (from the
+      // TUI plugin's prompt() flush) keep their value because
+      // per-sessionMap.set is conditional on whether the existing
+      // entry is in our deferred set only when the picked model
+      // hasn't been seen by a real chat.message yet — actually we
+      // simply prefer the more recent (live) chat.message value
+      // over a stale metadata leftover, so we DON'T overwrite if
+      // the agent already has a real entry.
+      if (input.sessionID) {
+        try {
+          const sessionRes = await client.session.get({ path: { id: input.sessionID } })
+          const data = (sessionRes as any)?.data ?? sessionRes
+          const metadata = data?.metadata
+          const deferred = metadata?.planReviewDeferredPicks
+          if (deferred && typeof deferred === "object" && !deferred._cleared) {
+            const perSession = chatMessageMemory.get(input.sessionID) ?? new Map<string, ModelRef>()
+            let promoted = 0
+            for (const [agentName, m] of Object.entries(deferred)) {
+              if (!m || typeof m !== "object") continue
+              if (agentName.startsWith("_")) continue
+              const providerID = (m as any).providerID
+              const modelID = (m as any).modelID
+              if (typeof providerID !== "string" || typeof modelID !== "string") continue
+              if (!perSession.has(agentName)) {
+                perSession.set(agentName, { providerID, modelID })
+                promoted++
+              }
+            }
+            if (!chatMessageMemory.has(input.sessionID)) {
+              chatMessageMemory.set(input.sessionID, perSession)
+            }
+            if (promoted > 0) {
+              await log(
+                client,
+                "info",
+                `plan-review: chat.message promoted deferredPicks: count=${promoted} session=${input.sessionID}`,
+              ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L539): ${(e as Error)?.message ?? String(e)}`) })
+            }
+          }
+        } catch {}
       }
     },
 

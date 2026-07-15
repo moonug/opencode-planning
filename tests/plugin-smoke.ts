@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.7")) {
-    throw new Error("TUI init log missing v0.1.7 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.8")) {
+    throw new Error("TUI init log missing v0.1.8 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=exitplan-mode-promotion-v1")) {
+  if (!loaded?.message?.includes("build=local-only-picker-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.7 build=exitplan-mode-promotion-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.8 build=local-only-picker-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -1025,27 +1025,54 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   if (!handlerFn) throw new Error("intercept handler not registered")
-  // 1st Tab: build -> plan
+  // 1st Tab: build -> plan. Real TUI host fires message.updated
+  // when the user submits a prompt under the new agent — we
+  // simulate that by manually dispatching the event handler, since
+  // there is no promptAsync call anymore to drive it.
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 50))
-  // 2nd Shift+Tab: plan -> build (after simulated message.updated)
+  for (const h of eventHandlers) {
+    if (h.type === "message.updated") {
+      h.fn({ properties: { info: { role: "user", agent: "plan" } } } as any)
+    }
+  }
+  currentAgent = "plan"
+  currentMessages = [{ role: "user", agent: "plan" }, { role: "assistant", agent: "plan" }]
+  await new Promise(r => setTimeout(r, 30))
+  // 2nd Shift+Tab: plan -> build
   handlerFn({ event: { name: "shift+tab" } })
   await new Promise(r => setTimeout(r, 50))
-  if (prompts.length !== 2) throw new Error("expected 2 promptAsync calls, got: " + prompts.length)
-  if ((prompts[0] as any).agent !== "plan") throw new Error("first Tab should target plan, got: " + (prompts[0] as any).agent)
-  if ((prompts[0] as any).noReply !== true) throw new Error("first Tab prompt must have noReply=true")
-  if (!Array.isArray((prompts[0] as any).parts) || (prompts[0] as any).parts.length === 0) {
-    throw new Error("first Tab prompt needs at least one part, got: " + JSON.stringify(prompts[0]))
+  for (const h of eventHandlers) {
+    if (h.type === "message.updated") {
+      h.fn({ properties: { info: { role: "user", agent: "build" } } } as any)
+    }
   }
-  if ((prompts[0] as any).sessionID !== "ses_route") {
-    throw new Error("first Tab prompt must use route.params.sessionID, got: " + JSON.stringify(prompts[0]))
+  currentAgent = "build"
+  currentMessages = [{ role: "user", agent: "build" }, { role: "assistant", agent: "build" }]
+  await new Promise(r => setTimeout(r, 30))
+  // Tab cycling is now local-only — no forward() calls fire anymore,
+  // because promptAsync would create a synthetic "." user message
+  // that the TUI shows as part of the session history. The agent
+  // change is conveyed to the server via chat.message hook on the
+  // user's next real prompt (which carries input.agent) and via
+  // exitPlanMode's metadata read.
+  if (prompts.length !== 0) {
+    throw new Error("Tab cycling must not call promptAsync (creates \".\" messages), got: " + prompts.length)
   }
-  if ((prompts[1] as any).agent !== "build") throw new Error("second Shift+Tab should target build, got: " + (prompts[1] as any).agent)
   const loaded = logs.find((l: any) => l.message?.includes("plan-review-TUI: plugin loaded"))
   if (!loaded) throw new Error("missing 'plugin loaded' log")
   const interceptLogs = logs.filter((l: any) => l.message?.includes("plan-review-TUI: intercept"))
   if (interceptLogs.length < 2) throw new Error("expected 2 intercept logs, got: " + interceptLogs.length)
-  console.log("[39] TUI plugin cycles agents and forwards via promptAsync: ok")
+  // first intercept should target plan, second should target build
+  const first = interceptLogs[0]
+  if (!first?.message?.includes("next=plan")) {
+    throw new Error("first Tab should target plan, got: " + first?.message)
+  }
+  const second = interceptLogs[1]
+  if (!second?.message?.includes("next=build")) {
+    throw new Error("second Shift+Tab should target build, got: " + second?.message)
+  }
+  console.log("[39] TUI plugin cycles agents locally (no synthetic messages): ok")
 }
 
 // 40. event hook accepts session.updated events from the v2 SDK shape
@@ -1137,11 +1164,14 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
   const prompts: any[] = []
+  const updates: any[] = []
+  const logs: any[] = []
   let handlerFn: any = null
   const fakeApi = {
     client: {
       session: {
         promptAsync: async (opts: any) => { prompts.push(opts); return { data: null } },
+        update: async (opts: any) => { updates.push(opts); return { data: null } },
       },
       app: {
         agents: async () => ({ data: [
@@ -1151,7 +1181,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
           { name: "code-review", mode: "primary", hidden: true },
           { name: "explore", mode: "subagent", hidden: true },
         ] }),
-        log: async () => ({}),
+        log: async (opts: any) => { logs.push(opts); return {} },
       },
     },
     state: {
@@ -1171,18 +1201,30 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (!handlerFn) throw new Error("intercept handler not registered")
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 30))
+  // Tab cycling is local-only now (no forward() calls). The cycle
+  // excludes hidden + subagent agents because primaryAgents is
+  // pre-filtered (mode !== "subagent" && hidden !== true). Verify
+  // by inspecting the intercepted targets: they cycle within the
+  // two visible primaries only. No SDK call happens, so we check
+  // the intercept logs to confirm the cycle direction.
+  const promptsBefore = prompts.length
   for (let i = 0; i < 4; i++) {
     handlerFn({ event: { name: "tab" } })
     await new Promise(r => setTimeout(r, 30))
   }
-  const called = prompts.map((p: any) => (p as any).agent).filter(Boolean)
-  if (called.length < 1) throw new Error("expected at least 1 promptAsync call, got 0")
+  const newPrompts = prompts.length - promptsBefore
+  if (newPrompts !== 0) {
+    throw new Error("active-session Tab cycling must not call promptAsync (no synthetic \".\" messages), got: " + newPrompts)
+  }
+  const nextTargets = logs.filter((l: any) => l.message?.includes("plan-review-TUI: intercept"))
+    .map((l: any) => (l.message.match(/next=(\S+)/) ?? [])[1])
+    .filter(Boolean)
   for (const bad of ["compaction", "code-review", "explore"]) {
-    if (called.includes(bad)) {
-      throw new Error(`${bad} should not be a cycle target: ${called.join(",")}`)
+    if (nextTargets.includes(bad)) {
+      throw new Error(`${bad} should not be a cycle target: ${nextTargets.join(",")}`)
     }
   }
-  console.log("[42] TUI plugin filter excludes hidden/subagent agents: ok")
+  console.log("[42] TUI plugin filter excludes hidden/subagent agents in active session Tab cycle: ok")
 }
 
 // 43. TUI plugin: no active route → no promptAsync. Tabs fired before
@@ -1262,14 +1304,19 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (!handlerFn) throw new Error("intercept handler not registered")
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 30))
-  if (prompts.length !== 1) throw new Error("expected 1 promptAsync call, got: " + prompts.length)
-  if ((prompts[0] as any).agent !== "plan") throw new Error("prompt should target plan, got: " + (prompts[0] as any).agent)
-  if ((prompts[0] as any).noReply !== true) throw new Error("prompt must have noReply=true")
+  // Tab in active session is now purely local — no SDK call. Verify
+  // the intercept log fired and no prompt was issued.
+  if (prompts.length !== 0) {
+    throw new Error("active-session Tab must not call promptAsync, got: " + prompts.length)
+  }
   const interceptLog = logs.find((l: any) => l.message?.includes("plan-review-TUI: intercept"))
   if (!interceptLog?.message?.includes("ses_log44")) {
     throw new Error("intercept log must mention sessionID=ses_log44, got: " + interceptLog?.message)
   }
-  console.log("[44] TUI plugin forward path uses promptAsync + log: ok")
+  if (!interceptLog?.message?.includes("next=plan")) {
+    throw new Error("Tab from build should cycle to plan, got: " + interceptLog?.message)
+  }
+  console.log("[44] TUI plugin Tab in active session is local-only (no synthetic messages): ok")
 }
 
 // 45. chat.message hook handler captures per-session, per-agent model.
@@ -1302,16 +1349,17 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
 }
 
 // 46. TUI plugin: writes to api.state.path.state/model.json trigger
-//     promptAsync with the current agent + picked model. The watcher
-//     lives in the TUI process (not the server plugin) so it's scoped
-//     to the active session and avoids the multi-instance duplication
-//     that the old server-side fs.watch produced.
+//     a session.update write with current agent + picked model via
+//     metadata. The watcher lives in the TUI process (scoped to the
+//     active session) and avoids the multi-instance duplication that
+//     the old server-side fs.watch produced. NO prompt() call here —
+//     the user explicitly does not want synthetic "." messages.
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
   const prompts: any[] = []
+  const updates: any[] = []
   const logs: any[] = []
-  // Use a per-test tmp dir for state so we don't touch the real file.
   const fakeStateDir = `/tmp/pr-state-${Date.now()}`
   require("node:fs").mkdirSync(fakeStateDir, { recursive: true })
   const modelJsonPath = `${fakeStateDir}/model.json`
@@ -1323,6 +1371,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     client: {
       session: {
         promptAsync: async (opts: any) => { prompts.push(opts); return { data: null } },
+        update: async (opts: any) => { updates.push(opts); return { data: null } },
       },
       app: {
         agents: async () => ({ data: [
@@ -1342,36 +1391,28 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     event: { on: (_t: string, _h: any) => () => {} },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
-  // give watcher init time to read current file
   await new Promise((r) => setTimeout(r, 30))
-  // Simulate the picker writing a new model to recent[0]. fs.watch's
-  // callback fires with no args on macOS Darwin backend for writes —
-  // we trigger it by calling the registered callback directly via the
-  // global subscribers list built during fs.watch.
-  // Easier: rewrite the file; the watcher tick reads via fs.readFileSync
-  // and compares to lastModelJSON.
   require("node:fs").writeFileSync(
     modelJsonPath,
     JSON.stringify({ recent: [{ providerID: "ya-glm", modelID: "glm" }], favorite: [], variant: {} }),
   )
-  // The macOS fs-events backend fires within tens of ms.
   for (let i = 0; i < 40; i++) {
     await new Promise((r) => setTimeout(r, 25))
-    if (prompts.length >= 1) break
+    if (updates.length >= 1) break
   }
   require("node:fs").rmSync(fakeStateDir, { recursive: true, force: true })
-  const pickerPrompt = prompts.find((p: any) => (p as any).model?.providerID === "ya-glm")
-  if (!pickerPrompt) {
-    throw new Error("watcher did not forward model.json change. prompts: " + JSON.stringify(prompts))
+  // Watcher must NOT call promptAsync — only session.update.
+  if (prompts.length !== 0) {
+    throw new Error("active-session picker must not call promptAsync, got: " + JSON.stringify(prompts))
   }
-  if ((pickerPrompt as any).agent !== "build") {
-    throw new Error("watcher must attach the current agent (build), got: " + (pickerPrompt as any).agent)
+  const pickerUpdate = updates.find((u: any) => u.sessionID === "ses_pick")
+  if (!pickerUpdate) {
+    throw new Error("watcher did not write metadata. updates: " + JSON.stringify(updates))
   }
-  if ((pickerPrompt as any).sessionID !== "ses_pick") {
-    throw new Error("watcher prompt sessionID should be ses_pick, got: " + (pickerPrompt as any).sessionID)
-  }
-  if ((pickerPrompt as any).noReply !== true) {
-    throw new Error("watcher must use noReply:true")
+  const meta = pickerUpdate.metadata?.planReviewDeferredPicks
+  const buildEntry = meta?.["build"]
+  if (!buildEntry || buildEntry.providerID !== "ya-glm" || buildEntry.modelID !== "glm") {
+    throw new Error("metadata entry for build must be ya-glm/glm, got: " + JSON.stringify(meta))
   }
   const pickerLog = logs.find((l: any) => l.message?.includes("picker changed"))
   if (!pickerLog?.message?.includes("agent=build") || !pickerLog?.message?.includes("ya-glm/glm")) {
@@ -1753,11 +1794,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.7")) {
-    throw new Error("init log must include v0.1.7 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.8")) {
+    throw new Error("init log must include v0.1.8 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=exitplan-mode-promotion-v1")) {
-    throw new Error("init log must include build=exitplan-mode-promotion-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=local-only-picker-v1")) {
+    throw new Error("init log must include build=local-only-picker-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

@@ -9,8 +9,8 @@ import type { Event } from "@opencode-ai/sdk/v2"
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.1.7"
-const BUILD_TAG = "exitplan-mode-promotion-v1"
+const VERSION = "0.1.8"
+const BUILD_TAG = "local-only-picker-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
@@ -114,55 +114,16 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     return primaryAgents[next]
   }
 
-  // Forward agent/model change to the server. The TUI host injects an
-  // `OpencodeClient` from @opencode-ai/sdk/v2 — confirmed by
-  // packages/tui/src/component/prompt/move.tsx which uses the v2
-  // parameter shape `{sessionID, noReply, parts, ...}` directly.
-  // We had been using the v1 shape `{path: {id}, body: {...}}` which
-  // silently failed: the v2 SDK's buildClientParams reads top-level
-  // fields and ignores `path`/`body` wrappers, so `parameters
-  // .sessionID` was always undefined and the server rejected the
-  // request. Fixed in this commit.
-  //
-  // forward() = fire-and-forget (uses promptAsync). Use for
-  // interactive paths (Tab cycle, mid-session picker) where the
-  // user doesn't need to wait for the server to acknowledge.
-  const forward = async (
-    to: string,
-    model?: { providerID: string; modelID: string },
-  ): Promise<void> => {
-    const sid = getActiveSessionID()
-    if (!sid) return
-    try {
-      await api.client.session.promptAsync({
-        sessionID: sid,
-        agent: to,
-        ...(model ? { model } : {}),
-        noReply: true,
-        parts: [{ type: "text", text: "." }],
-      })
-    } catch (e) {
-      void api.client.app
-        .log({
-          service: "plan-review-tui",
-          level: "warn",
-          message: `plan-review-TUI: forward to=${to} failed: ${(e as Error)?.message ?? String(e)}`,
-        })
-        .catch(() => {})
-    }
-  }
-
   // writeDeferredToMetadata stores the pending picks directly on the
   // session row via session.update({metadata:{planReviewDeferredPicks}}).
-  // The server-plugin's `chat.message` hook reads this metadata on
-  // the user's first real message (before plugin's chatMessageMemory
-  // is populated) and merges the picks into chatMessageMemory. This
-  // sidesteps the promptAsync race described in commit 37a727b —
-  // session.update is a synchronous server write that returns 200 only
-  // after the row is committed, so when the response Promise resolves
-  // the server already knows about the picks. Stays as a backup
-  // alongside forwardSync in case the user's first real prompt is
-  // processed faster than the flush's promptAsync.
+  // The server-plugin's chat.message hook promotion reads this
+  // metadata, but the actual promotion now lives in exitPlanMode
+  // (commit 967170b) — chat.message races the TUI flush, exitPlanMode
+  // runs seconds-to-minutes later and wins.
+  //
+  // No synthetic "." user messages anywhere in this plugin. Tab
+  // cycling and picker changes stay local-only; the user prompt
+  // is the only message the server ever sees for these flows.
   const writeDeferredToMetadata = async (
     sid: string,
     picks: Record<string, { providerID: string; modelID: string }>,
@@ -271,7 +232,14 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       logInfo(api, `plan-review-TUI: intercept ${name}: prev=${prevAgent ?? "?"} next=${next ?? "?"} sessionID=${sid ?? "none"}`)
       if (!next || next === prevAgent) return
       prevAgent = next
-      void forward(next)
+      // Local-only: Tab cycle updates `prevAgent` here without sending
+      // a synthetic "." message to the server. The server learns
+      // about the active agent on the user's next real user prompt
+      // (chat.message hook fires with input.agent = the new agent
+      // because OpenCode already syncs that from local.agent on
+      // submit). Server-plugin's exitPlanMode reads metadata to
+      // pick the model so we don't need to proactively notify the
+      // server either.
     },
     { priority: -1 },
   )
@@ -362,7 +330,12 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
             api,
             `plan-review-TUI: picker changed agent=${prevAgent} model=${picked.providerID}/${picked.modelID} sessionID=${sid}`,
           )
-          void forward(prevAgent, picked)
+          // Mid-session picker change: write to session.metadata so
+          // server-plugin's exitPlanMode can pick it up. No prompt()
+          // call — that would create a visible "." synthetic
+          // message in the session. Metadata write is the only path
+          // the user wants to see.
+          void writeDeferredToMetadata(sid, { [prevAgent]: picked })
         } catch (e) {
           void api.client.app
             .log({

@@ -512,6 +512,18 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
           }
           await log(client, "info", `plan-review: config hook added plan_review to primary_tools (count=${tools.length + 1})`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L572): ${(e as Error)?.message ?? String(e)}`) })
         }
+        // Permission configuration: allow plan agent to call plan_review,
+        // deny for build agent so it's not distracted by a planning tool.
+        // Matches plannotator pattern (agent.permission.submit_plan).
+        const agents = (opencodeConfig as any).agent ?? {}
+        if (agents.plan) {
+          agents.plan.permission ??= {}
+          agents.plan.permission.plan_review = "allow"
+        }
+        if (agents.build) {
+          agents.build.permission ??= {}
+          agents.build.permission.plan_review = "deny"
+        }
       } catch (err) {
         await log(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L575): ${(e as Error)?.message ?? String(e)}`) })
       }
@@ -584,7 +596,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       output.system.push(`
 ## Plan Review
 
-When you have completed your plan, you MUST call the \`plan_review\` tool to submit it for user review. The user can annotate, approve, or request changes.
+When you have completed your plan, call the \`plan_review\` tool to submit it for user review. The user can annotate, approve, or request changes.
 
 If your plan is rejected, you will receive feedback — revise the plan and call \`plan_review\` again.
 
@@ -801,6 +813,15 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L944): ${(e as Error)?.message ?? String(e)}`) })
+      }
+    },
+
+    "tool.definition": async (input, output) => {
+      // Suppress plan_exit during planning — redirect to plan_review.
+      // Matches plannotator pattern: without this the model may call
+      // plan_exit instead of plan_review.
+      if (input.toolID === "plan_exit") {
+        output.description = "Do not call this tool. Use plan_review to submit your plan for review."
       }
     },
   }

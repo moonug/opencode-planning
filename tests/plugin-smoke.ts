@@ -1922,7 +1922,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const appended = out.system[out.system.length - 1] ?? ""
   if (appended.length > 800) throw new Error(`system prompt too long: ${appended.length} chars (max 800)`)
   if (!appended.includes("plan_review")) throw new Error("system prompt missing plan_review mention")
-  if (!appended.includes("MUST call")) throw new Error("system prompt missing 'MUST call' directive")
+  if (!appended.includes("call the `plan_review` tool")) throw new Error("system prompt missing 'plan_review' directive")
   console.log(`[18] system prompt short and directive: ${appended.length} chars`)
 }
 
@@ -1951,7 +1951,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const out: any = { system: ["base prompt"] }
   await testHooks["experimental.chat.system.transform"]({ sessionID: "ses_build", model: {} as any } as any, out)
-  const injected = out.system.some((s: string) => s.includes("MUST call"))
+  const injected = out.system.some((s: string) => s.includes("call the `plan_review` tool"))
   if (injected) throw new Error("system prompt should be skipped when last user message is from build agent")
   console.log("[19] system prompt skip for build agent: ok")
 }
@@ -1978,7 +1978,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const out: any = { system: ["You may delegate to a subagent for exploration tasks."] }
   await testHooks["experimental.chat.system.transform"]({ sessionID: "ses_sub", model: {} as any } as any, out)
-  const injected = out.system.some((s: string) => s.includes("MUST call"))
+  const injected = out.system.some((s: string) => s.includes("call the `plan_review` tool"))
   if (!injected) throw new Error("system prompt should NOT be skipped when system contains 'subagent' word")
   console.log("[24] system prompt not skipped on 'subagent' word: ok")
 }
@@ -2113,7 +2113,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const out: any = { system: ["base prompt about file editing"] }
   await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" }, sessionID: "ses_old" } as any, out)
   const joined = out.system.join("\n")
-  if (!joined.includes("MUST call")) throw new Error("'MUST call' directive missing")
+  if (!joined.includes("call the `plan_review` tool")) throw new Error("'plan_review' directive missing")
   if (!joined.includes("plan_review")) throw new Error("plan_review mention missing")
   if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("system prompt injected"))) {
     throw new Error("diagnostic info log missing")

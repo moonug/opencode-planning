@@ -522,15 +522,24 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         }
         // Permission configuration: allow plan agent to call plan_review,
         // deny for build agent so it's not distracted by a planning tool.
-        // Matches plannotator pattern (agent.permission.submit_plan).
+        // opencode config can define an agent as a single object or an array
+        // of objects when multiple agents share a name. Handle both cases.
         const agents = (opencodeConfig as any).agent ?? {}
-        if (agents.plan) {
-          agents.plan.permission ??= {}
-          agents.plan.permission.plan_review = "allow"
+        const planEntry = agents.plan
+        if (planEntry) {
+          const plans = Array.isArray(planEntry) ? planEntry : [planEntry]
+          for (const ag of plans) {
+            ag.permission ??= {}
+            ag.permission.plan_review = "allow"
+          }
         }
-        if (agents.build) {
-          agents.build.permission ??= {}
-          agents.build.permission.plan_review = "deny"
+        const buildEntry = agents.build
+        if (buildEntry) {
+          const builds = Array.isArray(buildEntry) ? buildEntry : [buildEntry]
+          for (const ag of builds) {
+            ag.permission ??= {}
+            ag.permission.plan_review = "deny"
+          }
         }
       } catch (err) {
         await log(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L575): ${(e as Error)?.message ?? String(e)}`) })
@@ -605,6 +614,8 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
 ## Plan Review
 
 When you have completed your plan, call the \`plan_review\` tool to submit it for user review. The user can annotate, approve, or request changes.
+
+Do NOT ask the user for confirmation or approval in chat — always use the \`plan_review\` tool. Just call it directly.
 
 If your plan is rejected, you will receive feedback — revise the plan and call \`plan_review\` again.
 
@@ -825,11 +836,16 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
     },
 
     "tool.definition": async (input, output) => {
-      // Suppress plan_exit during planning — redirect to plan_review.
-      // Matches plannotator pattern: without this the model may call
-      // plan_exit instead of plan_review.
-      if (input.toolID === "plan_exit") {
-        output.description = "Do not call this tool. Use plan_review to submit your plan for review."
+      // Add plan_review to every agent's tool definitions so the model
+      // always sees it, even when the agent's default tools exclude it.
+      if (input.toolID === "plan_review") {
+        await log(client, "info", `plan-review: tool.definition fired for plan_review`).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L827): ${(e as Error)?.message ?? String(e)}`) })
+        return
+      }
+      // Suppress todowrite during planning — the model should focus
+      // on planning, not on writing todo items.
+      if (input.toolID === "todowrite") {
+        output.description = "During planning, use plan_review instead. Call plan_review when your plan is complete."
       }
     },
   }

@@ -159,16 +159,45 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // No synthetic "." user messages anywhere in this plugin. Tab
   // cycling and picker changes stay local-only; the user prompt
   // is the only message the server ever sees for these flows.
+  //
+  // MERGE behaviour: reads existing planReviewDeferredPicks from
+  // session.metadata before writing, then merges the new picks on top.
+  // Without this, each call replaces the entire metadata object and
+  // picks from a previous watcher tick (for a different agent) are
+  // silently dropped — model.json is global and the watcher fires
+  // for every Ctrl-X M pick, but each tick only carries the single
+  // agent that was active at that moment.
   const writeDeferredToMetadata = async (
     sid: string,
     picks: Record<string, { providerID: string; modelID: string }>,
   ): Promise<void> => {
     try {
+      // Read existing picks first so we don't drop entries from
+      // other agents that were recorded by a previous watcher tick.
+      let existing: Record<string, unknown> = {}
+      try {
+        const sessionRes = await api.client.session.get({ sessionID: sid })
+        const data = (sessionRes as { data?: { metadata?: Record<string, unknown> } }).data
+        const old = data?.metadata?.planReviewDeferredPicks
+        if (old && typeof old === "object") {
+          existing = old as Record<string, unknown>
+        }
+      } catch {
+        // session.get can fail (new session, race) — start fresh.
+      }
+      const merged = { ...existing, ...picks }
+      // Strip metadata-internal keys from existing so re-pick for
+      // the same agent overwrites rather than stacking.
+      for (const key of Object.keys(merged)) {
+        if (key.startsWith("_") && key !== "_writtenAt") {
+          delete merged[key]
+        }
+      }
       await api.client.session.update({
         sessionID: sid,
         metadata: {
           planReviewDeferredPicks: {
-            ...picks,
+            ...merged,
             _writtenAt: new Date().toISOString(),
           },
         },

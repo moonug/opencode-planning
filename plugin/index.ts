@@ -305,6 +305,15 @@ async function exitPlanMode(
     const sessionRes = await client.session.get({ path: { id: sessionID } })
     const data = (sessionRes as any)?.data ?? sessionRes
     const metadata = data?.metadata
+    // DIAG: log exact metadata we read so the next live test reveals
+    // whether the session.update write reached the server, got
+    // overwritten, or never committed. Remove once root cause is
+    // identified.
+    await log(
+      client,
+      "info",
+      `plan-review: exitPlanMode metadata check: session=${sessionID} keys=${metadata ? Object.keys(metadata).join(",") : "<null>"} deferred=${metadata?.planReviewDeferredPicks ? JSON.stringify(metadata.planReviewDeferredPicks) : "<absent>"} raw=${JSON.stringify(metadata ?? null)}`,
+    ).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L307): ${(e as Error)?.message ?? String(e)}`) })
     const deferred = metadata?.planReviewDeferredPicks
     if (deferred && typeof deferred === "object") {
       let perSession = chatMessageMemory.get(sessionID)

@@ -552,13 +552,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.1.2")) {
-    throw new Error("TUI init log missing v0.1.2 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.1.3")) {
+    throw new Error("TUI init log missing v0.1.3 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=picker-defer-v1")) {
+  if (!loaded?.message?.includes("build=picker-defer-per-agent-v1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.1.2 build=picker-defer-v1: ok")
+  console.log("[38b] TUI plugin logs v0.1.3 build=picker-defer-per-agent-v1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -609,21 +609,26 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log(`[38c] TUI plugin defaults prevAgent to first primary agent (${match[1]}) when no session: ok`)
 }
 
-// 38d. TUI plugin: when the watcher fires on the home route (no
-//      active session), the picker choice is stashed as deferred.
-//      When session.updated fires later with a real sessionID, the
-//      plugin forwards the deferred pick as a single promptAsync so
-//      the server's chat.message hook can attribute it to the active
-//      agent. This handles the common opencode-planning flow where
-//      the user picks a model on the home screen, switches the agent
-//      tab, then types — without ever sending the picker through a
-//      session-scoped prompt before the session exists.
+// 38d. TUI plugin: per-agent deferred pickers. The home route has no
+//      sessionID so watcher ticks stash the choice keyed by the
+//      agent that was active when the pick was made. The user can
+//      pick a model per agent (e.g. build → mimo-v2.5, then Tab to
+//      plan → deepseek-v4-flash) before any session exists, and
+//      refresh() flushes each (agent, model) pair separately when
+//      session.updated finally fires. This is the canonical
+//      opencode-planning flow — user picks models before typing.
+//
+//      Smoke covers two staggered picks before session appears, then
+//      session.updated → two promptAsync calls with the right
+//      (agent, model) on each. Verifies no promptAsync leaks until
+//      the session opens.
 {
   const mod = await import("../plugin/tui-plugin.ts" as any)
   const tuiPluginFn = (mod.default as any).tui
   const prompts: any[] = []
   const logs: any[] = []
   const eventHandlers: Array<{ type: string; fn: any }> = []
+  let keymapHandler: any = null
   const fakeApi: any = {
     client: {
       session: {
@@ -641,17 +646,14 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       session: { messages: () => [] },
       path: { state: `/tmp/pr-deferred-${Date.now()}`, config: "/tmp", worktree: "/tmp", directory: "/tmp" },
     },
-    route: { current: { name: "home" } }, // home at init
-    keymap: { intercept: (_t: string, _h: any) => () => {} },
+    route: { current: { name: "home" } },
+    keymap: { intercept: (_t: string, h: any) => { keymapHandler = h; return () => {} } },
     lifecycle: { signal: new AbortController().signal, onDispose: (_fn: any) => () => {} },
     event: {
       on: (type: string, fn: any) => { eventHandlers.push({ type, fn }); return () => {} },
     },
   }
-  // fs.watch requires the file to exist before subscribing — seed
-  // an initial model.json BEFORE invoking tui() so the plugin's
-  // init watcher read picks up "starting" and registers fs.watch
-  // successfully.
+  // Seed initial model.json before plugin init so fs.watch can register.
   const fs = await import("node:fs")
   const stateDir = fakeApi.state.path.state
   fs.mkdirSync(stateDir, { recursive: true })
@@ -662,65 +664,155 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }))
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
-  // Now write the "real" picker change — watcher should fire.
+
+  // Step 1: pick mimo-v2.5 while agent=build (default on home).
+  // First keymap intercept simulates a Tab press so prevAgent = "plan"
+  // (because [plan, build], Tab cycles to plan). Verify this in the log
+  // so the smoke doesn't depend on primaryAgents order.
   fs.writeFileSync(modelJsonPath, JSON.stringify({
-    recent: [{ providerID: "ya-glm", modelID: "glm" }],
+    recent: [{ providerID: "opencode-go", modelID: "mimo-v2.5" }],
     favorite: [], variant: {},
   }))
-  // give watcher a tick
   for (let i = 0; i < 40; i++) {
     await new Promise((r) => setTimeout(r, 25))
-    if (logs.find((l: any) => l.message?.includes("picker deferred"))) break
+    if (logs.find((l: any) => l.message?.includes("picker deferred") && l.message?.includes("mimo-v2.5"))) break
   }
-  fs.rmSync(stateDir, { recursive: true, force: true })
-  const deferred = logs.find((l: any) => l.message?.includes("picker deferred model=ya-glm/glm"))
-  if (!deferred) {
-    throw new Error("watcher should defer picker on home route.\nplugin logs:\n" +
-      logs.map((l: any) => l.message).join("\n") + "\nprompts:\n" + JSON.stringify(prompts))
+  const firstPick = logs.find((l: any) =>
+    l.message?.includes("picker deferred") && l.message?.includes("mimo-v2.5"),
+  )
+  if (!firstPick) {
+    throw new Error("first picker deferred log missing. logs:\n" +
+      logs.map((l: any) => l.message).join("\n"))
   }
-  // No promptAsync should have fired yet — we haven't created a session.
-  if (prompts.length !== 0) {
-    throw new Error("no promptAsync expected before session, got: " + prompts.length)
+  const firstAgent = (firstPick.message.match(/agent=(\S+)/) ?? [])[1]
+  if (!firstAgent || !["build", "plan"].includes(firstAgent)) {
+    throw new Error("first deferred log must key by build or plan, got: " + firstAgent)
+  }
+  if (firstPick.message?.includes("totalDeferred=1") !== true) {
+    throw new Error("first defer log missing totalDeferred=1: " + firstPick.message)
   }
 
-  // Now simulate session.updated firing (user typed first message,
-  // session created). The real TUI route changes from home to session
-  // at the same moment — mirror it on the fakeApi so refresh() picks
-  // up the sessionID.
-  fakeApi.route = { current: { name: "session", params: { sessionID: "ses_deferred" } } }
-  fakeApi.state.session.messages = () => [{ role: "user", agent: "plan" }]
-  prompts.length = 0
-  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
-    h.fn({ properties: { sessionID: "ses_deferred" } })
-  }
-  // let any async forward complete
-  await new Promise((r) => setTimeout(r, 50))
-
-  const flush = logs.find((l: any) => l.message?.includes("flush deferred picker"))
-  if (!flush) {
-    throw new Error("deferred pick did not flush on session.updated. logs: " + logs.map((l:any)=>l.message).join("\n"))
-  }
-  const flushed = prompts.find((p: any) => p.body?.model?.providerID === "ya-glm")
-  if (!flushed) {
-    throw new Error("flush did not produce a promptAsync with the deferred model. prompts: " + JSON.stringify(prompts))
-  }
-  if (flushed.body?.noReply !== true) {
-    throw new Error("flushed promptAsync must use noReply:true")
-  }
-  if (flushed.path?.id !== "ses_deferred") {
-    throw new Error("flushed promptAsync path.id should be ses_deferred, got: " + flushed.path?.id)
-  }
-  // After flush the deferred state is cleared — a second session.updated
-  // without a new picker change should NOT re-prompt.
-  prompts.length = 0
-  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
-    h.fn({ properties: { sessionID: "ses_deferred" } })
-  }
+  // Step 2: simulate Tab to flip prevAgent so the SECOND pick keys
+  // under the OTHER agent. Capture which one we are now so the
+  // assertion below is order-independent.
+  if (!keymapHandler) throw new Error("keymap intercept not registered")
+  keymapHandler({ event: { name: "tab" } })
   await new Promise((r) => setTimeout(r, 30))
-  if (prompts.find((p: any) => p.body?.model?.providerID === "ya-glm")) {
-    throw new Error("flush should only fire once per deferred pick")
+  // refresh() reads api.state.session.messages() — left as empty for now
+  // (no real session yet). The Tab callback's prevAgent update relies
+  // on refresh() setting prevAgent = primaryAgents[0] when messages()
+  // returns nothing. We don't know which direction it took (build → plan
+  // or stayed build), but we KNOW prevAgent is one of {build, plan}.
+  // Just trigger another pick — it will go under whichever agent
+  // prevAgent now points to.
+  fs.writeFileSync(modelJsonPath, JSON.stringify({
+    recent: [{ providerID: "opencode-go", modelID: "deepseek-v4-flash" }],
+    favorite: [], variant: {},
+  }))
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 25))
+    if (logs.filter((l: any) => l.message?.includes("picker deferred") && l.message?.includes("deepseek-v4-flash")).length) break
   }
-  console.log("[38d] TUI plugin defers picker on home and flushes on first session.updated: ok")
+  const secondPick = logs.find((l: any) =>
+    l.message?.includes("picker deferred") && l.message?.includes("deepseek-v4-flash"),
+  )
+  if (!secondPick) {
+    throw new Error("second picker deferred log missing. logs:\n" +
+      logs.map((l: any) => l.message).join("\n"))
+  }
+  const secondAgent = (secondPick.message.match(/agent=(\S+)/) ?? [])[1]
+  if (!secondAgent || !["build", "plan"].includes(secondAgent)) {
+    throw new Error("second deferred log must key by build or plan, got: " + secondAgent)
+  }
+  // Two different agents must have been used — that's the whole point
+  // of per-agent keying. If both picks went to the same agent the
+  // first pick was lost.
+  if (firstAgent === secondAgent) {
+    throw new Error("per-agent keying broken: both picks went to agent=" + firstAgent + " — first pick was overwritten")
+  }
+  // totalDeferred count should be 2 across both picks.
+  const lastDeferred = [...logs].reverse().find((l: any) => l.message?.includes("totalDeferred=2"))
+  if (!lastDeferred) {
+    throw new Error("expect totalDeferred=2 after both picks. logs:\n" +
+      logs.filter((l: any) => l.message?.includes("picker deferred")).map((l: any) => l.message).join("\n"))
+  }
+
+  // No promptAsync should have fired yet — no session exists.
+  if (prompts.length !== 0) {
+    throw new Error("no promptAsync expected before session.created, got: " + prompts.length)
+  }
+
+  // Step 3: simulate session.updated. The route swaps from home to
+  // session and messages() starts returning a build-agent user
+  // message so refresh() pins prevAgent=build (the user's actual
+  // agent for this session — the picker picks remain attributed
+  // correctly because the watcher stored them under their own keys).
+  fakeApi.route = { current: { name: "session", params: { sessionID: "ses_peragent" } } }
+  fakeApi.state.session.messages = () => [{ role: "user", agent: "build" }]
+  // Snapshot logs now so we can read the deferred-pick logs later
+  // (we clear logs.length before the flush so the assertions below
+  // only see flush lines).
+  const deferredLogs = logs.slice()
+  prompts.length = 0
+  logs.length = 0
+  for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
+    h.fn({ properties: { sessionID: "ses_peragent" } })
+  }
+  await new Promise((r) => setTimeout(r, 50))
+  fs.rmSync(stateDir, { recursive: true, force: true })
+
+  const flushHeader = logs.find((l: any) => l.message?.includes("flush deferred pickers count=2"))
+  if (!flushHeader) {
+    throw new Error("expect flush deferred pickers count=2. logs:\n" +
+      logs.map((l: any) => l.message).join("\n"))
+  }
+  if (prompts.length !== 2) {
+    throw new Error("expected 2 promptAsync after flush, got: " + prompts.length + "\n" + JSON.stringify(prompts))
+  }
+  // Each promptAsync must carry its own (agent, model) — per-agent keying
+  // works correctly when the prompt for agent="plan" carries mimo
+  // and the prompt for agent="build" carries deepseek, OR vice versa.
+  const mimoPrompt = prompts.find((p: any) => p.body?.model?.modelID === "mimo-v2.5")
+  const dsPrompt = prompts.find((p: any) => p.body?.model?.modelID === "deepseek-v4-flash")
+  if (!mimoPrompt || !dsPrompt) {
+    throw new Error("expected both mimo-v2.5 and deepseek-v4-flash prompts, got: " + JSON.stringify(prompts))
+  }
+  const mimoAgent = mimoPrompt.body?.agent
+  const dsAgent = dsPrompt.body?.agent
+  if (!["build", "plan"].includes(mimoAgent) || !["build", "plan"].includes(dsAgent)) {
+    throw new Error("agent in flush must be one of build/plan, got: mimo=" + mimoAgent + " ds=" + dsAgent)
+  }
+  if (mimoAgent === dsAgent) {
+    throw new Error("flushed prompts must have DIFFERENT agents — per-agent keying still broken")
+  }
+  for (const p of prompts) {
+    if (p.body?.noReply !== true) throw new Error("flushed prompt must use noReply:true")
+    if (p.path?.id !== "ses_peragent") throw new Error("flushed prompt path.id should be ses_peragent")
+  }
+  // First pick → firstAgent, second pick → secondAgent. They must
+  // survive intact through the flush.
+  const firstAgentExpected = firstAgent
+  const secondAgentExpected = secondAgent
+  if (mimoPrompt.body.agent !== firstAgentExpected && mimoPrompt.body.agent !== secondAgentExpected) {
+    throw new Error("mimo prompt agent " + mimoPrompt.body.agent + " doesn't match either deferred pick")
+  }
+  // Find which agent picked which model in the watcher logs — we
+  // snapshotted them into `deferredLogs` before clearing.
+  const mimoAgentInLog = (deferredLogs.find((l: any) =>
+    l.message?.includes("picker deferred") && l.message?.includes("mimo-v2.5"),
+  )?.message.match(/agent=(\S+)/) ?? [])[1]
+  if (mimoPrompt.body.agent !== mimoAgentInLog) {
+    throw new Error("mimo prompt agent " + mimoPrompt.body.agent +
+      " does not match defer log agent " + mimoAgentInLog + " — per-agent keying lost attribution")
+  }
+  const dsAgentInLog = (deferredLogs.find((l: any) =>
+    l.message?.includes("picker deferred") && l.message?.includes("deepseek-v4-flash"),
+  )?.message.match(/agent=(\S+)/) ?? [])[1]
+  if (dsPrompt.body.agent !== dsAgentInLog) {
+    throw new Error("ds prompt agent " + dsPrompt.body.agent +
+      " does not match defer log agent " + dsAgentInLog)
+  }
+  console.log("[38d] TUI plugin keeps deferred pickers per-agent across Tab+picker cycles: ok")
 }
 
 // 39. TUI plugin: Tab calls promptAsync({agent, noReply:true}) on the
@@ -1524,11 +1616,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.1.2")) {
-    throw new Error("init log must include v0.1.2 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.1.3")) {
+    throw new Error("init log must include v0.1.3 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=picker-defer-v1")) {
-    throw new Error("init log must include build=picker-defer-v1 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=picker-defer-per-agent-v1")) {
+    throw new Error("init log must include build=picker-defer-per-agent-v1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

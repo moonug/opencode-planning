@@ -9,8 +9,8 @@ import type { Event } from "@opencode-ai/sdk/v2"
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.1.2"
-const BUILD_TAG = "picker-defer-v1"
+const VERSION = "0.1.3"
+const BUILD_TAG = "picker-defer-per-agent-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
@@ -90,10 +90,16 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   // Deferred picker state — when the user picks a model on the home
   // screen there is no sessionID to forward to. We stash the choice
-  // here and flush it via promptAsync the first time refresh() sees
-  // an active session. Cleared after consumption so we only pay one
-  // extra promptAsync per pre-session picker change.
-  let lastPickedModel: { providerID: string; modelID: string } | undefined
+  // here keyed by agent so the user can pick one model per agent
+  // (build → mimo-v2.5, plan → deepseek-v4-flash) before any session
+  // exists. refresh() flushes every entry via promptAsync the first
+  // time session.updated fires with a real sessionID.
+  //
+  // Single-variable version lost picks: if you tabbed build → pick
+  // mimo, tab plan → pick deepseek, the second write overwrote the
+  // first and only the last agent's pick got attributed. Map keys by
+  // the agent that was active when the pick was made.
+  const lastPickedModels = new Map<string, { providerID: string; modelID: string }>()
 
   logInfo(
     api,
@@ -163,19 +169,35 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       // can attribute without waiting for the user to type.
       prevAgent = primaryAgents[0]
     }
-    if (lastPickedModel && prevAgent) {
-      // First chance to push the deferred pick through to the server:
-      // sessionID is now real, prevAgent is real (either from messages
-      // or the default fallback). Forward as a single noReply prompt
-      // so the server's chat.message hook can write the per-agent
-      // model into chatMessageMemory before the user actually types.
-      const m = lastPickedModel
-      lastPickedModel = undefined
+    if (lastPickedModels.size > 0) {
+      // First chance to push the deferred picks through to the server:
+      // sessionID is now real. Each pick was keyed by the agent that
+      // was active when the user made it (built-up state across
+      // Tab + Ctrl-X M cycles on the home screen). We intentionally
+      // forward EACH (agent, model) pair separately so the server
+      // sees input.agent=build+model=X and input.agent=plan+model=Y
+      // in distinct chat.message events — chatMessageMemory is per
+      // (sessionID, agent) so all four (plan+model, build+model)
+      // combinations land in the right slots.
+      //
+      // One synthetic "." user message per deferred pick is the
+      // accepted trade-off — we discussed flush-on-first-message in
+      // 0462c35, and the single-variable version lost picks when
+      // the user staggered picks per agent. Map form is the minimal
+      // change that preserves attribution.
+      const entries = Array.from(lastPickedModels.entries())
+      lastPickedModels.clear()
       logInfo(
         api,
-        `plan-review-TUI: flush deferred picker agent=${prevAgent} model=${m.providerID}/${m.modelID} sessionID=${sid}`,
+        `plan-review-TUI: flush deferred pickers count=${entries.length} sessionID=${sid}`,
       )
-      void forward(prevAgent, m)
+      for (const [agentName, model] of entries) {
+        logInfo(
+          api,
+          `plan-review-TUI: flush deferred picker agent=${agentName} model=${model.providerID}/${model.modelID} sessionID=${sid}`,
+        )
+        void forward(agentName, model)
+      }
     }
   }
 
@@ -191,12 +213,16 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       if (!event || event.ctrl || event.meta || event.alt) return
       const name = event.name
       if (name !== "tab" && name !== "shift+tab") return
-      const sid = getActiveSessionID()
-      if (!sid) return
+      // Tab works at home too (no session yet) so the user can switch
+      // agents and pick models per agent before opening a session.
+      // refresh() is a no-op without a sessionID, so we fall through
+      // and computeNext/forward still work — the only field that
+      // needs to stay current is prevAgent itself.
       refresh()
       const direction: 1 | -1 = name === "tab" ? 1 : -1
       const next = computeNext(prevAgent, direction)
-      logInfo(api, `plan-review-TUI: intercept ${name}: prev=${prevAgent ?? "?"} next=${next ?? "?"} sessionID=${sid}`)
+      const sid = getActiveSessionID() ?? sessionID
+      logInfo(api, `plan-review-TUI: intercept ${name}: prev=${prevAgent ?? "?"} next=${next ?? "?"} sessionID=${sid ?? "none"}`)
       if (!next || next === prevAgent) return
       prevAgent = next
       void forward(next)
@@ -258,13 +284,20 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           if (!picked) return
           const sid = getActiveSessionID()
           if (!sid) {
-            // Home-screen picker: stash the choice and let refresh()
-            // forward it the first time session.updated fires with a
-            // real sessionID (after the user types their first message).
-            lastPickedModel = picked
+            // Home-screen picker: stash the choice keyed by the agent
+            // that was active when the pick was made (prevAgent tracks
+            // Tab/Shift+Tab in real time via refresh() above). Multiple
+            // agents can stage picks before any session exists; refresh()
+            // flushes them all in one go on first session.updated.
+            const agentKey = prevAgent ?? primaryAgents[0]
+            if (!agentKey) {
+              logInfo(api, `plan-review-TUI: picker skipped reason=no-agent`)
+              return
+            }
+            lastPickedModels.set(agentKey, picked)
             logInfo(
               api,
-              `plan-review-TUI: picker deferred model=${picked.providerID}/${picked.modelID} reason=no-session`,
+              `plan-review-TUI: picker deferred agent=${agentKey} model=${picked.providerID}/${picked.modelID} reason=no-session totalDeferred=${lastPickedModels.size}`,
             )
             return
           }

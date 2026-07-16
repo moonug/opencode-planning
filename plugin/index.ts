@@ -214,27 +214,14 @@ async function getPlanAgentModel(client: any): Promise<ModelRef | undefined> {
   return undefined
 }
 
-function readPickerState(filePath?: string): ModelRef | undefined {
-  try {
-    const path = filePath ?? `${homedir()}/.local/state/opencode/model.json`
-    const raw = readFileSync(path, "utf8")
-    const data = JSON.parse(raw) as { recent?: Array<{ providerID?: string; modelID?: string }> }
-    if (Array.isArray(data.recent) && data.recent.length > 0) {
-      const entry = data.recent[0]!
-      if (typeof entry.providerID === "string" && typeof entry.modelID === "string") {
-        return { providerID: entry.providerID, modelID: entry.modelID }
-      }
-    }
-  } catch {}
-  return undefined
-}
-
 async function getGlobalModel(client: any): Promise<ModelRef | undefined> {
   try {
     const res = await client.config.get()
     const model = (res as any)?.data?.model ?? (res as any)?.model
     if (typeof model === "string") return parseModelString(model)
-  } catch {}
+  } catch (err) {
+    console.error(`plan-review: getGlobalModel failed: ${(err as Error)?.message ?? String(err)}`)
+  }
   return undefined
 }
 
@@ -261,7 +248,9 @@ async function listAvailableModels(client: any): Promise<ProviderListEntry[]> {
         entries.push({ providerID: id, providerName: name, modelID, displayName })
       }
     }
-  } catch {}
+  } catch (err) {
+    console.error(`plan-review: listAvailableModels failed: ${(err as Error)?.message ?? String(err)}`)
+  }
   return entries
 }
 
@@ -283,7 +272,6 @@ async function exitPlanMode(
   buildModels: Map<string, ModelRef>,
   chatMessageMemory: Map<string, Map<string, ModelRef>>,
   lastResolution: { target?: ModelRef; source?: string },
-  modelJsonPath: string,
   sessionID: string | undefined,
   summary: string,
 ): Promise<void> {
@@ -362,20 +350,13 @@ async function exitPlanMode(
   ])
 
   const fromChatPlan = perAgent?.get("plan")
-  // Read model.json synchronously when exitPlanMode fires. model.json is
-  // global (shared by every TUI), so attribution can't be precise — this
-  // is only the "no chat.message ever fired" fallback. The TUI plugin
-  // forces chat.message to fire on agent switches via promptAsync, so
-  // reaching this branch means the user clicked the picker without
-  // sending a message AND never tabbed.
-  const fromPicker = readPickerState(modelJsonPath)
 
   // DIAG: log all priority chain sources so we can trace why a
   // particular model was picked (user reports build got wrong model).
   await log(
     client,
     "info",
-    `plan-review: exitPlanMode chain: session=${sessionID} fromChat=${fromChat ? `${fromChat.providerID}/${fromChat.modelID}` : "∅"} fromChatPlan=${fromChatPlan ? `${fromChatPlan.providerID}/${fromChatPlan.modelID}` : "∅"} overridden=${overridden ? `${overridden.providerID}/${overridden.modelID}` : "∅"} agentCfg=${agentCfg ? `${agentCfg.providerID}/${agentCfg.modelID}` : "∅"} planCfg=${planCfg ? `${planCfg.providerID}/${planCfg.modelID}` : "∅"} globalCfg=${globalCfg ? `${globalCfg.providerID}/${globalCfg.modelID}` : "∅"} fromPicker=${fromPicker ? `${fromPicker.providerID}/${fromPicker.modelID}` : "∅"}`,
+    `plan-review: exitPlanMode chain: session=${sessionID} fromChat=${fromChat ? `${fromChat.providerID}/${fromChat.modelID}` : "∅"} fromChatPlan=${fromChatPlan ? `${fromChatPlan.providerID}/${fromChatPlan.modelID}` : "∅"} overridden=${overridden ? `${overridden.providerID}/${overridden.modelID}` : "∅"} agentCfg=${agentCfg ? `${agentCfg.providerID}/${agentCfg.modelID}` : "∅"} planCfg=${planCfg ? `${planCfg.providerID}/${planCfg.modelID}` : "∅"} globalCfg=${globalCfg ? `${globalCfg.providerID}/${globalCfg.modelID}` : "∅"}`,
   ).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L375): ${(e as Error)?.message ?? String(e)}`) })
 
   let source: string
@@ -385,7 +366,6 @@ async function exitPlanMode(
   else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
-  else if (fromPicker)  { target = fromPicker;  source = "picker (model.json recent[0])" }
   else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }
   else                  { source = "opencode default" }
 
@@ -411,7 +391,9 @@ async function exitPlanMode(
           }],
         },
       })
-    } catch {}
+    } catch (err) {
+      console.error(`plan-review: no-target prompt failed: ${(err as Error)?.message ?? String(err)}`)
+    }
     return
   }
 
@@ -467,13 +449,9 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   // Used as a best-effort fallback when no chat.message has set the
   // per-session build model. The watcher that used to live here was
   // removed: model.json is global (not per-workspace), and running
-  // fs.watch in every server-plugin instance produced duplicate
-  // "matched agent=build/explore" log lines whenever more than one
-  // opencode process shared $HOME. Tool attribution now relies on the
-  // chat.message hook (TUI plugin forwards agent switches via
-  // promptAsync), so the watcher added noise without adding accuracy.
-  const MODEL_JSON_PATH = process.env.PLAN_REVIEW_MODEL_JSON
-    ?? `${homedir()}/.local/state/opencode/model.json`
+  // Tool attribution relies on the chat.message hook and TUI plugin's
+  // per-session metadata writes. No model.json reads in the server plugin
+  // — model.json is global and leaks model choices across sessions.
 
   const plan_review = tool({
     description:
@@ -493,7 +471,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, MODEL_JSON_PATH, context.sessionID, "User closed editor without changes.")
+        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, context.sessionID, "User closed editor without changes.")
         return "Plan reviewed, no changes. Approved by user. Switched to build agent."
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
@@ -843,7 +821,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, MODEL_JSON_PATH, sessionID, `User approved \`${absolutePath}\`.`)
+          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
         }
       } catch (err) {
         await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L944): ${(e as Error)?.message ?? String(e)}`) })

@@ -2110,18 +2110,35 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
-  const out: any = { system: ["base prompt about file editing"] }
+  const out: any = { system: ["base prompt", "Phase 5: Call plan_exit tool. Your turn should only end with calling plan_exit or ExitPlanMode."] }
   await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" }, sessionID: "ses_old" } as any, out)
   const joined = out.system.join("\n")
   if (!joined.includes("call the `plan_review` tool")) throw new Error("'plan_review' directive missing")
   if (!joined.includes("plan_review")) throw new Error("plan_review mention missing")
+  if (joined.includes("plan_exit")) throw new Error("plan_exit should have been rewritten to plan_review")
+  if (joined.includes("ExitPlanMode")) throw new Error("ExitPlanMode should have been rewritten to plan_review")
+  if (!joined.includes("Call plan_review tool")) throw new Error("plan_exit not rewritten in Phase 5 directive")
   if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("system prompt injected"))) {
     throw new Error("diagnostic info log missing")
   }
-  // must skip subagent agents
-  const subOut: any = { system: ["subagent system prompt"] }
-  await testHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" } }, subOut)
-  if (subOut.system.join("\n").includes("ENFORCEMENT")) throw new Error("ENFORCEMENT should not be added for subagent")
+  if (!logs.some((l: any) => l.body?.level === "info" && l.body?.message?.includes("rewrote plan_exit"))) {
+    throw new Error("rewrite diagnostic log missing")
+  }
+  // skip build agent via sessionID lookup
+  const buildOut: any = { system: ["build prompt"] }
+  const buildClient: any = {
+    app: { log: async (o: any) => {} },
+    session: {
+      messages: async () => ({ data: [{ info: { role: "user", agent: "build" } }] }),
+      prompt: async () => {},
+    },
+  }
+  const buildHooks = await mod.default({
+    client: buildClient, project: {} as any, directory: "/tmp", worktree: "/tmp",
+    serverUrl: new URL("http://x"), $,
+  })
+  await buildHooks["experimental.chat.system.transform"]({ model: { providerID: "x", modelID: "y" }, sessionID: "ses_build_skip" } as any, buildOut)
+  if (buildOut.system.join("\n").includes("Plan Review")) throw new Error("Plan Review block should be skipped for build agent")
   console.log("[8] system prompt transform with ENFORCEMENT: ok")
 }
 

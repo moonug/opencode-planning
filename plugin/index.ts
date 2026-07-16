@@ -609,7 +609,22 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
             break
           }
         }
-      } catch {}
+      } catch (e) { console.error(`plan-review: agent check failed: ${(e as Error)?.message ?? String(e)}`) }
+      // Rewrite plan_exit/ExitPlanMode references in existing system blocks.
+      // Built-in plan-mode prompts contain strong directives like "Phase 5:
+      // Call plan_exit" and "your turn should only end with calling plan_exit".
+      // If left intact, the model follows those and ignores plan_review.
+      let rewrites = 0
+      for (let i = 0; i < output.system.length; i++) {
+        const before = output.system[i]
+        output.system[i] = before
+          .replace(/\bplan_exit\b/g, "plan_review")
+          .replace(/\bExitPlanMode\b/g, "plan_review")
+        if (output.system[i] !== before) rewrites++
+      }
+      if (rewrites > 0) {
+        await log(client, "info", `plan-review: rewrote plan_exit→plan_review in ${rewrites} system block(s)`).catch((e: unknown) => { console.error(`plan-review: swallowed error in rewrite-diag: ${(e as Error)?.message ?? String(e)}`) })
+      }
       output.system.push(`
 ## Plan Review
 

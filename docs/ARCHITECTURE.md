@@ -58,9 +58,24 @@ This works because the OS doesn't reserve unlinked paths — a subsequent `touch
 
 The plugin reads stdout via `BunShell.text()`. Empty stdout means approved; non-empty means iterate. No JSON wrapping.
 
+## TUI agent tracking
+
+The TUI's current agent lives in a private SolidJS `createStore` (see `packages/tui/src/context/local.tsx:77-133`) that is **not** exposed through the plugin API. Tab/Shift+Tab only mutate that store — the server has no awareness of the change. Since build-model resolution needs to know which agent the user is actually in, we bridge this with a small **TUI-side plugin** alongside the server plugin:
+
+- `plugin/tui-plugin.ts` registers a `keymap.intercept("key", ...)` handler that fires on Tab/Shift+Tab, before the default `agent.cycle` command runs.
+- It computes the next agent from `api.client.app.agents()` and writes a deferred-pick map to session metadata via `api.client.session.update({body:{metadata:{planReviewDeferredPicks}}})`.
+- On the user's first real prompt the `chat.message` hook reads that metadata and merges it into `chatMessageMemory` — but note the **promotion was moved out of `chat.message`** into `exitPlanMode`, because the user's first prompt fires `chat.message` *before* the TUI's `session.updated` handler flushes metadata. `exitPlanMode` runs much later (seconds-to-minutes, at plan approval) and is guaranteed to see the metadata, so it does the promotion there.
+- The server plugin also watches `session.updated` / `session.updated.1` events and updates `lastSessionAgent` so subsequent picker changes in `model.json` (Ctrl-X M) are attributed to the agent the user is actually in.
+
+The TUI plugin does **not** `preventDefault` — the default Tab handler still runs, and the TUI's local state changes as before. The plugin only **observes** and forwards.
+
+Key files / symbols: `plugin/tui-plugin.ts` (keymap intercept, `promptAsync` flush), `plugin/index.ts` (`chat.message` hook, `exitPlanMode` deferred-picker promotion block, `lastSessionAgent`), `plugin/model-memory.ts` (`rememberBuildModel`, `sessionUpdateInfo`).
+
 ## Files
 
 - `bin/plan-review.py` — Python helper. All editor-overlay logic, difflib, sentinel pattern, fallback cascade. Pure stdlib.
-- `plugin/index.ts` — opencode plugin. Tool registration, slash command via `event` hook, system prompt injection. Bun runtime.
-- `commands/plan-review.md` — slash-command body. Tells the model to call the tool when invoked.
-- `tests/plugin-smoke.ts` — end-to-end smoke (plugin loads, python helper diffs).
+- `plugin/index.ts` — opencode server plugin. Tool registration, slash command via `event` hook, system prompt injection, `chat.message` hook, `exitPlanMode` build-model resolution. Bun runtime.
+- `plugin/tui-plugin.ts` — TUI-side plugin. Tab/Shift+Tab observer, deferred-picker flush into session metadata.
+- `plugin/model-memory.ts` — `rememberBuildModel` + `sessionUpdateInfo`: parses `session.updated` events into a per-session build-model `Map`.
+- `commands/plan-review.md`, `commands/set-build-model.md`, `commands/plan-diag.md` — slash-command bodies. Tell the model what to do when invoked.
+- `tests/plugin-smoke.ts` — end-to-end smoke (plugin loads, python helper diffs, model-resolution priority chain).

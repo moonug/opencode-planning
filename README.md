@@ -1,4 +1,4 @@
-# opencode-plan-review
+# opencode-planning
 
 ## Origin
 
@@ -29,6 +29,12 @@ After the model produces a structured plan, open it in `$EDITOR` via a terminal 
 - Computes a unified diff (Python `difflib`); the diff becomes the model's next user message.
 - When the user closes the editor without changes: auto-switches the session from the plan agent to the build agent on a per-session build model (see [Build-model resolution](#build-model-resolution)).
 
+## Requirements
+
+- **Python 3.x** — stdlib only, no extra packages.
+- **Terminal overlay** (optional, for the popup editor): one of `tmux`, `kitty`, `wezterm`. Falls back to plain `$EDITOR` (e.g. `vim`) on a bare ssh session.
+- **bun** — optional, only for development / running the smoke test.
+
 ## Install
 
 One line. Add the plugin to `~/.config/opencode/opencode.jsonc`:
@@ -43,9 +49,9 @@ One line. Add the plugin to `~/.config/opencode/opencode.jsonc`:
 
 Restart opencode. The plugin self-installs the rest on first load:
 
-- **`bin/plan-review.py`** — Python 3 helper, found via `import.meta.url` (no `$PATH` copy needed). Spawned directly via shebang.
+- **`bin/plan-review.py`** — Python 3 helper. Resolved from the plugin's own directory via `fileURLToPath(import.meta.url)` → `../bin/plan-review.py` (no `$PATH` copy needed). Spawned directly via shebang.
 - **`commands/*.md`** — all three (`plan-review`, `set-build-model`, `plan-diag`) are symlinked into `~/.config/opencode/commands/` automatically.
-- **`plugin/tui-plugin.ts`** — TUI-side plugin, symlinked into `~/.config/opencode/plugins/plan-review-tui.ts`. Forwarded Tab/Shift+Tab agent switches to the server-side plugin via `session.update({metadata:{planReviewTabSwitchTo}})` so picker changes in model.json are correctly attributed to the agent the user is actually in.
+- **`plugin/tui-plugin.ts`** — TUI-side plugin, auto-registered into `~/.config/opencode/tui.jsonc` on first load. It observes Tab/Shift+Tab agent switches and forwards them to the server plugin via session metadata, so picker changes in `model.json` are attributed to the agent the user is actually in. See [TUI agent tracking](#how-the-plugin-tracks-which-agent-the-user-is-in) below and `docs/ARCHITECTURE.md`.
 - The plugin also `chmod +x`s the python helper if it isn't already.
 
 Override paths via env vars if needed:
@@ -54,6 +60,8 @@ Override paths via env vars if needed:
 |---|---|
 | `PLAN_REVIEW_SCRIPT` | `<plugin-dir>/../bin/plan-review.py` |
 | `EDITOR` | `$VISUAL` → `micro` → `nano` → `vi` |
+
+> On macOS, `os.homedir()` can return the build user's home instead of the runtime user's when `HOME` is unset. The plugin prefers `process.env.HOME` and falls back to `os.homedir()` only when it's empty or unset, so symlinks/paths resolve correctly under sandboxed server spawns.
 
 ## Editor cascade
 
@@ -82,36 +90,40 @@ python3 bin/plan-review.py --test
 # end-to-end smoke (requires bun — https://bun.sh)
 bun tests/plugin-smoke.ts
 
-# manual end-to-end (opens real editor, returns real diff)
-echo "# Plan\n- task 1\n" | python3 bin/plan-review.py --file /dev/stdin
+# manual end-to-end: writes a plan to disk, opens $EDITOR on it, returns a unified diff of your edits
+printf '# Plan\n- task 1\n' > /tmp/test-plan.md
+python3 bin/plan-review.py --file /tmp/test-plan.md
+
+# same, but pipe the plan via stdin (avoids shell-escaping markdown; still opens $EDITOR)
+printf '# Plan\n- task 1\n- task 2\n' | python3 bin/plan-review.py --file /dev/stdin
+
+# same, but via --plan-text-stdin (alternative to --file /dev/stdin; reads stdin as plan text)
+printf '# Plan\n- task 1\n- task 2\n' | python3 bin/plan-review.py --plan-text-stdin
 ```
+
+> Every entry point opens `$EDITOR`. There is no headless "just diff two strings" CLI mode — the review loop is inherently interactive.
 
 ## Build-model resolution
 
 When a plan is approved, the session auto-switches to the build agent on a model resolved in this order (first match wins):
 
-1. **chat.message memory** — the model the TUI's inline picker (Ctrl-X M) last picked, per session.
-2. **`/set-build-model` override** — explicit in-memory override for the current session.
-3. **`agent.build.model`** — from `opencode.jsonc`.
-4. **`config.model`** — global default from `opencode.jsonc`.
-5. **last global picker** (`model.json` recent[0]) — the model the TUI picker last selected, anywhere.
-6. **`session.list[0]` for build agent** — the most recent session's agent + model (fallback when chat.message hasn't fired yet).
+> **"chat.message memory"** below is a per-session, per-agent `Map` kept by the server plugin's `chat.message` hook (`plugin/index.ts`). Every time a message is about to be sent from an agent — including the TUI plugin's silent `promptAsync` on Tab/Shift+Tab — the hook records `{providerID, modelID}` for that agent. It is the primary source of truth for "which model did the user last pick for this agent here". See `plugin/model-memory.ts` and `docs/ARCHITECTURE.md`.
+
+1. **chat.message memory (build)** — the last model picked for the build agent in this session.
+2. **chat.message memory (plan)** — the last model picked for the plan agent in this session (fallback when build agent never had a picker event).
+3. **`/set-build-model` override** — explicit in-memory override for the current session.
+4. **`agent.build.model`** — from `opencode.jsonc`.
+5. **`config.model`** — global default from `opencode.jsonc`.
+6. **last global picker** (`model.json` recent[0]) — the model the TUI picker last selected, anywhere (fallback when no chat.message has fired).
 7. **fallback to plan agent's model** — keeps the session running on whatever the plan agent was using.
 
 If none of these resolve a model, the plugin refuses the auto-switch and prints instructions for fixing it. Use `/plan-diag` to inspect which sources resolved what.
 
 ### How the plugin tracks which agent the user is in
 
-The TUI's agent state lives in a private SolidJS `createStore` (see `packages/tui/src/context/local.tsx:77-133`) and is **not** exposed through the plugin API. Tab/Shift+Tab only mutate that store — the server has no awareness of the change.
+The TUI's current agent lives in a private SolidJS store that the plugin API does **not** expose, so Tab/Shift+Tab switches are invisible to the server. The plugin bridges this with a tiny **TUI-side plugin** (`plugin/tui-plugin.ts`) that observes Tab/Shift+Tab and forwards the resulting agent into session metadata; the server plugin reads it back so picker changes are attributed to the right agent. It only observes — it never blocks the default Tab handler.
 
-We bridge this by running a small **TUI-side plugin** alongside the server-side plugin:
-
-- `plugin/tui-plugin.ts` registers a `keymap.intercept("key", ...)` handler that fires on Tab/Shift+Tab, before the default `agent.cycle` command runs.
-- It computes the next agent from `api.client.app.agents()` and writes it to session metadata via `api.client.session.update({body:{metadata:{planReviewTabSwitchTo}}})`.
-- The server-side plugin sees the metadata change on `SessionV1.Event.Updated` and updates its `lastSessionAgent`.
-- Subsequent picker changes in `model.json` (Ctrl-X M) are now correctly attributed to the agent the user is actually in.
-
-The TUI plugin does **not** `preventDefault` — the default Tab handler still runs, and the TUI's local state changes as before. The plugin only **observes** and forwards.
+Full mechanism (the deferred-picker promotion race, `promptAsync` flush, and `lastSessionAgent` update) is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#tui-agent-tracking).
 
 ## Color behavior
 
@@ -132,7 +144,7 @@ python3 bin/plan-review.py --test
 bun tests/plugin-smoke.ts
 ```
 
-The `plugin/node_modules/` directory is gitignored. Override the path to the helper with `PLAN_REVIEW_SCRIPT=<absolute>` if you're not running from a clone.
+The root `.gitignore` excludes `plugin/node_modules/`, lockfiles, and `__pycache__/`. Override the path to the helper with `PLAN_REVIEW_SCRIPT=<absolute>` if you're not running from a clone.
 
 ## Layout
 

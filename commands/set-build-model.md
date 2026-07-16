@@ -22,13 +22,23 @@ Usage:
 - `/set-build-model <provider>/<model-id>` — set directly, e.g.
   `/set-build-model ya-glm/glm`.
 
-Resolution priority on plan approval:
+Resolution priority on plan approval (first match wins):
 
-1. `/set-build-model` override (this command, in-memory, session-scoped)
-2. `agent.build.model` from `opencode.jsonc`
-3. `config.model` global default
-4. opencode default
+1. `chat.message` memory (build agent) — last picker choice per session
+2. `chat.message` memory (plan agent) — fallback when build agent never picked
+3. `/set-build-model` override (this command, in-memory, session-scoped)
+4. `agent.build.model` from `opencode.jsonc`
+5. `config.model` global default
+6. picker history (`model.json` recent[0])
+7. fallback to plan agent's model
 
-Note: the opencode TUI model picker (Ctrl-X M) is a separate runtime
-mechanism that does not emit a persistent event; this command is the
-text-based counterpart for plugin-internal state.
+This command sits at priority #3 — it overrides the config but is itself
+overridden by any TUI picker choice (chat.message memory). It only takes
+effect when the TUI picker has not been used in this session; any Ctrl-X M
+pick (before or after running this command) wins.
+
+Note: the opencode TUI model picker (Ctrl-X M) changes are captured by the
+TUI-side plugin via model.json watcher and forwarded into chat.message
+memory via session metadata, so they take priority over this command
+(see priority #1-2 above). Use this command only when you need to set a
+model without using the TUI picker.

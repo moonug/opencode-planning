@@ -297,7 +297,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   api.keymap.intercept(
     "key",
-    (input) => {
+    (input: { event: { name?: string; ctrl?: boolean; meta?: boolean; alt?: boolean } }) => {
       const event = input.event as { name?: string; ctrl?: boolean; meta?: boolean; alt?: boolean }
       if (!event || event.ctrl || event.meta || event.alt) return
       const name = event.name

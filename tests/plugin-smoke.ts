@@ -407,6 +407,82 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[36] chat.message memory captures plan-agent pick: ok")
 }
 
+// 36b. chatMessageMemory is per-session — no cross-session model leak.
+//      ONE plugin instance serves two sessions. Each session's chat.message
+//      build-model pick must stay isolated: ses_A gets openai/gpt-a, ses_B
+//      gets anthropic/claude-b. If chatMessageMemory were global (or if a
+//      global file fallback were re-introduced), one session would see the
+//      other's model.
+{
+  const noopEditor = "/tmp/pr-smoke-cross-noop.sh"
+  writeFileSync(noopEditor, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor, 0o755)
+
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    } as any,
+    config: { get: async () => ({ data: {} }) },
+    session: {
+      get: async () => ({ data: {} }),
+      prompt: async (opts: any) => { prompts.push(opts); return {} },
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+
+  // Populate chatMessageMemory for two sessions with different build models
+  await testHooks["chat.message"](
+    { sessionID: "ses_isoA", agent: "build", model: { providerID: "openai", modelID: "gpt-a" } } as any,
+    {},
+  )
+  await testHooks["chat.message"](
+    { sessionID: "ses_isoB", agent: "build", model: { providerID: "anthropic", modelID: "claude-b" } } as any,
+    {},
+  )
+
+  // Session A: exitPlanMode should pick openai/gpt-a (from ses_isoA's chatMessageMemory)
+  prompts.length = 0
+  await testHooks.tool.plan_review.execute(
+    { plan: "isolation test A" },
+    { sessionID: "ses_isoA", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildA = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildA) throw new Error("[36b] ses_A: build prompt missing")
+  if (buildA.body.model?.providerID !== "openai" || buildA.body.model?.modelID !== "gpt-a") {
+    throw new Error(`[36b] ses_A should get openai/gpt-a, got: ${JSON.stringify(buildA.body.model)}`)
+  }
+  if (buildA.body.model?.providerID === "anthropic") {
+    throw new Error("[36b] ses_A LEAKED ses_B's model anthropic/claude-b!")
+  }
+
+  // Session B: exitPlanMode should pick anthropic/claude-b (from ses_isoB's chatMessageMemory)
+  prompts.length = 0
+  await testHooks.tool.plan_review.execute(
+    { plan: "isolation test B" },
+    { sessionID: "ses_isoB", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildB = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildB) throw new Error("[36b] ses_B: build prompt missing")
+  if (buildB.body.model?.providerID !== "anthropic" || buildB.body.model?.modelID !== "claude-b") {
+    throw new Error(`[36b] ses_B should get anthropic/claude-b, got: ${JSON.stringify(buildB.body.model)}`)
+  }
+  if (buildB.body.model?.providerID === "openai") {
+    throw new Error("[36b] ses_B LEAKED ses_A's model openai/gpt-a!")
+  }
+
+  console.log("[36b] chatMessageMemory per-session isolation: ses_A→openai, ses_B→anthropic, no leak: ok")
+}
+
 // 37. chat.message captures per-session, per-agent. Two sessions, two
 //     agents each — ensure chatMessageMemory is keyed correctly.
 //     REMOVED: too granular for the reduced plugin state (single

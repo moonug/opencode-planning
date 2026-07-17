@@ -445,13 +445,12 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   const lastResolution: { target?: ModelRef; source?: string } = {}
   const lastShownModels = new Map<string, ProviderListEntry[]>()
   const chatMessageMemory = new Map<string, Map<string, ModelRef>>()
-  // Reads the TUI's global picker history on demand inside exitPlanMode.
-  // Used as a best-effort fallback when no chat.message has set the
-  // per-session build model. The watcher that used to live here was
-  // removed: model.json is global (not per-workspace), and running
-  // Tool attribution relies on the chat.message hook and TUI plugin's
-  // per-session metadata writes. No model.json reads in the server plugin
-  // — model.json is global and leaks model choices across sessions.
+  // Keyed by sessionID → agent → model. Populated by chat.message hook
+  // (fires for every real and synthetic prompt). exitPlanMode reads this
+  // as its first-priority source. No model.json reads — model.json is
+  // global and leaks model choices across sessions. All model attribution
+  // is per-session: chatMessageMemory (sessionID), buildModels (sessionID),
+  // and session metadata (per-session row written by TUI plugin).
 
   const plan_review = tool({
     description:

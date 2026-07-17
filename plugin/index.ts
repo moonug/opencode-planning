@@ -362,8 +362,8 @@ async function exitPlanMode(
   let source: string
   let target: ModelRef | undefined
   if (fromChat)         { target = fromChat;    source = "chat.message (build)" }
+  else if (overridden)  { target = overridden;  source = "build model memory" }
   else if (fromChatPlan) { target = fromChatPlan; source = "chat.message (plan)" }
-  else if (overridden)  { target = overridden;  source = "/set-build-model" }
   else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
   else if (globalCfg)   { target = globalCfg;   source = "config.model" }
   else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }

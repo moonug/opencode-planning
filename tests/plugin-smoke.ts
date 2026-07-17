@@ -86,17 +86,17 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[4] parseModelString: 7/7 cases ok")
 }
 
-// 5. rememberBuildModel correctly tracks last model per session (any agent)
+// 5. rememberBuildModel correctly tracks last build model per session
 {
   const models = new Map<string, { providerID: string; modelID: string }>()
 
-  // any-agent events populate the map (no agent guard)
+  // plan-agent events are IGNORED (agent filter — Bug 1 fix)
   rememberBuildModel({
     type: "session.updated",
     properties: { info: { id: "s1", agent: "plan", model: { providerID: "ya-glm", id: "glm" } } },
   }, models)
-  if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "ya-glm", modelID: "glm" })) {
-    throw new Error("plan-agent model not remembered")
+  if (models.has("s1")) {
+    throw new Error("plan-agent model should NOT be remembered (agent filter)")
   }
 
   // remember build-agent model
@@ -105,7 +105,16 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     properties: { info: { id: "s1", agent: "build", model: { providerID: "omlx", id: "Ornith" } } },
   }, models)
   if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "omlx", modelID: "Ornith" })) {
-    throw new Error("build-agent model did not overwrite plan-agent model")
+    throw new Error("build-agent model not remembered")
+  }
+
+  // plan-agent events do NOT overwrite build entries
+  rememberBuildModel({
+    type: "session.updated",
+    properties: { info: { id: "s1", agent: "plan", model: { providerID: "wrong", id: "wrong" } } },
+  }, models)
+  if (JSON.stringify(models.get("s1")) !== JSON.stringify({ providerID: "omlx", modelID: "Ornith" })) {
+    throw new Error("plan-agent event overwrote build entry — agent filter broken")
   }
 
   // overwrite with later build-agent model
@@ -483,6 +492,80 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[36b] chatMessageMemory per-session isolation: ses_A→openai, ses_B→anthropic, no leak: ok")
 }
 
+// 36c. Priority: build model memory (rememberBuildModel) beats chat.message (plan).
+//      Scenario: plan agent runs on kimi-k3, build agent was on deepseek.
+//      exitPlanMode must pick deepseek (overridden), NOT kimi-k3 (fromChatPlan).
+//      Also verifies: plan-agent session.updated does NOT leak into buildModels.
+{
+  const noopEditor = "/tmp/pr-smoke-prio-noop.sh"
+  writeFileSync(noopEditor, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor, 0o755)
+
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    } as any,
+    config: { get: async () => ({ data: {} }) },
+    session: {
+      get: async () => ({ data: {} }),
+      prompt: async (opts: any) => { prompts.push(opts); return {} },
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+
+  // 1. Build agent session.updated → rememberBuildModel records deepseek
+  await testHooks.event({
+    event: {
+      type: "session.updated",
+      properties: { info: { id: "ses_prio", agent: "build", model: { providerID: "opencode-go", modelID: "deepseek-v4-flash" } } },
+    },
+  })
+
+  // 2. Plan agent session.updated → must NOT overwrite buildModels (agent filter)
+  await testHooks.event({
+    event: {
+      type: "session.updated",
+      properties: { info: { id: "ses_prio", agent: "plan", model: { providerID: "opencode-go", modelID: "kimi-k3" } } },
+    },
+  })
+
+  // 3. chat.message for plan → chatMessageMemory["plan"] = kimi-k3
+  await testHooks["chat.message"](
+    { sessionID: "ses_prio", agent: "plan", model: { providerID: "opencode-go", modelID: "kimi-k3" } } as any,
+    {},
+  )
+
+  // 4. exitPlanMode — overridden (deepseek) must beat fromChatPlan (kimi-k3)
+  prompts.length = 0
+  await testHooks.tool.plan_review.execute(
+    { plan: "priority test" },
+    { sessionID: "ses_prio", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("[36c] build prompt missing")
+  if (buildPrompt.body?.model?.modelID !== "deepseek-v4-flash") {
+    throw new Error(`[36c] should resolve to deepseek (build model memory), got: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (buildPrompt.body?.model?.modelID === "kimi-k3") {
+    throw new Error("[36c] LEAKED plan's kimi-k3 into build model!")
+  }
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: build model memory")) {
+    throw new Error(`[36c] wrong source label: ${buildPrompt.body?.parts?.[0]?.text}`)
+  }
+
+  console.log("[36c] priority: build model memory (deepseek) beats chat.message plan (kimi-k3): ok")
+}
+
 // 37. chat.message captures per-session, per-agent. Two sessions, two
 //     agents each — ensure chatMessageMemory is keyed correctly.
 //     REMOVED: too granular for the reduced plugin state (single
@@ -792,18 +875,16 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("ds metadata agent=" + dsMetaEntry[0] +
       " does not match defer log agent=" + dsAgentInLog)
   }
-  // After flush the deferred state is cleared — a second session.updated
-  // without a new picker change must NOT re-prompt or re-write metadata.
-  // First call triggers seed+flush (build seeded from default), second
-  // should be no-op.
+  // After flush the deferred state is cleared — subsequent session.updated
+  // events without a new picker change must NOT re-write metadata.
+  // (defaultBuildModel seed removed — no seed to re-flush.)
   updates.length = 0
   for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
     h.fn({ properties: { sessionID: "ses_peragent" } })
   }
   await new Promise((r) => setTimeout(r, 30))
-  // First call seeds build from defaultBuildModel then flushes → 1 update.
-  if (updates.length !== 1) {
-    throw new Error("first session.updated should trigger seed+flush (1 update), got: " + updates.length)
+  if (updates.length !== 0) {
+    throw new Error("session.updated should not re-write metadata after flush. updates=" + updates.length)
   }
   updates.length = 0
   for (const h of eventHandlers.filter((e) => e.type === "session.updated")) {
@@ -1504,7 +1585,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (buildPrompt.body?.model?.providerID !== "ya-glm") throw new Error(`inline model.providerID wrong: ${JSON.stringify(buildPrompt.body?.model)}`)
   if (buildPrompt.body?.model?.modelID !== "glm") throw new Error(`inline model.modelID wrong: ${JSON.stringify(buildPrompt.body?.model)}`)
   if (buildPrompt.body?.noReply !== true) throw new Error("build prompt must have noReply=true")
-  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: /set-build-model")) {
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: build model memory")) {
     throw new Error("build prompt text missing source label: " + buildPrompt.body?.parts?.[0]?.text)
   }
   console.log("[7b] exitPlanMode happy path with inline model+agent: ok")
@@ -1556,8 +1637,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (buildPrompt.body?.model?.providerID !== "ya-glm" || buildPrompt.body?.model?.modelID !== "glm") {
     throw new Error(`build prompt wrong model: ${JSON.stringify(buildPrompt.body?.model)}`)
   }
-  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: /set-build-model")) {
-    throw new Error("build prompt text missing /set-build-model source label")
+  if (!buildPrompt.body?.parts?.[0]?.text?.includes("source: build model memory")) {
+    throw new Error("build prompt text missing build model memory source label")
   }
   console.log("[10] /set-build-model writes Map, exitPlanMode uses it: ok")
 }

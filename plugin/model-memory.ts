@@ -18,5 +18,6 @@ export function rememberBuildModel(event: any, models: Map<string, ModelRef>): v
   const modelID = info?.model?.modelID ?? info?.model?.id
   const sessionID = info?.id ?? info?.sessionID
   if (!sessionID || !info?.model?.providerID || !modelID) return
+  if (info?.agent !== "build") return
   models.set(sessionID, { providerID: info.model.providerID, modelID })
 }

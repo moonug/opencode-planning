@@ -38,7 +38,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     const current = api.route.current
     if (current && current.name === "session") {
       const sid = (current as { params?: { sessionID?: string } }).params?.sessionID
-      if (typeof sid === "string" && sid) return sid
+      if (typeof sid === "string" && sid.startsWith("ses_")) return sid
     }
     return undefined
   }

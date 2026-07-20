@@ -323,10 +323,8 @@ async function exitPlanMode(
         const providerID = (m as any).providerID
         const modelID = (m as any).modelID
         if (typeof providerID !== "string" || typeof modelID !== "string") continue
-        if (!perSession.has(agentName)) {
-          perSession.set(agentName, { providerID, modelID })
-          deferredPromoted++
-        }
+        perSession.set(agentName, { providerID, modelID })
+        deferredPromoted++
       }
       if (deferredPromoted > 0) {
         await log(

@@ -566,6 +566,65 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[36c] priority: build model memory (deepseek) beats chat.message plan (kimi-k3): ok")
 }
 
+// 36d. Promotion overwrites stale chatMessageMemory entry from metadata.
+//      Scenario: previous exitPlanMode sent build prompt with sol →
+//      chat.message set chatMessageMemory["build"]=sol. User then picks
+//      terra via picker → metadata has {build: terra}. exitPlanMode must
+//      OVERWRITE the stale sol with terra from metadata.
+{
+  const noopEditor = "/tmp/pr-smoke-stale-noop.sh"
+  writeFileSync(noopEditor, "#!/bin/sh\nexit 0\n")
+  chmodSync(noopEditor, 0o755)
+
+  const prompts: any[] = []
+  const logs: any[] = []
+  const fakeClient = {
+    app: {
+      log: async (opts: any) => { logs.push(opts) },
+      agents: async () => ({ data: [] }),
+    } as any,
+    config: { get: async () => ({ data: {} }) },
+    session: {
+      get: async () => ({ data: { metadata: { planReviewDeferredPicks: {
+        build: { providerID: "openai", modelID: "gpt-5.6-terra" },
+        _writtenAt: "2026-07-19T20:31:22.665Z",
+      } } } }),
+      prompt: async (opts: any) => { prompts.push(opts); return {} },
+    },
+  }
+  const testHooks = await mod.default({
+    client: fakeClient as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+
+  // Simulate stale chatMessageMemory entry from a previous exitPlanMode
+  await testHooks["chat.message"](
+    { sessionID: "ses_stale", agent: "build", model: { providerID: "openai", modelID: "gpt-5.6-sol" } } as any,
+    {},
+  )
+
+  // exitPlanMode: should promote terra from metadata, OVERWRITING stale sol
+  prompts.length = 0
+  await testHooks.tool.plan_review.execute(
+    { plan: "stale test" },
+    { sessionID: "ses_stale", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+  )
+  const buildPrompt = prompts.find((p: any) => p.body?.agent === "build")
+  if (!buildPrompt) throw new Error("[36d] build prompt missing")
+  if (buildPrompt.body?.model?.modelID !== "gpt-5.6-terra") {
+    throw new Error(`[36d] should resolve to terra (from metadata), got: ${JSON.stringify(buildPrompt.body?.model)}`)
+  }
+  if (buildPrompt.body?.model?.modelID === "gpt-5.6-sol") {
+    throw new Error("[36d] stale sol was NOT overwritten by terra from metadata!")
+  }
+
+  console.log("[36d] promotion overwrites stale chatMessageMemory from metadata: sol→terra: ok")
+}
+
 // 37. chat.message captures per-session, per-agent. Two sessions, two
 //     agents each — ensure chatMessageMemory is keyed correctly.
 //     REMOVED: too granular for the reduced plugin state (single

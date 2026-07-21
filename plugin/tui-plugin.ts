@@ -5,12 +5,17 @@ import type {
 } from "@opencode-ai/plugin/tui"
 import type { Event } from "@opencode-ai/sdk/v2"
 
+// solid-js is available inside opencode's TUI process but not in our
+// project's node_modules. Dynamic import with fallback to model.json.
+let solidGetOwner: (() => any) | undefined
+try { solidGetOwner = require("solid-js").getOwner } catch { /* not available in smoke tests */ }
+
 // Build-time markers. Bump BUILD_TAG when this file changes in a way that
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
 const VERSION = "0.1.8"
-const BUILD_TAG = "local-only-picker-v1"
+const BUILD_TAG = "tab-snapshot-v1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app
@@ -101,9 +106,78 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // the agent that was active when the pick was made.
   const lastPickedModels = new Map<string, { providerID: string; modelID: string }>()
 
+  // lastSeenModel tracks the model.json recent[0] value at the last Tab.
+  // Change detection: only record for prevAgent if the model actually
+  // changed since the last Tab (prevents stale overwrites when the user
+  // Tabs without changing the model).
+  let lastSeenModel = ""
+  let getOwnerAvailable: boolean | null = null
+
+  // Load fs once at init — used for model.json reads on Tab
+  let fsModule: typeof import("node:fs") | undefined
+  const getFs = (): typeof import("node:fs") | undefined => {
+    if (!fsModule) {
+      try { fsModule = require("node:fs") } catch { /* not available */ }
+    }
+    return fsModule
+  }
+
+  // Initialize lastSeenModel from model.json at startup
+  try {
+    const stateDir = api.state?.path?.state
+    if (stateDir && typeof stateDir === "string") {
+      const fs = getFs()
+      if (fs) {
+        const raw = fs.readFileSync(`${stateDir}/model.json`, "utf8")
+        const parsed = JSON.parse(raw) as { recent?: Array<{ providerID?: string; modelID?: string }> }
+        const first = Array.isArray(parsed.recent) ? parsed.recent[0] : undefined
+        if (first?.providerID && first?.modelID) {
+          lastSeenModel = `${first.providerID}/${first.modelID}`
+        }
+      }
+    }
+  } catch {
+    // model.json may not exist on a fresh install — fine.
+  }
+
+  // readLocalModel tries to access the TUI's internal modelStore via
+  // Solid's reactive Owner chain. getOwner() returns the current
+  // reactive scope; walking up the owner chain finds ancestor contexts
+  // including LocalProvider which holds modelStore.model[agentName].
+  // Returns { model, agentName } or undefined if not inside a reactive
+  // scope (keymap handler may run outside Solid's tree).
+  const readLocalModel = (): { providerID: string; modelID: string; agentName: string } | undefined => {
+    if (!solidGetOwner) return undefined
+    const owner = solidGetOwner()
+    if (getOwnerAvailable === null) {
+      getOwnerAvailable = owner !== null
+      logInfo(api, `plan-review-TUI: getOwner available=${getOwnerAvailable}`)
+    }
+    if (!owner) return undefined
+    let o: any = owner
+    let depth = 0
+    while (o && depth < 30) {
+      const ctx = o.context
+      if (ctx instanceof Map && ctx.size > 0) {
+        for (const val of ctx.values()) {
+          if (val && typeof val === "object" && typeof (val as any).model?.current === "function") {
+            const model = (val as any).model.current()
+            const agent = (val as any).agent?.current?.()
+            if (model?.providerID && model?.modelID && typeof agent?.name === "string") {
+              return { providerID: model.providerID, modelID: model.modelID, agentName: agent.name }
+            }
+          }
+        }
+      }
+      o = o.owner
+      depth++
+    }
+    return undefined
+  }
+
   logInfo(
     api,
-    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG}`,
+    `plan-review-TUI: ready sessionID=${sessionID ?? "none"} prevAgent=${prevAgent ?? "?"} build=${BUILD_TAG} lastSeenModel=${lastSeenModel || "<none>"}`,
   )
 
   const computeNext = (current: string | undefined, direction: 1 | -1): string | undefined => {
@@ -251,10 +325,44 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       if (name !== "tab" && name !== "shift+tab") return
       // Tab works at home too (no session yet) so the user can switch
       // agents and pick models per agent before opening a session.
-      // refresh() is a no-op without a sessionID, so we fall through
-      // and computeNext/forward still work — the only field that
-      // needs to stay current is prevAgent itself.
       refresh()
+
+      // Snapshot the model for prevAgent BEFORE switching away.
+      // Two strategies: Solid getOwner (exact per-agent from modelStore)
+      // or model.json read (global recent[0] with change detection).
+      const localModel = readLocalModel()
+      if (localModel && prevAgent) {
+        // getOwner path: read EXACT per-agent model from modelStore
+        lastPickedModels.set(prevAgent, { providerID: localModel.providerID, modelID: localModel.modelID })
+        lastSeenModel = `${localModel.providerID}/${localModel.modelID}`
+        logInfo(api, `plan-review-TUI: model snapshot (getOwner) agent=${prevAgent} model=${localModel.providerID}/${localModel.modelID}`)
+      } else if (prevAgent) {
+        // Fallback: read model.json recent[0] with change detection.
+        // Only record if the model changed since last Tab — prevents
+        // stale overwrites when the user Tabs without picking.
+        try {
+          const stateDir = api.state?.path?.state
+          if (stateDir && typeof stateDir === "string") {
+            const fs = getFs()
+            if (fs) {
+              const raw = fs.readFileSync(`${stateDir}/model.json`, "utf8")
+              const parsed = JSON.parse(raw) as { recent?: Array<{ providerID?: string; modelID?: string }> }
+              const first = Array.isArray(parsed.recent) ? parsed.recent[0] : undefined
+              if (first?.providerID && first?.modelID) {
+                const currentModel = `${first.providerID}/${first.modelID}`
+                if (currentModel !== lastSeenModel) {
+                  lastPickedModels.set(prevAgent, { providerID: first.providerID, modelID: first.modelID })
+                  logInfo(api, `plan-review-TUI: model snapshot (model.json) agent=${prevAgent} model=${currentModel}`)
+                }
+                lastSeenModel = currentModel
+              }
+            }
+          }
+        } catch {
+          // model.json may not exist — skip
+        }
+      }
+
       const direction: 1 | -1 = name === "tab" ? 1 : -1
       const next = computeNext(prevAgent, direction)
       const sid = getActiveSessionID() ?? sessionID
@@ -273,135 +381,18 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     { priority: -1 },
   )
 
-  // Watch the global picker file (model.json) inside the TUI process.
-  // The server plugin's fs.watch was removed because model.json is shared
-  // by every opencode instance and produced duplicate `matched agent=X`
-  // log lines whenever more than one was running (e.g. a long-lived
-  // `opencode serve` under plannotator plus every TUI attach). Watchers
-  // in TUI process are scoped to that one renderer's session, so the
-  // picker change can be forwarded with that agent attached — and the
-  // server-side chat.message hook will write it into chatMessageMemory
-  // keyed by (sessionID, agent).
-  //
-  // The TUI host exposes api.state.path.state which is the directory that
-  // model.json lives in (default: ~/.local/state/opencode). Watching
-  // here is supported because fs is a node:fs primitive available inside
-  // any bun/Node host that the TUI plugin runs in.
-  const stateDir = api.state?.path?.state
-  if (stateDir && typeof stateDir === "string") {
-    let lastModelJSON = ""
-    const modelJsonPath = `${stateDir}/model.json`
-    let watcher: ReturnType<typeof import("node:fs").watch> | undefined
-    try {
-      // Load node:fs dynamically — it's a stdlib dep that the plugin
-      // runtime already uses elsewhere (the server plugin imports from
-      // it directly).
-      const fs = await import("node:fs")
-      // Initialise lastModelJSON so the first watcher tick (which fires
-      // once for fs.watch default behaviour on some platforms) doesn't
-      // treat the start state as a "change".
-      try {
-        lastModelJSON = fs.readFileSync(modelJsonPath, "utf8")
-      } catch {
-        lastModelJSON = ""
-      }
-      watcher = fs.watch(modelJsonPath, { persistent: false }, () => {
-        // Fires on every model.json mtime change. We only act when the
-        // file content actually differs from the last snapshot — saves
-        // the duplicate "change" events fs.watch emits when writes
-        // touch atime too.
-        try {
-          const raw = fs.readFileSync(modelJsonPath, "utf8")
-          if (raw === lastModelJSON) return
-          lastModelJSON = raw
-          let picked: { providerID: string; modelID: string } | undefined
-          try {
-            const parsed = JSON.parse(raw) as {
-              recent?: Array<{ providerID?: string; modelID?: string }>
-            }
-            const first = Array.isArray(parsed.recent) ? parsed.recent[0] : undefined
-            if (first && typeof first.providerID === "string" && typeof first.modelID === "string") {
-              picked = { providerID: first.providerID, modelID: first.modelID }
-            }
-          } catch {}
-          if (!picked) return
-          const sid = getActiveSessionID()
-          if (!sid) {
-            // Home-screen picker: stash the choice keyed by the agent
-            // that was active when the pick was made (prevAgent tracks
-            // Tab/Shift+Tab in real time via refresh() above). Multiple
-            // agents can stage picks before any session exists; refresh()
-            // flushes them all in one go on first session.updated.
-            const agentKey = prevAgent ?? primaryAgents[0]
-            if (!agentKey) {
-              logInfo(api, `plan-review-TUI: picker skipped reason=no-agent`)
-              return
-            }
-            lastPickedModels.set(agentKey, picked)
-            logInfo(
-              api,
-              `plan-review-TUI: picker deferred agent=${agentKey} model=${picked.providerID}/${picked.modelID} reason=no-session totalDeferred=${lastPickedModels.size}`,
-            )
-            return
-          }
-          refresh()
-          if (!prevAgent) {
-            // Fall back to the first primary agent — mirrors local.agent
-            // fallback in packages/tui/src/context/local.tsx:97.
-            prevAgent = primaryAgents[0]
-            if (!prevAgent) {
-              logInfo(api, `plan-review-TUI: picker skipped reason=no-agent`)
-              return
-            }
-            logInfo(api, `plan-review-TUI: picker using default agent=${prevAgent}`)
-          }
-          logInfo(
-            api,
-            `plan-review-TUI: picker changed agent=${prevAgent} model=${picked.providerID}/${picked.modelID} sessionID=${sid}`,
-          )
-          // Mid-session picker change: write to session.metadata so
-          // server-plugin's exitPlanMode can pick it up. No prompt()
-          // call — that would create a visible "." synthetic
-          // message in the session. Metadata write is the only path
-          // the user wants to see.
-          void writeDeferredToMetadata(sid, { [prevAgent]: picked })
-        } catch (e) {
-          void api.client.app
-            .log({
-              service: "plan-review-tui",
-              level: "warn",
-              message: `plan-review-TUI: model.json watcher failed: ${(e as Error)?.message ?? String(e)}`,
-            })
-            .catch(() => {})
-        }
-      })
-    } catch (e) {
-      void api.client.app
-        .log({
-          service: "plan-review-tui",
-          level: "warn",
-          message: `plan-review-TUI: model.json watcher init failed: ${(e as Error)?.message ?? String(e)}`,
-        })
-        .catch(() => {})
-    }
-
-    if (watcher) {
-      logInfo(api, `plan-review-TUI: watcher ready path=${modelJsonPath} initialBytes=${lastModelJSON.length}`)
-      api.lifecycle.onDispose(() => {
-        try {
-          watcher!.close()
-        } catch {}
-      })
-    } else {
-      logInfo(api, `plan-review-TUI: no watcher (stateDir=${stateDir ?? "?"})`)
-    }
-  }
+  // model.json watcher REMOVED. It fired in ALL TUI instances
+  // simultaneously (model.json is global), causing cross-session
+  // contamination: each instance attributed the same model change
+  // to its own prevAgent. Replaced with Tab-based snapshot that
+  // reads model.json (or modelStore via getOwner) only on Tab —
+  // a per-instance event with no contamination.
 
   api.lifecycle.onDispose(() => {
     for (const off of subs) {
       try {
         off()
-      } catch {}
+      } catch (e) { console.error(`plan-review-TUI: dispose sub failed: ${(e as Error)?.message ?? String(e)}`) }
     }
   })
 }

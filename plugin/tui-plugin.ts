@@ -6,7 +6,9 @@ import type {
 import type { Event } from "@opencode-ai/sdk/v2"
 
 // solid-js is available inside opencode's TUI process but not in our
-// project's node_modules. Dynamic import with fallback to model.json.
+// project's node_modules. Try require() first (fast, sync), then fall
+// back to dynamic import() (async, resolves bundled modules in Bun).
+// If both fail, model.json fallback is used.
 let solidGetOwner: (() => any) | undefined
 try { solidGetOwner = require("solid-js").getOwner } catch { /* not available in smoke tests */ }
 
@@ -138,6 +140,21 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   } catch {
     // model.json may not exist on a fresh install — fine.
+  }
+
+  // Record startup model for prevAgent (default: build).
+  // This is the model the user sees on screen when opencode opens.
+  // Without this, plan-mode sessions have no build model and fall
+  // through to plan's model. No watcher — one-time read, no
+  // continuous contamination.
+  if (prevAgent && lastSeenModel) {
+    const slashIdx = lastSeenModel.indexOf("/")
+    if (slashIdx > 0) {
+      const providerID = lastSeenModel.slice(0, slashIdx)
+      const modelID = lastSeenModel.slice(slashIdx + 1)
+      lastPickedModels.set(prevAgent, { providerID, modelID })
+      logInfo(api, `plan-review-TUI: startup model snapshot agent=${prevAgent} model=${lastSeenModel}`)
+    }
   }
 
   // readLocalModel tries to access the TUI's internal modelStore via

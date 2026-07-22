@@ -1295,8 +1295,15 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await new Promise(r => setTimeout(r, 30))
   if (!handlerFn) throw new Error("intercept handler not registered")
 
+  // Startup model snapshot should have fired at init
+  const startupSnap = logs.find((l: any) => l.message?.includes("startup model snapshot"))
+  if (!startupSnap) throw new Error("[46] startup model snapshot missing. logs: " + logs.map((l:any)=>l.message).join("\n"))
+  if (!startupSnap.message.includes("agent=build")) throw new Error("[46] startup snapshot should be for build. got: " + startupSnap.message)
+  if (!startupSnap.message.includes("gpt-5.6")) throw new Error("[46] startup snapshot should have gpt-5.6. got: " + startupSnap.message)
+
   // First Tab: model.json UNCHANGED from startup → should NOT snapshot
   // (change detection: lastSeenModel was initialized at startup)
+  logs.length = 0
   handlerFn({ event: { name: "tab" } })
   await new Promise(r => setTimeout(r, 30))
   const snap0 = logs.find((l: any) => l.message?.includes("model snapshot"))

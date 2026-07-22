@@ -159,7 +159,7 @@ function log(client: any, level: "debug" | "info" | "warn" | "error", message: s
 }
 
 // logged() — fire-and-forget variant of log() that never swallows an
-// error silently. Per AGENTS.md: `catch {}` — нельзя. This is the only
+// error silently. Per AGENTS.md: `catch {}` is forbidden. This is the only
 // place in this file where a catch is allowed to fail open — it routes
 // the failure through console.error so it lands in terminal stderr
 // even when the server log API is unreachable.

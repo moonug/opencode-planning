@@ -1,8 +1,8 @@
 # AGENTS.md
 
-## Ошибки
+## Errors
 
-- `catch {}` — нельзя. Пустой catch глотает ошибки и превращает дебаг в ад. Как минимум логируй, кидай дальше, или объясни комментом почему намеренно игнорируешь.
+- `catch {}` — forbidden. Empty catch swallows errors and turns debugging into hell. At minimum: log it, rethrow, or add a comment explaining why it's intentionally ignored.
 
 ## opencode plugin architecture
 

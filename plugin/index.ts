@@ -17,13 +17,12 @@ function homedir(): string {
 import { rememberBuildModel, type ModelRef } from "./model-memory"
 
 const PLUGIN_DIR = dirname(new URL(import.meta.url).pathname)
-const REPO_DIR = resolve(PLUGIN_DIR, "..")
 const SCRIPT_PATH =
-  process.env.PLAN_REVIEW_SCRIPT ?? join(REPO_DIR, "bin", "plan-review.py")
+  process.env.PLAN_REVIEW_SCRIPT ?? join(PLUGIN_DIR, "bin", "plan-review.py")
 const COMMAND_SOURCES = [
-  join(REPO_DIR, "commands", "plan-review.md"),
-  join(REPO_DIR, "commands", "set-build-model.md"),
-  join(REPO_DIR, "commands", "plan-diag.md"),
+  join(PLUGIN_DIR, "commands", "plan-review.md"),
+  join(PLUGIN_DIR, "commands", "set-build-model.md"),
+  join(PLUGIN_DIR, "commands", "plan-diag.md"),
 ]
 
 const FEEDBACK_HEADER =
@@ -90,7 +89,7 @@ function ensureCommandSymlink(): void {
   // We now write only tui.jsonc (and migrate any old tui.json by
   // reading from it but writing to tui.jsonc).
   try {
-    const tuiPluginPath = join(REPO_DIR, "plugin", "tui-plugin.ts")
+    const tuiPluginPath = join(PLUGIN_DIR, "tui-plugin.ts")
     const tuiJsonPath = join(homedir(), ".config", "opencode", "tui.jsonc")
     const tuiJsonLegacy = join(homedir(), ".config", "opencode", "tui.json")
     // Always remove a legacy symlink at ~/.config/opencode/plugins/
@@ -148,7 +147,7 @@ function runPlanReview($: any, planText: string): Promise<string> {
   // $.escape() never touches the markdown content (backticks, $,
   // etc.). The helper reads the file, opens it in $EDITOR, diffs,
   // and prints the result on stdout.
-  const tmpPath = join(REPO_DIR, ".plan-review-tmp.md")
+  const tmpPath = join(import.meta.dirname ?? ".", ".plan-review-tmp.md")
   writeFileSync(tmpPath, planText, "utf8")
   const promise = $`${SCRIPT_PATH} --file ${$.escape(tmpPath)}`.text()
   promise.then(() => { try { unlinkSync(tmpPath) } catch {} }, () => { try { unlinkSync(tmpPath) } catch {} })
@@ -427,7 +426,7 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 }
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
-  await log(client, "info", "plan-review: plugin init v0.1.8 build=local-only-picker-v1").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
+  await log(client, "info", "plan-review: plugin init v0.2.0 build=v0.2.0").catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
   await log(client, "info", `plan-review: argv0=${(process.argv[1] ?? "unknown").split("/").slice(-3).join("/")}`).catch((e: unknown) => { console.error(`plan-review: log(argv0) failed: ${(e as Error)?.message ?? String(e)}`) })
 
   if (!existsSync(SCRIPT_PATH)) {

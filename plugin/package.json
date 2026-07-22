@@ -1,21 +1,38 @@
 {
   "name": "opencode-plan-review",
-  "version": "0.1.0",
-  "description": "opencode plugin: review plans in $EDITOR, return diff to the model",
+  "version": "0.2.0",
+  "description": "opencode plugin: review plans in $EDITOR with per-agent model tracking",
   "type": "module",
   "main": "index.ts",
   "exports": {
     ".": "./index.ts",
     "./tui": "./tui-plugin.ts"
   },
+  "files": [
+    "index.ts",
+    "tui-plugin.ts",
+    "model-memory.ts",
+    "bin/",
+    "commands/",
+    "README.md"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "keywords": [
+    "opencode",
+    "plan",
+    "review",
+    "plugin",
+    "agent",
+    "model-tracking"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moonug/opencode-planning"
+  },
   "dependencies": {
     "@opencode-ai/plugin": "*"
-  },
-  "devDependencies": {
-    "@types/node": "^26.0.1",
-    "typescript": "*"
   }
 }

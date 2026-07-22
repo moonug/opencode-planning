@@ -16,8 +16,8 @@ try { solidGetOwner = require("solid-js").getOwner } catch { /* not available in
 // must be observable across runs — Bun caches plugin module imports so the
 // only reliable way to confirm the new code is loaded is to log the marker
 // at startup and compare.
-const VERSION = "0.2.0"
-const BUILD_TAG = "v0.2.0"
+const VERSION = "0.2.1"
+const BUILD_TAG = "v0.2.1"
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
   void api.client.app

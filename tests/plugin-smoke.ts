@@ -671,13 +671,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
   const loaded = logs.find((l: any) => l.message?.includes("plugin loaded"))
-  if (!loaded?.message?.includes("v0.2.0")) {
-    throw new Error("TUI init log missing v0.2.0 marker, got: " + loaded?.message)
+  if (!loaded?.message?.includes("v0.2.1")) {
+    throw new Error("TUI init log missing v0.2.1 marker, got: " + loaded?.message)
   }
-  if (!loaded?.message?.includes("build=v0.2.0")) {
+  if (!loaded?.message?.includes("build=v0.2.1")) {
     throw new Error("TUI init log missing build marker, got: " + loaded?.message)
   }
-  console.log("[38b] TUI plugin logs v0.2.0 build=v0.2.0: ok")
+  console.log("[38b] TUI plugin logs v0.2.1 build=v0.2.1: ok")
 }
 
 // 38c. TUI plugin: prevAgent defaults to first primary agent when no
@@ -1712,11 +1712,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   })
   const initLog = logs.find((l: any) => l.body?.level === "info" && /^plan-review: plugin init v\d+\.\d+\.\d+ build=/.test(l.body?.message ?? ""))
   if (!initLog) throw new Error("init log 'plan-review: plugin init v' missing")
-  if (!initLog.body.message.includes("v0.2.0")) {
-    throw new Error("init log must include v0.2.0 build marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("v0.2.1")) {
+    throw new Error("init log must include v0.2.1 build marker, got: " + initLog.body.message)
   }
-  if (!initLog.body.message.includes("build=v0.2.0")) {
-    throw new Error("init log must include build=v0.2.0 marker, got: " + initLog.body.message)
+  if (!initLog.body.message.includes("build=v0.2.1")) {
+    throw new Error("init log must include build=v0.2.1 marker, got: " + initLog.body.message)
   }
   const toolLog = logs.find((l: any) => l.body?.level === "info" && l.body?.message?.includes("tool 'plan_review' created"))
   if (!toolLog) throw new Error("tool registration log missing")

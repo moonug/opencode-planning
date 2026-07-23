@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify tarball contents
         run: |
-          pkg=$(npm pack --dry-run 2>&1)
+          pkg=$(npm pack --dry-run --json 2>/dev/null)
           echo "$pkg"
           echo "$pkg" | grep -q "LICENSE" || { echo "LICENSE missing from tarball"; exit 1; }
           echo "$pkg" | grep -q "tui-plugin.tsx" || { echo "tui-plugin.tsx missing from tarball"; exit 1; }

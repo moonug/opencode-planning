@@ -12,7 +12,7 @@ Adapted from the Claude Code `planning` plugin in [`umputun/cc-thingz`](https://
 
 - Registers a `plan_review` tool the model calls when the plan is ready
 - Rewrites `plan_exit` / `ExitPlanMode` references in system prompts → `plan_review` so the model always calls the right tool
-- Opens the plan in `$EDITOR` (cascade: tmux popup → kitty overlay → wezterm split → `code -w` / `cursor -w` → blocking spawn)
+- Opens the plan in `$EDITOR` (cascade: agterm → tmux → zellij → kitty → wezterm → ghostty → `code -w` / `cursor -w` → blocking spawn)
 - Computes a unified diff (Python `difflib`); the diff becomes the model's next user message
 - When the user closes the editor without changes: auto-switches from plan agent to build agent on a per-session build model
 - Slash commands: `/plan-review <file>`, `/set-build-model [provider/model | N]`, `/plan-diag [reset]`
@@ -20,7 +20,7 @@ Adapted from the Claude Code `planning` plugin in [`umputun/cc-thingz`](https://
 ## Requirements
 
 - **Python 3.x** — stdlib only
-- **Terminal overlay** (optional): `tmux`, `kitty`, or `wezterm`. Falls back to plain `$EDITOR` (e.g. `vim`) on bare ssh.
+- **Terminal overlay** (optional): `agtermctl`, `tmux`, `zellij`, `kitty`, `wezterm`, or `ghostty`. Falls back to plain `$EDITOR` on bare ssh.
 
 ## Install
 
@@ -34,14 +34,14 @@ Add to `~/.config/opencode/opencode.jsonc`:
 
 Restart opencode. The plugin self-installs on first load:
 - **`commands/*.md`** — symlinked into `~/.config/opencode/commands/`
-- **TUI plugin** — auto-registered into `~/.config/opencode/tui.jsonc` (tracks Tab agent switches + model snapshots)
+- **TUI plugin** — auto-registered into `~/.config/opencode/tui.jsonc` (tracks the fork's native per-session selection state and adds an `Agent models` sidebar block)
 - **`bin/plan-review.py`** — Python helper, resolved from the package directory. `chmod +x` applied if needed.
 
 ## Build-model resolution
 
 When a plan is approved, the session switches to the build agent. The build model is resolved per-session in this order (first match wins):
 
-1. **chat.message memory (build)** — model promoted from TUI metadata snapshots (Tab or startup)
+1. **chat.message memory (build)** — model captured directly or promoted from native TUI selection metadata
 2. **build model memory** — `rememberBuildModel` from `session.updated` events (agent-filtered: only `agent === "build"`)
 3. **chat.message memory (plan)** — fallback when no build-specific model is known
 4. **`agent.build.model`** — from opencode config
@@ -52,24 +52,22 @@ If none resolve, the plugin refuses the auto-switch and prints instructions. Use
 
 ### How model tracking works
 
-The TUI's per-agent model store (`modelStore.model[agentName]`) is in-memory and not exposed to plugins. The plugin bridges this with two mechanisms — both per-instance, no cross-session contamination:
+The [opencode fork](https://github.com/moonug/opencode/tree/tui-selection-events) exposes `api.state.selection()` and `tui.selection.changed`. At startup and on each event, the TUI plugin serializes a per-session metadata read-modify-write for the current plan/build models. It also shows a compact `Agent models` sidebar block with status-dot highlighting.
 
-- **Startup snapshot** — reads `model.json` once at TUI init, records it for the default agent (build). This is the model the user sees on screen when opencode opens.
-- **Tab snapshot** — on Tab, reads `model.json` with change detection: only records if the model changed since the last Tab. Attributed to `prevAgent` (the agent being tabbed away from).
-
-Snapshots are written to session metadata via `session.update`. The server plugin's `exitPlanMode` reads them back at plan-approval time.
-
-No `model.json` watcher — a global watcher fired in all opencode instances simultaneously, causing cross-session model contamination. Removed in v0.2.0.
+Published plugin types do not yet include this additive API, so the plugin uses feature detection. On stock opencode it logs a safe fallback and relies on the server-side `chat.message` hook; it never reads global `model.json` or guesses from Tab presses. This prevents cross-session contamination.
 
 ## Editor cascade
 
 | Priority | Condition | How |
 |---|---|---|
-| 1 | `$TMUX` set, `tmux` on PATH | `tmux display-popup -E -w 90% -h 90%` |
-| 2 | `$KITTY_LISTEN_ON` set, `kitty` on PATH | `kitty @ launch --type=overlay` + sentinel file |
-| 3 | `$WEZTERM_PANE` set, `wezterm` on PATH | `wezterm cli split-pane` + sentinel file |
-| 4 | `$EDITOR` is `code` / `cursor` / `subl` | spawn with `-w` (blocks until GUI closes) |
-| 5 | otherwise | `subprocess.run([$EDITOR, file])` (works on ssh with vim) |
+| 1 | `$AGTERM_SESSION_ID` set, `agtermctl` on PATH | `agtermctl session overlay open` (blocks natively) |
+| 2 | `$TMUX` set, `tmux` on PATH | `tmux display-popup -E -w 90% -h 90%` |
+| 3 | `$ZELLIJ` set, `zellij` on PATH | `zellij run --floating` + sentinel file |
+| 4 | `$KITTY_LISTEN_ON` set, `kitty` on PATH | `kitty @ launch --type=overlay` + sentinel file |
+| 5 | `$WEZTERM_PANE` set, `wezterm` on PATH | `wezterm cli split-pane` + sentinel file |
+| 6 | `ghostty` on PATH | blocking spawn with `--command` |
+| 7 | `$EDITOR` is `code` / `cursor` / `subl` | spawn with `-w` (blocks until GUI closes) |
+| 8 | otherwise | `subprocess.run([$EDITOR, file])` (blocks, works on ssh) |
 
 If `$EDITOR` is unset: `$VISUAL` → `micro` → `nano` → `vi`.
 
@@ -91,7 +89,7 @@ cd plugin
 npm install
 python3 bin/plan-review.py --test
 cd ..
-EDITOR=/dev/null bun tests/plugin-smoke.ts
+EDITOR=true bun ../tests/plugin-smoke.ts
 ```
 
 Override the helper path with `PLAN_REVIEW_SCRIPT=<absolute>` if not running from a clone.
@@ -102,7 +100,7 @@ Override the helper path with `PLAN_REVIEW_SCRIPT=<absolute>` if not running fro
 opencode-planning/
 ├── plugin/                        # npm package root
 │   ├── index.ts                   # server plugin (tool + hooks)
-│   ├── tui-plugin.ts              # TUI plugin (Tab snapshot + model tracking)
+│   ├── tui-plugin.tsx             # Native selection tracking + sidebar block
 │   ├── model-memory.ts            # rememberBuildModel (agent-filtered)
 │   ├── package.json
 │   ├── bin/plan-review.py         # Python helper (stdlib only)

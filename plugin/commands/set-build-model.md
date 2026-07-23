@@ -24,21 +24,20 @@ Usage:
 
 Resolution priority on plan approval (first match wins):
 
-1. `chat.message` memory (build agent) — last picker choice per session
-2. `chat.message` memory (plan agent) — fallback when build agent never picked
-3. `/set-build-model` override (this command, in-memory, session-scoped)
+1. `chat.message` memory (build agent) — last model used by the build
+   agent in this session, captured directly or promoted from native TUI
+   selection metadata
+2. `/set-build-model` override (this command, in-memory, session-scoped)
+3. `chat.message` memory (plan agent) — fallback when build agent never
+   picked
 4. `agent.build.model` from `opencode.jsonc`
 5. `config.model` global default
-6. picker history (`model.json` recent[0])
-7. fallback to plan agent's model
+6. `agent.plan.model` (last resort)
 
-This command sits at priority #3 — it overrides the config but is itself
-overridden by any TUI picker choice (chat.message memory). It only takes
-effect when the TUI picker has not been used in this session; any Ctrl-X M
-pick (before or after running this command) wins.
+This command sits at priority #2 — it overrides the config but is itself
+overridden by any TUI model picker choice recorded for the build agent,
+or by a later build prompt.
 
-Note: the opencode TUI model picker (Ctrl-X M) changes are captured by the
-TUI-side plugin via model.json watcher and forwarded into chat.message
-memory via session metadata, so they take priority over this command
-(see priority #1-2 above). Use this command only when you need to set a
-model without using the TUI picker.
+Note: the fork's TUI plugin tracks `api.state.selection()` and
+`tui.selection.changed`. Stock opencode falls back safely to
+`chat.message`; neither path reads global `model.json`.

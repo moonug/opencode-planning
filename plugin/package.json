@@ -1,19 +1,20 @@
 {
   "name": "opencode-plan-review",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "opencode plugin: review plans in $EDITOR with per-agent model tracking",
   "type": "module",
   "main": "index.ts",
   "exports": {
     ".": "./index.ts",
-    "./tui": "./tui-plugin.ts"
+    "./tui": "./tui-plugin.tsx"
   },
   "files": [
     "index.ts",
-    "tui-plugin.ts",
+    "tui-plugin.tsx",
     "model-memory.ts",
     "bin/",
     "commands/",
+    "LICENSE",
     "README.md"
   ],
   "scripts": {
@@ -33,6 +34,13 @@
     "url": "https://github.com/moonug/opencode-planning"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opentui/solid": "0.4.5",
+    "@opencode-ai/plugin": "*",
+    "jsonc-parser": "^3.3.1",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
   }
 }

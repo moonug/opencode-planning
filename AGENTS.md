@@ -14,15 +14,15 @@
 - **`chat.message` hook**: the only reliable server-side hook for per-session tracking. The `event` hook drops `session.*` events (filtered at `packages/opencode/src/plugin/index.ts:252`).
 - **`config` hook**: can inject into `experimental.primary_tools` and set per-agent `permission` (e.g., `plan_review: "allow"` for plan, `"deny"` for build).
 
-## model.json is global
+## Native TUI selection
 
-`~/.local/state/opencode/model.json` stores only `recent[]`, `favorite[]`, `variant{}` — NOT per-agent models. `modelStore.model[agentName]` is in-memory only, inside a SolidJS `createSimpleContext` closure, inaccessible from plugin API.
+The fork adds `api.state.selection()` and the local `tui.selection.changed` event. Use a small additive local type plus feature detection until published `@opencode-ai/plugin` types catch up.
 
-Every TUI instance watches the same `model.json`. A watcher fires in ALL instances simultaneously, causing cross-session model contamination. Solution: Tab-based snapshot (Tab is per-instance, reads model.json once with change detection — no contamination).
+Persist plan/build selections only for `ses_` IDs through serialized session metadata read-modify-writes. Never read global `model.json`, intercept Tab, or infer pending model picks. When the native API is absent, log the fallback and rely on `chat.message`.
 
 ## Version centralization
 
-`require("./package.json").version` works in Bun ESM modules. Version lives only in `plugin/package.json`. Both `index.ts` and `tui-plugin.ts` read it at runtime. Tests read `EXPECTED_VERSION` from the same file.
+`require("./package.json").version` works in Bun ESM modules. Version lives only in `plugin/package.json`. Both `index.ts` and `tui-plugin.tsx` read it at runtime. Tests read `EXPECTED_VERSION` from the same file.
 
 ## npm publishing
 

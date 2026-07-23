@@ -6,7 +6,8 @@ the editor-overlay cascade, sentinel-file pattern, difflib-based diff, and
 temp-file lifecycle ported verbatim; the PreToolUse JSON protocol was removed
 because opencode has no equivalent hook.
 
-opens plan markdown in $EDITOR via terminal overlay (tmux / kitty / wezterm)
+opens plan markdown in $EDITOR via terminal overlay (agterm -> tmux -> zellij ->
+herdr -> kitty -> wezterm -> ghostty -> cmux -> iTerm2 -> emacs vterm -> blocking)
 or blocking spawn (plain ssh terminal), waits for the user to edit, computes
 a unified diff, prints it to stdout. opencode plugin reads stdout as the
 model's feedback.
@@ -25,15 +26,22 @@ stdout contract:
   - internal error  -> message on stderr, exit nonzero
 
 editor cascade (first match wins):
-  1. tmux             ($TMUX)              -> tmux display-popup -E (native block)
-  2. kitty            ($KITTY_LISTEN_ON)   -> remote-control overlay + sentinel
-  3. wezterm          ($WEZTERM_PANE)      -> split-pane + sentinel
-  4. code / cursor    ($EDITOR matches)    -> spawn with -w (blocks until GUI close)
-  5. blocking spawn   (fallback)           -> $EDITOR with stdio=inherit, blocks until exit
+  1. agterm      ($AGTERM_SESSION_ID)  -> agtermctl overlay (native block)
+  2. tmux        ($TMUX)               -> tmux display-popup -E (native block)
+  3. zellij      ($ZELLIJ)             -> floating pane + sentinel
+  4. kitty       ($KITTY_LISTEN_ON)    -> remote-control overlay + sentinel
+  5. wezterm     ($WEZTERM_PANE)       -> split-pane + sentinel
+  6. ghostty     (on PATH)             -> blocking spawn with --command
+  7. blocking fallback                   $EDITOR with stdio=inherit, blocks until exit
+  (upstream plugin supports herdr, cmux, iTerm2, emacs vterm via bash launcher)
 
 requirements:
   - python 3.8+ stdlib only
-  - $EDITOR (defaults: micro -> nano -> vi)
+  - $EDITOR or $VISUAL (defaults: micro -> nano -> vi). Multi-word $EDITOR
+    values (e.g. "emacsclient -c -a ''") are supported via shlex.split.
+    The editor binary is resolved to an absolute path for overlay shells.
+  - terminal overlays: agterm, tmux, zellij, kitty, wezterm, ghostty.
+    Only one needed, detected automatically.
   - for kitty: kitty.conf must enable allow_remote_control + listen_on
   - for wezterm: WEZTERM_PANE env var (set automatically by wezterm)
 
@@ -107,101 +115,183 @@ def _which(name: str) -> str | None:
     return found if found else None
 
 
+def build_editor_cmd(editor_str: str) -> str:
+    """split $EDITOR into argv, resolve first token to abs path, re-quote.
+    overlay shells (tmux popup, kitty overlay) don't inherit the launcher's
+    PATH, so a bare 'vi' would fail. falls back to vi on empty/malformed."""
+    try:
+        parts = shlex.split(editor_str) or ["vi"]
+    except ValueError:
+        parts = ["vi"]
+    resolved = shutil.which(parts[0])
+    if resolved:
+        parts[0] = resolved
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def resolve_editor_cmd() -> str:
+    """resolve editor to an absolute-path command string."""
+    raw = (
+        os.environ.get("VISUAL")
+        or os.environ.get("EDITOR")
+        or _which("micro")
+        or _which("nano")
+        or "vi"
+    )
+    return build_editor_cmd(raw)
+
+
 def _is_gui_editor(editor: str) -> bool:
     """true for editor binaries that block on file open via -w flag."""
     basename = Path(editor).name
     return basename in {"code", "code-insiders", "cursor", "cursor-bin", "subl", "sublime_text"}
 
 
-def _spawn_blocking(editor: str, filepath: Path) -> int:
-    """spawn editor as blocking child, inheriting stdio. ponytail: this is the ssh/vim fallback."""
-    cmd = [editor, str(filepath)]
-    if _is_gui_editor(editor):
+def _sentinel_spawn(
+    run_cmd: list[str], editor_cmd: str, filepath: Path
+) -> int | None:
+    """launch a terminal overlay with sentinel-based blocking.
+    run_cmd includes the terminal CLI and all its flags (but not a shell wrapper).
+    returns 0 on success (editor closed), None if launch failed."""
+    fd, sentinel_path = tempfile.mkstemp(prefix="plan-done-")
+    os.close(fd)
+    os.unlink(sentinel_path)
+    sentinel = Path(sentinel_path)
+    wrapper = f"{editor_cmd} {shlex.quote(str(filepath))}; touch {shlex.quote(str(sentinel))}"
+    cmd = [*run_cmd, "sh", "-c", wrapper]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        sentinel.unlink(missing_ok=True)
+        return None
+    deadline = time.monotonic() + 30
+    while not sentinel.exists() and time.monotonic() < deadline:
+        time.sleep(0.3)
+    sentinel.unlink(missing_ok=True)
+    return 0 if sentinel.exists() else None
+
+
+def _spawn_blocking(editor_cmd: str, filepath: Path) -> int:
+    """spawn editor as blocking child, inheriting stdio. ponytail: the ssh/vim fallback."""
+    try:
+        parts = shlex.split(editor_cmd)
+    except ValueError:
+        parts = ["vi"]
+    cmd = [*parts, str(filepath)]
+    if _is_gui_editor(parts[0]):
         cmd.append("-w")
     try:
         result = subprocess.run(cmd, stdin=None, stdout=None, stderr=None)
     except FileNotFoundError:
-        print(f"error: editor not found: {editor}", file=sys.stderr)
+        print(f"error: editor not found: {parts[0]}", file=sys.stderr)
         return 127
     return result.returncode
 
 
 def open_editor(filepath: Path) -> int:
     """open file in editor, blocking until user closes it. returns editor exit code.
-
-    cascade: tmux -> kitty -> wezterm -> code/cursor (-w) -> blocking spawn.
+    cascade: agterm -> tmux -> zellij -> kitty -> wezterm -> ghostty -> blocking spawn.
+    Every overlay branch falls through on failure; only the blocking fallback is guaranteed.
     """
-    editor = resolve_editor()
+    editor_cmd = resolve_editor_cmd()
 
-    # 1. tmux: display-popup -E blocks until the command exits, no sentinel needed
+    # 1. agterm: native overlay (blocks natively), no sentinel needed.
+    if os.environ.get("AGTERM_SESSION_ID") and _which("agtermctl"):
+        target = ["--target", os.environ["AGTERM_SESSION_ID"]]
+        if os.environ.get("AGTERM_SOCKET"):
+            target += ["--socket", os.environ["AGTERM_SOCKET"]]
+        subprocess.run(
+            ["agtermctl", "session", "status", "blocked", "--blink", *target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            result = subprocess.run(
+                ["agtermctl", "session", "overlay", "open",
+                 f"{editor_cmd} {shlex.quote(str(filepath))}", *target, "--block"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        finally:
+            subprocess.run(
+                ["agtermctl", "session", "status", "active", *target],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        if result.returncode == 0:
+            return 0
+        # fall through on agterm failure
+
+    # 2. tmux: display-popup -E blocks natively, no sentinel.
     if os.environ.get("TMUX") and _which("tmux"):
         result = subprocess.run(
             ["tmux", "display-popup", "-E", "-w", "90%", "-h", "90%",
-             "-T", "Plan Review", "--", editor, str(filepath)],
+             "-T", "Plan Review", "--",
+             "sh", "-c", f"{editor_cmd} {shlex.quote(str(filepath))}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        return result.returncode
+        if result.returncode == 0:
+            return 0
+        # fall through on tmux failure
 
-    # 2. kitty: sentinel file to detect editor close.
-    # requires KITTY_LISTEN_ON — running from opencode without a TTY means
-    # kitty @ cannot auto-detect via /dev/tty.
+    # 3. zellij: floating pane + sentinel.
+    if os.environ.get("ZELLIJ") and _which("zellij"):
+        result = _sentinel_spawn(
+            ["zellij", "run", "--floating", "--close-on-exit",
+             "--width", "90%", "--height", "90%", "--"],
+            editor_cmd, filepath,
+        )
+        if result is not None:
+            return result
+        # fall through on zellij failure
+
+    # 4. kitty: overlay + sentinel.
     kitty_sock = os.environ.get("KITTY_LISTEN_ON")
     if kitty_sock and _which("kitty"):
-        sentinel = _wait_with_sentinel(editor, filepath)
-        if sentinel is not None:
-            return sentinel
-        # fall through if sentinel pattern failed
+        result = _sentinel_spawn(
+            ["kitty", "@", "--to", kitty_sock, "launch", "--type=overlay",
+             f"--title=Plan Review: {filepath.name}"],
+            editor_cmd, filepath,
+        )
+        if result is not None:
+            return result
+        # fall through on kitty failure
 
-    # 3. wezterm: split-pane with sentinel file
+    # 5. wezterm: split-pane + sentinel.
     wezterm_pane = os.environ.get("WEZTERM_PANE")
     if wezterm_pane and _which("wezterm"):
-        fd, sentinel_path = tempfile.mkstemp(prefix="plan-done-")
-        os.close(fd)
-        os.unlink(sentinel_path)
-        sentinel = Path(sentinel_path)
-        wrapper = f'{shlex.quote(editor)} {shlex.quote(str(filepath))}; touch {shlex.quote(str(sentinel))}'
-        subprocess.run(
+        result = _sentinel_spawn(
             ["wezterm", "cli", "split-pane", "--bottom", "--percent", "80",
-             "--pane-id", wezterm_pane, "--", "sh", "-c", wrapper],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             "--pane-id", wezterm_pane, "--"],
+            editor_cmd, filepath,
         )
-        while not sentinel.exists():
-            time.sleep(0.3)
-        sentinel.unlink(missing_ok=True)
-        return 0
+        if result is not None:
+            return result
+        # fall through on wezterm failure
 
-    # 4 & 5. no overlay terminal: blocking spawn.
-    # GUI editors get -w (blocks until window closes), terminal editors inherit stdio.
-    # this is the only path that works on plain ssh / iTerm2 / Terminal.app.
-    return _spawn_blocking(editor, filepath)
+    # 6. ghostty: blocking spawn (opens new window).
+    if _which("ghostty"):
+        try:
+            parts = shlex.split(editor_cmd)
+        except ValueError:
+            parts = ["vi"]
+        try:
+            result = subprocess.run(
+                ["ghostty", "--command"] + parts + [str(filepath)],
+                stdin=None, stdout=None, stderr=None,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if result.returncode == 0:
+                return 0
+            # fall through on ghostty failure
 
+    # 7. blocking fallback: plain $EDITOR.
+    return _spawn_blocking(editor_cmd, filepath)
 
-def _wait_with_sentinel(editor: str, filepath: Path) -> int | None:
-    """kitty overlay + sentinel pattern. returns None on failure (caller falls back)."""
-    if not (kitty_sock := os.environ.get("KITTY_LISTEN_ON")):
-        return None
-    fd, sentinel_path = tempfile.mkstemp(prefix="plan-done-")
-    os.close(fd)
-    os.unlink(sentinel_path)
-    sentinel = Path(sentinel_path)
-    wrapper = f'{shlex.quote(editor)} {shlex.quote(str(filepath))}; touch {shlex.quote(str(sentinel))}'
-    cmd = ["kitty", "@", "--to", kitty_sock, "launch", "--type=overlay",
-           f"--title=Plan Review: {filepath.name}"]
-    if kitty_wid := os.environ.get("KITTY_WINDOW_ID"):
-        cmd.extend(["--match", f"id:{kitty_wid}"])
-    cmd.extend(["sh", "-c", wrapper])
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except subprocess.CalledProcessError:
-        return None
-    while not sentinel.exists():
-        time.sleep(0.3)
-    sentinel.unlink(missing_ok=True)
-    return 0
 
 
 def review(plan_content: str) -> str:
-    """open plan in editor, return unified diff (empty string if no changes)."""
+    """open plan in editor, return unified diff (empty string if no changes).
+    exits with 1 if editor failed (nonzero exit)."""
     if not plan_content:
         return ""
 
@@ -211,8 +301,9 @@ def review(plan_content: str) -> str:
 
     try:
         exit_code = open_editor(tmp_path)
-        if exit_code not in (0, None):
-            print(f"warning: editor exited with code {exit_code}", file=sys.stderr)
+        if exit_code != 0 and exit_code is not None:
+            print(f"error: editor exited with code {exit_code}", file=sys.stderr)
+            sys.exit(1)
         edited = tmp_path.read_text()
         return get_diff(plan_content, edited)
     finally:
@@ -424,46 +515,31 @@ def run_tests() -> int:
                 else:
                     os.environ["NO_COLOR"] = old_nc
 
-    class TestResolveEditor(unittest.TestCase):
-        def test_visual_takes_priority(self) -> None:
-            old_visual, old_editor = os.environ.get("VISUAL"), os.environ.get("EDITOR")
-            os.environ["VISUAL"] = "vim"
-            os.environ["EDITOR"] = "nano"
-            try:
-                self.assertEqual(resolve_editor(), "vim")
-            finally:
-                self._restore(old_visual, old_editor)
+    class TestBuildEditorCmd(unittest.TestCase):
+        def test_multi_word_editor(self) -> None:
+            """emacsclient -c -a '' should split into argv correctly."""
+            result = build_editor_cmd("emacsclient -c -a ''")
+            parts = shlex.split(result)
+            self.assertGreater(len(parts), 1)
+            self.assertTrue(parts[0].startswith("/"), f"expected absolute path, got: {parts[0]}")
 
-        def test_editor_when_no_visual(self) -> None:
-            old_visual, old_editor = os.environ.get("VISUAL"), os.environ.get("EDITOR")
-            os.environ.pop("VISUAL", None)
-            os.environ["EDITOR"] = "nvim"
-            try:
-                self.assertEqual(resolve_editor(), "nvim")
-            finally:
-                self._restore(old_visual, old_editor)
+        def test_unbalanced_quote_fallback_to_vi(self) -> None:
+            """malformed $EDITOR falls back to vi."""
+            result = build_editor_cmd("emacsclient -c -a '")
+            parts = shlex.split(result)
+            self.assertEqual(Path(parts[0]).name, "vi")
 
-        def test_fallback_when_unset(self) -> None:
-            old_visual, old_editor = os.environ.get("VISUAL"), os.environ.get("EDITOR")
-            os.environ.pop("VISUAL", None)
-            os.environ.pop("EDITOR", None)
-            try:
-                editor = resolve_editor()
-                # vi is always the last-resort tier; micro/nano may win if installed
-                self.assertIn(Path(editor).name, {"vi", "micro", "nano"})
-            finally:
-                self._restore(old_visual, old_editor)
+        def test_empty_editor_fallback_to_vi(self) -> None:
+            """set-but-empty $EDITOR falls back to vi."""
+            result = build_editor_cmd("")
+            parts = shlex.split(result)
+            self.assertEqual(Path(parts[0]).name, "vi")
 
-        @staticmethod
-        def _restore(visual: str | None, editor: str | None) -> None:
-            if visual is None:
-                os.environ.pop("VISUAL", None)
-            else:
-                os.environ["VISUAL"] = visual
-            if editor is None:
-                os.environ.pop("EDITOR", None)
-            else:
-                os.environ["EDITOR"] = editor
+        def test_resolved_path_starts_with_slash(self) -> None:
+            """build_editor_cmd resolves first token to absolute path."""
+            result = build_editor_cmd("vi")
+            self.assertTrue(result.startswith("/") or result.startswith(shlex.quote("/")),
+                            f"expected absolute path, got: {result}")
 
     class TestIsGuiEditor(unittest.TestCase):
         def test_code_variants(self) -> None:
@@ -510,9 +586,19 @@ def run_tests() -> int:
             edited = "unchanged content\n"
             self.assertEqual(get_diff(original, edited), "")
 
+    class TestSentinelSpawn(unittest.TestCase):
+        """verify sentinel file is cleaned up on launch failure via _sentinel_spawn."""
+
+        def test_sentinel_spawn_launch_failure_returns_none(self) -> None:
+            """_sentinel_spawn returns None on CalledProcessError and cleans sentinel."""
+            from unittest.mock import patch
+            with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, [])):
+                result = _sentinel_spawn(["test-cmd"], "vim", Path("/tmp/fake-plan.md"))
+            self.assertIsNone(result)
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for tc in [TestGetDiff, TestColorizeDiff, TestShouldColor, TestResolveEditor, TestIsGuiEditor, TestRunFile, TestReview]:
+    for tc in [TestGetDiff, TestColorizeDiff, TestShouldColor, TestBuildEditorCmd, TestIsGuiEditor, TestRunFile, TestReview, TestSentinelSpawn]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

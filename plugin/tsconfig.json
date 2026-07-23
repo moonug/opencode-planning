@@ -8,9 +8,11 @@
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
     "allowImportingTsExtensions": false,
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "tui-plugin.ts"]
+  "include": ["index.ts", "tui-plugin.tsx"]
 }

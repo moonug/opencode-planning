@@ -18,5 +18,45 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
-      - run: npm publish --access public
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: oven-sh/setup-bun@v2
+
+      # Verify tag matches plugin/package.json version
+      - name: Verify tag version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(node -p "require('./plugin/package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag v$TAG does not match package.json version $PKG"
+            exit 1
+          fi
+          echo "Tag v$TAG matches package.json (OK)"
+
+      - name: Install dependencies
+        run: npm install --no-package-lock
+        working-directory: plugin
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: plugin
+
+      - name: Python helper tests
+        run: python3 bin/plan-review.py --test
+        working-directory: plugin
+
+      - name: Smoke tests
+        run: EDITOR=true bun ../tests/plugin-smoke.ts
+        working-directory: plugin
+
+      - name: Verify tarball contents
+        run: |
+          pkg=$(npm pack --dry-run 2>&1)
+          echo "$pkg"
+          echo "$pkg" | grep -q "LICENSE" || { echo "LICENSE missing from tarball"; exit 1; }
+          echo "$pkg" | grep -q "tui-plugin.tsx" || { echo "tui-plugin.tsx missing from tarball"; exit 1; }
+
+      - name: Publish
+        run: npm publish --access public
         working-directory: plugin

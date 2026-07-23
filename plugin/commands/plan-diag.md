@@ -14,29 +14,25 @@ Usage: `/plan-diag` — prints current state
 
 Output sections:
 
-1. **Build event memory** — Map<sessionID, ModelRef> built from
-   `session.updated` events where `info.agent === "build"`. The plugin
-   picks the last-remembered build-agent model as priority #2 in its
-   resolution chain. Empty if you never switched to the build agent in
-   this session, or if opencode did not emit `session.updated` for your
-   ctrl-x m / agent-tab switch.
+1. **/set-build-model overrides (in-memory)** — Map<sessionID, ModelRef> built from
+   `session.updated` events where `info.agent === "build"` and from `/set-build-model`
+   slash commands. The plugin picks the last-remembered build-agent model as priority #2
+   in its resolution chain. Empty if no build agent activity or explicit override.
 
-2. **Last resolved target** — the model that exitPlanMode picked last
-   time (or "never called"). Format: `provider/model (source)`.
+2. **chat.message memory** — per-session, per-agent model map built from
+   `chat.message` hook calls (fires on every user prompt). Priority #1 for build
+   and fallback #3 for plan.
 
-3. **Current session info** — what the plugin sees in the latest
-   `session.updated` event for this session: agent, model, and (if
-   opencode provides it) `next.agent` / `next.model`.
+3. **Current session info** — session ID, last resolved target and source.
 
-If you ran ctrl-x m in the TUI and `/plan-diag` still shows the old
+If you ran Ctrl-X M in the TUI and `/plan-diag` still shows the old
 model, opencode did not emit a `session.updated` event for your picker
-action. In that case the plugin cannot know what you picked. Workarounds:
+action. Workarounds:
 
 - `/set-build-model <provider>/<model>` before approving the plan
-- `/agent build` → `/model <provider>/<model>` → `/agent plan`, then
-  approve
+- Switch to build agent, pick a model, switch back to plan, then approve
 
-Diagnostic log lines `plan-review: session.updated: ...` are emitted to
-the opencode log on every session.updated event — grep for those in
-`~/.local/share/opencode/log/opencode.log` to see exactly which fields
-opencode populates after your picker action.
+Diagnostic log lines `plan-review: ...` and `plan-review-TUI: ...` are emitted to
+the opencode log on every metadata write — grep for those in
+`~/.local/share/opencode/log/opencode.log` to verify the fork's native
+selection is tracking correctly.

@@ -1,7 +1,7 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, lstatSync, chmodSync, statSync, copyFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync, readlinkSync, lstatSync, chmodSync, statSync, copyFileSync, mkdtempSync, rmSync } from "node:fs"
 import { dirname, resolve, join, basename } from "node:path"
-import { homedir as osHomedir } from "node:os"
+import { homedir as osHomedir, tmpdir } from "node:os"
 
 // On macOS, node:os's homedir() falls back to /etc/passwd when HOME is
 // unset or invalid, regardless of process.env.HOME. This makes it
@@ -16,7 +16,18 @@ function homedir(): string {
 }
 import { rememberBuildModel, type ModelRef } from "./model-memory"
 
-const PLUGIN_DIR = dirname(new URL(import.meta.url).pathname)
+interface TimedModelRef extends ModelRef {
+  capturedAt: number
+}
+
+type ExitResult =
+  | { status: "switched"; target: ModelRef; source: string }
+  | { status: "no_model" }
+  | { status: "prompt_failed"; error: string }
+
+import { fileURLToPath } from "node:url"
+
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const SCRIPT_PATH =
   process.env.PLAN_REVIEW_SCRIPT ?? join(PLUGIN_DIR, "bin", "plan-review.py")
 const COMMAND_SOURCES = [
@@ -39,78 +50,106 @@ const REVISION_PROMPT =
 function ensureExecutable(path: string): void {
   try {
     if ((statSync(path).mode & 0o111) === 0) chmodSync(path, 0o755)
-  } catch {
-    // ignore — existsSync catches the missing case later
+  } catch (err) {
+    // existsSync catches the missing case later; log unexpected errors.
+    console.error(`plan-review: ensureExecutable(${path}) failed: ${(err as Error).message}`)
   }
 }
 
-function ensureCommandSymlink(): void {
+const { parse: parseJsonc, modify: modifyJsonc, applyEdits } = require("jsonc-parser") as {
+  parse: (text: string, errors?: unknown[]) => unknown
+  modify: (text: string, path: Array<string | number>, value: unknown, options?: { formattingOptions: { insertSpaces: boolean; tabSize: number } }) => any
+  applyEdits: (text: string, edits: any) => string
+}
+
+// ensureManagedLink — create or refresh a symlink only when the existing
+// path is absent, already ours, or a symlink into PLUGIN_DIR. Regular
+// files and foreign symlinks are never touched.
+function ensureManagedLink(source: string, linkPath: string): void {
+  let stat: ReturnType<typeof lstatSync> | undefined
+  try {
+    stat = lstatSync(linkPath)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`plan-review: lstat failed for ${linkPath}: ${(err as Error).message}`)
+    }
+  }
+  if (stat) {
+    if (stat.isSymbolicLink()) {
+      try {
+        const target = readlinkSync(linkPath)
+        const resolved = resolve(dirname(linkPath), target)
+        if (resolved === resolve(source)) return // already correct
+        if (resolved.startsWith(PLUGIN_DIR)) {
+          // Our symlink, stale target — update it.
+          unlinkSync(linkPath)
+        } else {
+          // Foreign symlink — don't touch.
+          console.error(`plan-review: not overwriting foreign symlink at ${linkPath} -> ${target}`)
+          return
+        }
+      } catch (err) {
+        console.error(`plan-review: readlink failed for ${linkPath}: ${(err as Error).message}`)
+        return
+      }
+    } else {
+      // Regular file or directory — user-created, don't touch.
+      console.error(`plan-review: not overwriting existing file at ${linkPath}`)
+      return
+    }
+  }
+  try {
+    symlinkSync(source, linkPath)
+  } catch (symErr) {
+    console.error(`plan-review: failed to symlink ${linkPath}: ${(symErr as Error).message}. Symlink is required — run as a user with permission to create symlinks in ~/.config/opencode/commands/`)
+  }
+}
+
+// ensureCommandLinks — symlink each slash-command into
+// ~/.config/opencode/commands/ without clobbering user files or foreign
+// links. Then register the TUI plugin in tui.jsonc using jsonc-parser
+// so comments/trailing commas are preserved.
+function ensureCommandLinks(): void {
   for (const source of COMMAND_SOURCES) {
     const linkPath = join(homedir(), ".config", "opencode", "commands", basename(source))
     try {
       mkdirSync(dirname(linkPath), { recursive: true })
-    } catch {
-      continue
-    }
-    try {
-      const existing = readlinkSync(linkPath)
-      if (resolve(existing) === resolve(source)) continue
-      unlinkSync(linkPath)
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        try { unlinkSync(linkPath) } catch {}
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        console.error(`plan-review: mkdir failed for ${dirname(linkPath)}: ${(err as Error).message}`)
       }
     }
-    try {
-      symlinkSync(source, linkPath)
-    } catch {
-      copyFileSync(source, linkPath)
-    }
+    ensureManagedLink(source, linkPath)
   }
-  // also register the TUI plugin via tui.json so the opencode TUI
-  // plugin host picks it up on launch. Without this, the TUI's local
-  // agent state (which is purely in-memory in a private SolidJS store
-  // that is not exposed through TuiPluginApi) cannot be observed, and
-  // the server plugin cannot attribute model.json picker changes to
-  // the agent the user is actually in. The TUI plugin's keymap.intercept
-  // handler fires on Tab/Shift+Tab and forwards the resulting agent
-  // change to the server via client.session.update({metadata:{...}}).
-  //
-  // NOTE: TUI plugins are NOT auto-discovered from
-  // ~/.config/opencode/plugins/ — that path is server-side only and
-  // tries to load the file as a server plugin (which fails with
-  // 'must default export an object with server()'). TUI plugins
-  // MUST be registered in tui.json (or tui.jsonc) under the 'plugin'
-  // field, see packages/opencode/src/config/tui.ts:89.
-  //
-  // Prior iterations wrote both ~/.config/opencode/tui.json AND
-  // ~/.config/opencode/tui.jsonc with the same path; that created
-  // duplicate plugin origins that the plugin loader couldn't tell apart.
-  // We now write only tui.jsonc (and migrate any old tui.json by
-  // reading from it but writing to tui.jsonc).
+  // Register TUI plugin in tui.jsonc (NOT in ~/.config/opencode/plugins/ —
+  // that path is server-plugin territory and the server loader requires
+  // a .server() export, which a TUI plugin doesn't have).
   try {
-    const tuiPluginPath = join(PLUGIN_DIR, "tui-plugin.ts")
+    const tuiPluginPath = join(PLUGIN_DIR, "tui-plugin.tsx")
+    const previousTuiPluginPath = join(PLUGIN_DIR, "tui-plugin.ts")
     const tuiJsonPath = join(homedir(), ".config", "opencode", "tui.jsonc")
     const tuiJsonLegacy = join(homedir(), ".config", "opencode", "tui.json")
-    // Always remove a legacy symlink at ~/.config/opencode/plugins/
-    // plan-review-tui.ts. That path is server-plugin territory and the
-    // server loader requires .server() export on whatever it loads —
-    // a TUI plugin there produces 'must default export an object with
-    // server()' and clutters every opencode startup with a failed
-    // plugin load log. Earlier install iterations (before tui.json was
-    // adopted) created this symlink; we now delete it on every init.
+
+    // Remove legacy symlink at ~/.config/opencode/plugins/plan-review-tui.ts
+    // only if it was created by THIS package (symlink target inside PLUGIN_DIR).
     const legacySymlink = join(homedir(), ".config", "opencode", "plugins", "plan-review-tui.ts")
     try {
-      const stat = lstatSync(legacySymlink)
-      if (stat.isSymbolicLink()) {
-        unlinkSync(legacySymlink)
+      const lstat = lstatSync(legacySymlink)
+      if (lstat.isSymbolicLink()) {
+        const target = readlinkSync(legacySymlink)
+        if (resolve(dirname(legacySymlink), target).startsWith(PLUGIN_DIR)) {
+          unlinkSync(legacySymlink)
+        }
       }
-    } catch {}
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`plan-review: legacy symlink check failed: ${(err as Error).message}`)
+      }
+    }
 
+    // Read existing config (tui.jsonc first, then legacy tui.json).
     let existing: string | undefined
     try { existing = readFileSync(tuiJsonPath, "utf8") } catch (err) {
-      // ENOENT expected on first run; log other errors so silent
-      // permission/parse failures don't recur.
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
         console.error(`plan-review: failed to read ${tuiJsonPath}: ${(err as Error).message}`)
       }
@@ -122,18 +161,39 @@ function ensureCommandSymlink(): void {
         }
       }
     }
-    let parsed: any = {}
-    if (existing) {
-      try { parsed = JSON.parse(existing) } catch {}
+
+    if (existing !== undefined) {
+      // Parse with JSONC support; on error, do NOT overwrite the file.
+      const errors: unknown[] = []
+      const parsed = (parseJsonc(existing, errors) ?? {}) as { plugin?: unknown }
+      if (errors.length > 0) {
+        console.error(`plan-review: ${tuiJsonPath} has parse errors, not modifying: ${JSON.stringify(errors)}`)
+        return
+      }
+      const plugins = Array.isArray(parsed.plugin) ? parsed.plugin as unknown[] : []
+      const nextPlugins = plugins.filter((plugin) => plugin !== previousTuiPluginPath)
+      if (!nextPlugins.includes(tuiPluginPath)) nextPlugins.push(tuiPluginPath)
+      if (JSON.stringify(nextPlugins) !== JSON.stringify(plugins)) {
+        const edits = modifyJsonc(existing, ["plugin"], nextPlugins, {
+          formattingOptions: { insertSpaces: true, tabSize: 2 },
+        })
+        const newText = applyEdits(existing, edits)
+        try { mkdirSync(dirname(tuiJsonPath), { recursive: true }) } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
+        }
+        writeFileSync(tuiJsonPath, newText)
+      }
+    } else {
+      // No config yet — create fresh.
+      const newText = JSON.stringify({ plugin: [tuiPluginPath] }, null, 2) + "\n"
+      try { mkdirSync(dirname(tuiJsonPath), { recursive: true }) } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
+      }
+      writeFileSync(tuiJsonPath, newText)
     }
-    const plugins = Array.isArray(parsed.plugin) ? parsed.plugin : []
-    if (!plugins.includes(tuiPluginPath)) {
-      plugins.push(tuiPluginPath)
-      parsed.plugin = plugins
-      try { mkdirSync(dirname(tuiJsonPath), { recursive: true }) } catch {}
-      writeFileSync(tuiJsonPath, JSON.stringify(parsed, null, 2) + "\n")
-    }
-  } catch {}
+  } catch (err) {
+    console.error(`plan-review: tui.jsonc registration failed: ${(err as Error).message}`)
+  }
 }
 
 function parseModelString(s: string): ModelRef | undefined {
@@ -142,16 +202,19 @@ function parseModelString(s: string): ModelRef | undefined {
   return { providerID: m[1]!, modelID: m[2]! }
 }
 
-function runPlanReview($: any, planText: string): Promise<string> {
-  // Write plan to a temp file and pass via --file so Bun Shell's
-  // $.escape() never touches the markdown content (backticks, $,
-  // etc.). The helper reads the file, opens it in $EDITOR, diffs,
-  // and prints the result on stdout.
-  const tmpPath = join(import.meta.dirname ?? ".", ".plan-review-tmp.md")
+async function runPlanReview($: any, planText: string): Promise<string> {
+  const tmpDir = mkdtempSync(join(tmpdir(), "opencode-plan-review-"))
+  const tmpPath = join(tmpDir, "plan.md")
   writeFileSync(tmpPath, planText, "utf8")
-  const promise = $`${SCRIPT_PATH} --file ${$.escape(tmpPath)}`.text()
-  promise.then(() => { try { unlinkSync(tmpPath) } catch {} }, () => { try { unlinkSync(tmpPath) } catch {} })
-  return promise
+  try {
+    return await $`${SCRIPT_PATH} --file ${tmpPath}`.text()
+  } finally {
+    try { rmSync(tmpDir, { recursive: true, force: true }) } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.error(`plan-review: failed to clean temp dir ${tmpDir}: ${(err as Error).message}`)
+      }
+    }
+  }
 }
 
 function log(client: any, level: "debug" | "info" | "warn" | "error", message: string): Promise<unknown> {
@@ -172,16 +235,15 @@ function logged(client: any, level: "debug" | "info" | "warn" | "error", message
     })
 }
 
-// visibleErr() — helper for replacing `.catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L143): ${(e as Error)?.message ?? String(e)}`) })` on non-log
-// promises. Records the error on the server log first, falls back to
-// console.error if server is unreachable. Use this everywhere instead
-// of bare `.catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L146): ${(e as Error)?.message ?? String(e)}`) })` so we never silently lose a fail signal.
+// visibleErr() — helper for non-log promises. Records the error on the
+// server log first, falls back to console.error if server is unreachable.
 async function visibleErr(client: any, context: string, e: unknown): Promise<void> {
   const errText = (e as Error)?.message ?? String(e)
   try {
-    await log(client, "warn", `swallowed error in ${context}: ${errText}`)
-  } catch {
-    console.error(`plan-review: swallowed error in ${context}: ${errText}`)
+    await logged(client, "warn", `swallowed error in ${context}: ${errText}`)
+  } catch (logErr) {
+    // logged() already tried console.error; this is a last resort.
+    console.error(`plan-review: swallowed error in ${context}: ${errText} (log also failed: ${(logErr as Error)?.message ?? String(logErr)})`)
   }
 }
 
@@ -195,7 +257,9 @@ async function getBuildAgentModel(client: any): Promise<ModelRef | undefined> {
     if (buildAgent?.model?.providerID && buildAgent?.model?.modelID) {
       return { providerID: buildAgent.model.providerID, modelID: buildAgent.model.modelID }
     }
-  } catch {}
+  } catch (err) {
+    console.error(`plan-review: getBuildAgentModel failed: ${(err as Error)?.message ?? String(err)}`)
+  }
   return undefined
 }
 
@@ -209,7 +273,9 @@ async function getPlanAgentModel(client: any): Promise<ModelRef | undefined> {
     if (planAgent?.model?.providerID && planAgent?.model?.modelID) {
       return { providerID: planAgent.model.providerID, modelID: planAgent.model.modelID }
     }
-  } catch {}
+  } catch (err) {
+    console.error(`plan-review: getPlanAgentModel failed: ${(err as Error)?.message ?? String(err)}`)
+  }
   return undefined
 }
 
@@ -269,51 +335,38 @@ function formatProviderList(entries: ProviderListEntry[]): string {
 async function exitPlanMode(
   client: any,
   buildModels: Map<string, ModelRef>,
-  chatMessageMemory: Map<string, Map<string, ModelRef>>,
+  chatMessageMemory: Map<string, Map<string, TimedModelRef>>,
   lastResolution: { target?: ModelRef; source?: string },
   sessionID: string | undefined,
   summary: string,
-): Promise<void> {
-  if (!sessionID) return
-  await log(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L259): ${(e as Error)?.message ?? String(e)}`) })
+): Promise<ExitResult> {
+  if (!sessionID) return { status: "no_model" }
+  await logged(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`)
 
   // Promote deferred picker picks stored by the TUI plugin into
-  // chatMessageMemory. TUI plugin writes
-  // `metadata.planReviewDeferredPicks[agent] = {providerID, modelID}`
-  // via session.update on session.updated. We read it here at
-  // exitPlanMode time because:
-  //   - The TUI plugin can't race with us any more: by the time
-  //     the user approves the plan, the user has typed their
-  //     first message, the plan agent has generated a response,
-  //     and the user has reviewed it — seconds-to-minutes after
-  //     the TUI plugin's session.update completed.
-  //   - Earlier placement in chat.message hook raced: user's
-  //     first real prompt fired chat.message BEFORE the TUI's
-  //     session.updated handler wrote the metadata.
-  //
-  // Idempotent: we set perSession[agent] only when no entry
-  // exists yet, so a concurrent chat.message write that already
-  // populated (agent -> real model) survives intact. The
-  // "promoted deferred" log says how many we filled in.
+  // chatMessageMemory. Each pick carries a `pickedAt` timestamp; we
+  // only apply it when it is NEWER than the existing chat.message
+  // entry for that agent. This prevents stale metadata from
+  // overwriting a fresher model captured by chat.message on a
+  // subsequent approval.
   let deferredPromoted = 0
-  try {
-    const sessionRes = await client.session.get({ path: { id: sessionID } })
-    const data = (sessionRes as any)?.data ?? sessionRes
-    const metadata = data?.metadata
-    // DIAG: log exact metadata we read so the next live test reveals
-    // whether the session.update write reached the server, got
-    // overwritten, or never committed. Remove once root cause is
-    // identified.
-    await log(
-      client,
-      "info",
-      `plan-review: exitPlanMode metadata check: session=${sessionID} keys=${metadata ? Object.keys(metadata).join(",") : "<null>"} deferred=${metadata?.planReviewDeferredPicks ? JSON.stringify(metadata.planReviewDeferredPicks) : "<absent>"} raw=${JSON.stringify(metadata ?? null)}`,
-    ).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L307): ${(e as Error)?.message ?? String(e)}`) })
-    const deferred = metadata?.planReviewDeferredPicks
+    try {
+      const sessionRes = await client.session.get({ path: { id: sessionID } })
+      const data = (sessionRes as any)?.data ?? sessionRes
+      const metadata = data?.metadata
+      const deferredPicks = metadata?.planReviewDeferredPicks
+      const picksKeys = deferredPicks && typeof deferredPicks === "object"
+        ? Object.keys(deferredPicks as Record<string, unknown>).join(",") : "<absent>"
+      await logged(
+        client,
+        "info",
+        `plan-review: exitPlanMode metadata check: session=${sessionID} keys=${metadata ? Object.keys(metadata).join(",") : "<null>"} deferred_agents=${picksKeys}`,
+      )
+      const deferred = metadata?.planReviewDeferredPicks
     if (deferred && typeof deferred === "object") {
       let perSession = chatMessageMemory.get(sessionID)
       if (!perSession) {
-        perSession = new Map<string, ModelRef>()
+        perSession = new Map<string, TimedModelRef>()
         chatMessageMemory.set(sessionID, perSession)
       }
       for (const [agentName, m] of Object.entries(deferred)) {
@@ -322,19 +375,24 @@ async function exitPlanMode(
         const providerID = (m as any).providerID
         const modelID = (m as any).modelID
         if (typeof providerID !== "string" || typeof modelID !== "string") continue
-        perSession.set(agentName, { providerID, modelID })
+        const pickTime = typeof (m as any).pickedAt === "number"
+          ? (m as any).pickedAt as number
+          : typeof (m as any)._writtenAt === "string"
+            ? new Date((m as any)._writtenAt).getTime() || 0
+            : 0
+        const existing = perSession.get(agentName)
+        // Legacy pick without timestamp: only apply when no entry exists yet.
+        if (pickTime === 0 && existing) continue
+        if (existing && existing.capturedAt >= pickTime) continue // stale
+        perSession.set(agentName, { providerID, modelID, capturedAt: pickTime })
         deferredPromoted++
       }
       if (deferredPromoted > 0) {
-        await log(
-          client,
-          "info",
-          `plan-review: exitPlanMode promoted deferredPicks: count=${deferredPromoted} session=${sessionID}`,
-        ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L287): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "info", `plan-review: exitPlanMode promoted deferredPicks: count=${deferredPromoted} session=${sessionID}`)
       }
     }
   } catch (err) {
-    await log(client, "warn", `plan-review: exitPlanMode deferred-pick lookup failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L289): ${(e as Error)?.message ?? String(e)}`) })
+    await logged(client, "warn", `plan-review: exitPlanMode deferred-pick lookup failed: ${(err as Error).message}`)
   }
 
   const overridden = buildModels.get(sessionID)
@@ -348,13 +406,11 @@ async function exitPlanMode(
 
   const fromChatPlan = perAgent?.get("plan")
 
-  // DIAG: log all priority chain sources so we can trace why a
-  // particular model was picked (user reports build got wrong model).
-  await log(
+  await logged(
     client,
     "info",
     `plan-review: exitPlanMode chain: session=${sessionID} fromChat=${fromChat ? `${fromChat.providerID}/${fromChat.modelID}` : "∅"} fromChatPlan=${fromChatPlan ? `${fromChatPlan.providerID}/${fromChatPlan.modelID}` : "∅"} overridden=${overridden ? `${overridden.providerID}/${overridden.modelID}` : "∅"} agentCfg=${agentCfg ? `${agentCfg.providerID}/${agentCfg.modelID}` : "∅"} planCfg=${planCfg ? `${planCfg.providerID}/${planCfg.modelID}` : "∅"} globalCfg=${globalCfg ? `${globalCfg.providerID}/${globalCfg.modelID}` : "∅"}`,
-  ).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L375): ${(e as Error)?.message ?? String(e)}`) })
+  )
 
   let source: string
   let target: ModelRef | undefined
@@ -369,14 +425,14 @@ async function exitPlanMode(
   lastResolution.target = target
   lastResolution.source = source
 
-  await log(
+  await logged(
     client,
     "info",
     `plan-review: exitPlanMode resolution: session=${sessionID} target=${target ? `${target.providerID}/${target.modelID}` : "undefined"} source=${source}`,
-  ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L301): ${(e as Error)?.message ?? String(e)}`) })
+  )
 
   if (!target) {
-    await log(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L304): ${(e as Error)?.message ?? String(e)}`) })
+    await logged(client, "warn", `auto-exit: no build model resolved (sources tried: ${source}), asking user to switch manually`)
     try {
       await client.session.prompt({
         path: { id: sessionID },
@@ -391,14 +447,10 @@ async function exitPlanMode(
     } catch (err) {
       console.error(`plan-review: no-target prompt failed: ${(err as Error)?.message ?? String(err)}`)
     }
-    return
+    return { status: "no_model" }
   }
 
-  await log(
-    client,
-    "info",
-    `auto-exit to build. model=${target.providerID}/${target.modelID} source=${source}`,
-  ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L324): ${(e as Error)?.message ?? String(e)}`) })
+  await logged(client, "info", `auto-exit to build. model=${target.providerID}/${target.modelID} source=${source}`)
 
   try {
     await client.session.prompt({
@@ -413,8 +465,11 @@ async function exitPlanMode(
         }],
       },
     })
+    return { status: "switched", target, source }
   } catch (err) {
-    await log(client, "error", `failed to send build-exit prompt: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L340): ${(e as Error)?.message ?? String(e)}`) })
+    const errMsg = (err as Error)?.message ?? String(err)
+    await logged(client, "error", `failed to send build-exit prompt: ${errMsg}`)
+    return { status: "prompt_failed", error: errMsg }
   }
 }
 
@@ -427,8 +482,8 @@ async function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Promi
 
 export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   const VERSION = require("./package.json").version
-  await log(client, "info", `plan-review: plugin init v${VERSION} build=v${VERSION}`).catch((e: unknown) => { console.error(`plan-review: log(init) failed: ${(e as Error)?.message ?? String(e)}`) })
-  await log(client, "info", `plan-review: argv0=${(process.argv[1] ?? "unknown").split("/").slice(-3).join("/")}`).catch((e: unknown) => { console.error(`plan-review: log(argv0) failed: ${(e as Error)?.message ?? String(e)}`) })
+  await logged(client, "info", `plan-review: plugin init v${VERSION} build=v${VERSION}`)
+  await logged(client, "info", `plan-review: argv0=${(process.argv[1] ?? "unknown").split("/").slice(-3).join("/")}`)
 
   if (!existsSync(SCRIPT_PATH)) {
     throw new Error(
@@ -437,12 +492,12 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
     )
   }
   ensureExecutable(SCRIPT_PATH)
-  ensureCommandSymlink()
+  ensureCommandLinks()
 
   const buildModels = new Map<string, ModelRef>()
   const lastResolution: { target?: ModelRef; source?: string } = {}
   const lastShownModels = new Map<string, ProviderListEntry[]>()
-  const chatMessageMemory = new Map<string, Map<string, ModelRef>>()
+  const chatMessageMemory = new Map<string, Map<string, TimedModelRef>>()
   // Keyed by sessionID → agent → model. Populated by chat.message hook
   // (fires for every real and synthetic prompt). exitPlanMode reads this
   // as its first-priority source. No model.json reads — model.json is
@@ -468,14 +523,20 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, context.sessionID, "User closed editor without changes.")
-        return "Plan reviewed, no changes. Approved by user. Switched to build agent."
+        const exit = await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, context.sessionID, "User closed editor without changes.")
+        if (exit.status === "switched") {
+          return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
+        }
+        if (exit.status === "no_model") {
+          return "Plan approved by user, but no build model resolved. See the message above for manual switch instructions. Do NOT proceed until the user has switched."
+        }
+        return `Plan approved by user, but failed to switch to build agent: ${exit.error}. Run \`/agent build\` manually before proceeding.`
       }
       return FEEDBACK_HEADER + result + REVISION_PROMPT
     },
   })
 
-  await log(client, "info", `plan-review: tool 'plan_review' created, args: ${Object.keys(plan_review.args).join(",")}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L554): ${(e as Error)?.message ?? String(e)}`) })
+  await logged(client, "info", `plan-review: tool 'plan_review' created, args: ${Object.keys(plan_review.args).join(",")}`)
 
   return {
     tool: { plan_review },
@@ -484,7 +545,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
     // tool visible to primary agents even when an `agent.tools` map would
     // otherwise filter it out.
     config: async (opencodeConfig) => {
-      await log(client, "info", "plan-review: config hook fired").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L563): ${(e as Error)?.message ?? String(e)}`) })
+      await logged(client, "info", "plan-review: config hook fired")
       try {
         const exp = (opencodeConfig as any).experimental ?? {}
         const tools: string[] = exp.primary_tools ?? []
@@ -493,7 +554,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
             ...exp,
             primary_tools: [...tools, "plan_review"],
           }
-          await log(client, "info", `plan-review: config hook added plan_review to primary_tools (count=${tools.length + 1})`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L572): ${(e as Error)?.message ?? String(e)}`) })
+          await logged(client, "info", `plan-review: config hook added plan_review to primary_tools (count=${tools.length + 1})`)
         }
         // Permission configuration: allow plan agent to call plan_review,
         // deny for build agent so it's not distracted by a planning tool.
@@ -517,25 +578,22 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
           }
         }
       } catch (err) {
-        await log(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L575): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "warn", `plan-review: config hook failed: ${(err as Error).message}`)
       }
     },
 
     "chat.message": async (input, _output) => {
-      await log(
-        client,
+      await logged(client,
         "info",
         `plan-review: chat.message HOOK FIRED: session=${input.sessionID ?? "?"} agent=${input.agent ?? "?"} model=${input.model?.providerID ?? "?"}/${input.model?.modelID ?? "?"}`,
-      ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L584): ${(e as Error)?.message ?? String(e)}`) })
+      )
 
       // chat.message is the ONLY server-plugin hook that reliably fires
       // for both user-typed and programmatic prompts — see
-      // packages/opencode/src/session/prompt.ts:999. The TUI plugin
-      // calls promptAsync with noReply:true on every Tab cycle, which
-      // fires this hook for the new agent even though no real message
-      // reaches the LLM. Use this as the single source of truth for
-      // per-session, per-agent last-picked model. exitPlanMode()
-      // prioritises this map over any global file state.
+      // packages/opencode/src/session/prompt.ts:999. It is the safe
+      // stock-opencode fallback when the fork's native local selection
+      // API is absent. Use it as per-session, per-agent memory;
+      // exitPlanMode() prioritises it over any global file state.
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
         if (!perSession) {
@@ -545,12 +603,9 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         perSession.set(input.agent, {
           providerID: input.model.providerID,
           modelID: input.model.modelID,
+          capturedAt: Date.now(),
         })
-        await log(
-          client,
-          "info",
-          `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`,
-        ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L502): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "info", `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`)
       }
 
       // (Deferred-picker promotion moved out of this hook — see
@@ -565,11 +620,10 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
     },
 
     "experimental.chat.system.transform": async (input, output) => {
-      await log(
-        client,
+      await logged(client,
         "info",
         `plan-review: system.transform HOOK FIRED: session=${input.sessionID ?? "?"} system_blocks=${output.system.length}`,
-      ).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L637): ${(e as Error)?.message ?? String(e)}`) })
+      )
       const joined = output.system.join("\n").toLowerCase()
       if (joined.includes("title generator") || joined.includes("generate a title")) return
       // Skip injection for the build agent (mirrors plannotator's skip).
@@ -591,14 +645,14 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       // If left intact, the model follows those and ignores plan_review.
       let rewrites = 0
       for (let i = 0; i < output.system.length; i++) {
-        const before = output.system[i]
+        const before = output.system[i]!
         output.system[i] = before
           .replace(/\bplan_exit\b/g, "plan_review")
           .replace(/\bExitPlanMode\b/g, "plan_review")
         if (output.system[i] !== before) rewrites++
       }
       if (rewrites > 0) {
-        await log(client, "info", `plan-review: rewrote plan_exit→plan_review in ${rewrites} system block(s)`).catch((e: unknown) => { console.error(`plan-review: swallowed error in rewrite-diag: ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "info", `plan-review: rewrote plan_exit→plan_review in ${rewrites} system block(s)`)
       }
       output.system.push(`
 ## Plan Review
@@ -611,7 +665,7 @@ If your plan is rejected, you will receive feedback — revise the plan and call
 
 Do NOT proceed with implementation until the plan is approved.
 `)
-      await log(client, "info", `plan-review: system prompt injected (${output.system.length} blocks, ${output.system[output.system.length - 1]!.length} chars)`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L662): ${(e as Error)?.message ?? String(e)}`) })
+      await logged(client, "info", `plan-review: system prompt injected (${output.system.length} blocks, ${output.system[output.system.length - 1]!.length} chars)`)
     },
 
     event: async ({ event }) => {
@@ -634,14 +688,14 @@ Do NOT proceed with implementation until the plan is approved.
       try {
         rememberBuildModel(e, buildModels)
       } catch (err) {
-        await log(client, "warn", `plan-review: rememberBuildModel failed: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L556): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "warn", `plan-review: rememberBuildModel failed: ${(err as Error).message}`)
       }
       if (e.type === "session.updated" || e.type === "session.updated.1") {
         const info = e.properties?.info ?? e.data?.info
         const sid = info?.id
         if (info?.agent === "build" && sid && buildModels.has(sid)) {
           const m = buildModels.get(sid)!
-          await log(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L560): ${(e as Error)?.message ?? String(e)}`) })
+          await logged(client, "info", `plan-review: build event memory updated: session=${sid} -> ${m.providerID}/${m.modelID}`)
         }
       }
 
@@ -654,7 +708,7 @@ Do NOT proceed with implementation until the plan is approved.
 
       if (name === "set-build-model") {
         if (!sessionID) {
-          await log(client, "error", "set-build-model: no active session").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L777): ${(e as Error)?.message ?? String(e)}`) })
+          await logged(client, "error", "set-build-model: no active session")
           return
         }
         const arg = rawArgs.trim()
@@ -674,7 +728,7 @@ Do NOT proceed with implementation until the plan is approved.
                   text: `set-build-model: index ${numIdx} out of range (last list had ${list.length} entries). Run \`/set-build-model\` to refresh.`,
                 }],
               },
-            }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L797): ${(e as Error)?.message ?? String(e)}`) })
+            })
             return
           }
           buildModels.set(sessionID, { providerID: entry.providerID, modelID: entry.modelID })
@@ -687,7 +741,7 @@ Do NOT proceed with implementation until the plan is approved.
                 text: `Build model for this session set to: \`${entry.providerID}/${entry.modelID}\` (picked #${numIdx} from list). On the next plan approval, the session will switch to this model before build executes.`,
               }],
             },
-          }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L810): ${(e as Error)?.message ?? String(e)}`) })
+          })
           return
         }
 
@@ -695,7 +749,7 @@ Do NOT proceed with implementation until the plan is approved.
         if (arg !== "") {
           const parsed = parseModelString(arg)
           if (!parsed) {
-            await log(client, "error", `set-build-model: invalid format "${arg}". Expected "provider/model-id".`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L818): ${(e as Error)?.message ?? String(e)}`) })
+            await logged(client, "error", `set-build-model: invalid format "${arg}". Expected "provider/model-id".`)
             return
           }
           buildModels.set(sessionID, parsed)
@@ -708,7 +762,7 @@ Do NOT proceed with implementation until the plan is approved.
                 text: `Build model for this session set to: \`${parsed.providerID}/${parsed.modelID}\`. On the next plan approval, the session will switch to this model before build executes.`,
               }],
             },
-          }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L831): ${(e as Error)?.message ?? String(e)}`) })
+          })
           return
         }
 
@@ -724,13 +778,13 @@ Do NOT proceed with implementation until the plan is approved.
               text: `# set-build-model picker\n\nAvailable models (${entries.length}):\n\n${formatProviderList(entries)}\n\nReply with:\n- \`/set-build-model <number>\` to pick from this list (e.g. \`/set-build-model 5\`)\n- \`/set-build-model <provider>/<model-id>\` to set directly (e.g. \`/set-build-model ya-glm/glm\`)\n\nStored in this plugin's in-memory session memory — lost on opencode restart. For runtime model picker use the opencode UI (Ctrl-X M).`,
             }],
           },
-        }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L847): ${(e as Error)?.message ?? String(e)}`) })
+        })
         return
       }
 
       if (name === "plan-diag") {
         if (!sessionID) {
-          await log(client, "error", "plan-diag: no active session").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L853): ${(e as Error)?.message ?? String(e)}`) })
+          await logged(client, "error", "plan-diag: no active session")
           return
         }
         const subCmd = rawArgs.trim()
@@ -745,7 +799,7 @@ Do NOT proceed with implementation until the plan is approved.
                 text: `plan-diag: build-event memory cleared. Next session.updated will repopulate it.`,
               }],
             },
-          }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L868): ${(e as Error)?.message ?? String(e)}`) })
+          })
           return
         }
         const memEntries = Array.from(buildModels.entries()).map(([sid, m]) => `  ${sid.slice(0, 16)}… → ${m.providerID}/${m.modelID}`).join("\n") || "  (empty)"
@@ -772,17 +826,18 @@ ${chatEntries}
 - last target resolved: ${lastResolution.target ? `${lastResolution.target.providerID}/${lastResolution.target.modelID} (source: ${lastResolution.source})` : "never called"}
 
 Resolution priority on plan approval:
-1. chat.message memory for build agent (last picker choice)
+1. chat.message memory for build agent (TUI model.switched events)
 2. /set-build-model override
-3. agent.build.model from opencode.jsonc
-4. config.model global default
-5. opencode default
+3. chat.message memory for plan agent (fallback)
+4. agent.build.model from opencode.jsonc
+5. config.model global default
+6. agent.plan.model (last resort)
 
-Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.message captured: ...\` appear in opencode log.
+Diagnostic lines \`plan-review: exitPlanMode ...\` and \`plan-review-TUI: ...\` appear in opencode log.
 `,
             }],
           },
-        }).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L905): ${(e as Error)?.message ?? String(e)}`) })
+        })
         return
       }
 
@@ -790,17 +845,17 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
 
       const filePath = rawArgs.trim()
       if (!filePath) {
-        await log(client, "error", "Usage: /plan-review <path-to-plan.md>").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L913): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "error", "Usage: /plan-review <path-to-plan.md>")
         return
       }
       if (!sessionID) {
-        await log(client, "error", "plan-review: no active session").catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L917): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "error", "plan-review: no active session")
         return
       }
 
       const absolutePath = resolve(filePath)
       if (!existsSync(absolutePath)) {
-        await log(client, "error", `plan-review: file not found: ${absolutePath}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L923): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "error", `plan-review: file not found: ${absolutePath}`)
         return
       }
 
@@ -818,10 +873,15 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
           body: { parts: [{ type: "text", text: feedback }] },
         })
         if (!trimmed) {
-          await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
+          const exit = await exitPlanMode(client, buildModels, chatMessageMemory, lastResolution, sessionID, `User approved \`${absolutePath}\`.`)
+          if (exit.status === "no_model") {
+            await logged(client, "warn", `plan-review: no build model after approval of ${absolutePath}`)
+          } else if (exit.status === "prompt_failed") {
+            await logged(client, "error", `plan-review: build-exit prompt failed after approval of ${absolutePath}: ${exit.error}`)
+          }
         }
       } catch (err) {
-        await log(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`).catch((e: unknown) => { console.error(`plan-review: swallowed error in anon (L944): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`)
       }
     },
 
@@ -829,7 +889,7 @@ Diagnostic lines \`plan-review: session.updated: ...\` and \`plan-review: chat.m
       // Add plan_review to every agent's tool definitions so the model
       // always sees it, even when the agent's default tools exclude it.
       if (input.toolID === "plan_review") {
-        await log(client, "info", `plan-review: tool.definition fired for plan_review`).catch((e: unknown) => { console.error(`plan-review: swallowed error in diag (L827): ${(e as Error)?.message ?? String(e)}`) })
+        await logged(client, "info", `plan-review: tool.definition fired for plan_review`)
         return
       }
       // Suppress plan_exit — model sees two similar tools (plan_exit and

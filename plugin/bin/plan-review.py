@@ -164,11 +164,10 @@ def _sentinel_spawn(
     except (subprocess.CalledProcessError, OSError):
         sentinel.unlink(missing_ok=True)
         return None
-    deadline = time.monotonic() + 30
-    while not sentinel.exists() and time.monotonic() < deadline:
+    while not sentinel.exists():
         time.sleep(0.3)
     sentinel.unlink(missing_ok=True)
-    return 0 if sentinel.exists() else None
+    return 0
 
 
 def _spawn_blocking(editor_cmd: str, filepath: Path) -> int:
@@ -588,6 +587,20 @@ def run_tests() -> int:
 
     class TestSentinelSpawn(unittest.TestCase):
         """verify sentinel file is cleaned up on launch failure via _sentinel_spawn."""
+
+        def test_sentinel_spawn_success_returns_zero(self) -> None:
+            """_sentinel_spawn returns 0 (never None) when editor closes.
+            regression: v0.2.3 unchecked sentinel.exists() after unlink."""
+            from unittest.mock import patch
+            import os
+            with (
+                patch("subprocess.run"),
+                patch("time.sleep"),
+                patch("os.unlink", side_effect=lambda p, *a, **kw:
+                      None if "plan-done-" in str(p) else os.unlink(p, *a, **kw)),
+            ):
+                result = _sentinel_spawn(["test-cmd"], "vim", Path("/tmp/fake-plan.md"))
+            self.assertEqual(result, 0)
 
         def test_sentinel_spawn_launch_failure_returns_none(self) -> None:
             """_sentinel_spawn returns None on CalledProcessError and cleans sentinel."""

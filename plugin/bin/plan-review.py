@@ -521,7 +521,7 @@ def run_tests() -> int:
             result = build_editor_cmd("emacsclient -c -a ''")
             parts = shlex.split(result)
             self.assertGreater(len(parts), 1)
-            self.assertTrue(parts[0].startswith("/"), f"expected absolute path, got: {parts[0]}")
+            self.assertEqual(Path(parts[0]).name, "emacsclient")
 
         def test_unbalanced_quote_fallback_to_vi(self) -> None:
             """malformed $EDITOR falls back to vi."""

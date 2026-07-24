@@ -52,7 +52,7 @@ If none resolve, the plugin refuses the auto-switch and prints instructions. Use
 
 ### How model tracking works
 
-The [opencode fork](https://github.com/moonug/opencode/tree/tui-selection-events) exposes `api.state.selection()` and `tui.selection.changed`. At startup and on each event, the TUI plugin serializes a per-session metadata read-modify-write for the current plan/build models. It also shows a compact `Agent models` sidebar block with status-dot highlighting.
+The [opencode fork](https://github.com/moonug/opencode/tree/tui-selection-events) exposes `api.state.selection()` for the sidebar, advertises `api.state.modelSelectionEvents`, and emits `tui.model.selected` with the session, agent, and selected model. Each model event updates only that agent through a serialized per-session metadata read-modify-write; startup snapshots are never persisted. The TUI plugin also shows a compact `Agent models` sidebar block with status-dot highlighting.
 
 Published plugin types do not yet include this additive API, so the plugin uses feature detection. On stock opencode it logs a safe fallback and relies on the server-side `chat.message` hook; it never reads global `model.json` or guesses from Tab presses. This prevents cross-session contamination.
 

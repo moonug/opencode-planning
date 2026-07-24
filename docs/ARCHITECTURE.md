@@ -60,10 +60,10 @@ The plugin reads stdout via `BunShell.text()`. Empty stdout means approved; non-
 
 ## TUI agent tracking
 
-The fork exposes the TUI's local selection through `api.state.selection()` and `tui.selection.changed`. Published `@opencode-ai/plugin` types do not yet include this additive contract, so `plugin/tui-plugin.tsx` defines a small local type and checks for the function at runtime.
+The fork exposes the TUI's local selection through `api.state.selection()`, advertises `api.state.modelSelectionEvents`, and emits `tui.model.selected` after a user picks a model. Published `@opencode-ai/plugin` types do not yet include this additive contract, so `plugin/tui-plugin.tsx` defines a small local type and checks both capabilities at runtime.
 
-- Startup state and each selection event contain the active session, active agent, and per-agent model map.
-- Only IDs beginning with `ses_` are persisted. Plan/build picks are written to session metadata via `api.client.session.update({metadata:{planReviewDeferredPicks}})` with timestamps.
+- `tui.model.selected` carries the session ID, agent, and selected model. Startup and full selection snapshots are never persisted.
+- Only IDs beginning with `ses_` are persisted. Each event writes only its agent to session metadata via `api.client.session.update({metadata:{planReviewDeferredPicks}})` with timestamps.
 - Metadata reads and writes share one promise chain, preventing overlapping read-modify-write races while preserving session isolation.
 - A compact `Agent models` sidebar block displays current plan and build models with status-dot active-agent highlighting.
 - On the user's first real prompt the `chat.message` hook captures the model+agent pair (authoritative). `exitPlanMode` reads the metadata at plan-approval time — seconds-to-minutes after the TUI plugin's write — and promotes any deferred picks that are newer than the existing `chat.message` entry (timestamp comparison).
@@ -71,13 +71,13 @@ The fork exposes the TUI's local selection through `api.state.selection()` and `
 
 On stock opencode, feature detection logs a safe fallback and the server plugin relies on `chat.message`. The TUI plugin never intercepts Tab, reads `model.json`, or restores a model-pick heuristic.
 
-Key files: `plugin/tui-plugin.tsx` (native selection, serialized metadata writes, sidebar UI), `plugin/index.ts` (`chat.message` hook, `exitPlanMode` deferred-picker promotion with timestamps), `plugin/model-memory.ts` (`rememberBuildModel`, `sessionUpdateInfo`).
+Key files: `plugin/tui-plugin.tsx` (native model events, serialized metadata writes, sidebar UI), `plugin/index.ts` (`chat.message` hook, `exitPlanMode` deferred-picker promotion with timestamps), `plugin/model-memory.ts` (`rememberBuildModel`, `sessionUpdateInfo`).
 
 ## Files
 
 - `bin/plan-review.py` — Python helper. All editor-overlay logic, difflib, sentinel pattern, fallback cascade. Pure stdlib.
 - `plugin/index.ts` — opencode server plugin. Tool registration, slash command via `event` hook, system prompt injection, `chat.message` hook, `exitPlanMode` build-model resolution. Bun runtime.
-- `plugin/tui-plugin.tsx` — TUI-side plugin. Native selection tracking, sidebar model block, and session metadata writes.
+- `plugin/tui-plugin.tsx` — TUI-side plugin. Native model-event tracking, sidebar model block, and session metadata writes.
 - `plugin/model-memory.ts` — `rememberBuildModel` + `sessionUpdateInfo`: parses `session.updated` events into a per-session build-model `Map`.
 - `commands/plan-review.md`, `commands/set-build-model.md`, `commands/plan-diag.md` — slash-command bodies. Tell the model what to do when invoked.
 - `tests/plugin-smoke.ts` — end-to-end smoke (plugin loads, python helper diffs, model-resolution priority chain).

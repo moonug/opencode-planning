@@ -637,7 +637,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
         log: async (opts: any) => { logs.push(opts); return {} },
       },
     },
-    state: {},
+    state: { selection: () => ({ models: {} }) },
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: (plugin: any) => { slots.push(plugin); return "test" } },
     lifecycle: { signal: new AbortController().signal, onDispose: (_fn: any) => () => {} },
@@ -659,7 +659,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log(`[38b] TUI plugin logs v${EXPECTED_VERSION} and falls back safely: ok`)
 }
 
-// 38c. Native startup selection writes plan/build picks into only its session.
+// 38c. Native startup selection is display-only and never writes metadata.
 {
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
@@ -667,7 +667,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const updates: any[] = []
   const slots: any[] = []
   let selectionCalls = 0
-  let selection = {
+  const selection = {
     sessionID: "ses_start",
     agent: "plan",
     models: {
@@ -685,6 +685,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     },
     state: {
       provider: [],
+      modelSelectionEvents: true,
       selection: () => { selectionCalls++; return selection },
     },
     theme: { current: { primary: {}, textMuted: {} } },
@@ -694,12 +695,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
-  const write = updates[0]
-  if (write?.sessionID !== "ses_start") throw new Error("startup selection wrote wrong session")
-  if (write.metadata?.keep !== true) throw new Error("startup metadata merge dropped existing keys")
-  if (!write.metadata?.planReviewDeferredPicks?.plan?.pickedAt) throw new Error("plan startup pick missing timestamp")
-  if (!write.metadata?.planReviewDeferredPicks?.build?.pickedAt) throw new Error("build startup pick missing timestamp")
-  if (selectionCalls !== 1) throw new Error("native startup must read selection exactly once")
+  if (updates.length !== 0) throw new Error("startup selection must not write metadata")
+  if (selectionCalls !== 0) throw new Error("startup must not snapshot selection")
   if (typeof slots[0]?.slots?.sidebar_content !== "function") throw new Error("native runtime must register sidebar_content")
   if (slots[0]?.slots?.home_prompt_right || slots[0]?.slots?.session_prompt_right) {
     throw new Error("native runtime must not register prompt-right slots")
@@ -708,7 +705,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (tuiSource.includes("createSignal")) throw new Error("sidebar must not cache selection in plugin-local Solid state")
   if (!tuiSource.includes("Agent models")) throw new Error("heading must be Agent models")
   if (tuiSource.includes('border={["bottom"]}')) throw new Error("sidebar must not have a divider — should be compact like MCP")
-  console.log("[38c] native startup metadata and compact sidebar model block: ok")
+  console.log("[38c] native startup has no metadata write and registers compact sidebar model block: ok")
 }
 
 // 38e. exitPlanMode promotes metadata.planReviewDeferredPicks into
@@ -835,13 +832,13 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log("[38e] exitPlanMode promotes deferredPicks from session.metadata: ok")
 }
 
-// 39. Native selection events are serialized and remain session-scoped.
+// 39. Native model events write only their agent, serialize, and remain session-scoped.
 {
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
-  const metadata = new Map<string, Record<string, unknown>>()
+  const metadata = new Map<string, Record<string, unknown>>([["ses_A", { keep: true }]])
   let eventType = ""
-  let selectionHandler: any
+  let modelHandler: any
   const fakeApi = {
     client: {
       session: {
@@ -853,18 +850,18 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       },
       app: { log: async () => ({}) },
     },
-    state: { selection: () => ({ models: {} }) },
+    state: { modelSelectionEvents: true, selection: () => ({ models: {} }) },
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: () => "test" },
     lifecycle: { signal: new AbortController().signal, onDispose: () => () => {} },
-    event: { on: (type: string, handler: any) => { eventType = type; selectionHandler = handler; return () => {} } },
+    event: { on: (type: string, handler: any) => { eventType = type; modelHandler = handler; return () => {} } },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
-  if (eventType !== "tui.selection.changed") throw new Error("native selection event was not subscribed")
+  if (eventType !== "tui.model.selected") throw new Error("native model event was not subscribed")
 
-  selectionHandler({ type: eventType, data: { current: { sessionID: "ses_A", agent: "plan", models: { plan: { providerID: "openai", modelID: "a-plan" } } } } })
-  selectionHandler({ type: eventType, data: { current: { sessionID: "ses_B", agent: "build", models: { build: { providerID: "anthropic", modelID: "b-build" } } } } })
-  selectionHandler({ type: eventType, data: { current: { sessionID: "ses_A", agent: "build", models: { build: { providerID: "openai", modelID: "a-build" } } } } })
+  modelHandler({ type: eventType, data: { sessionID: "ses_A", agent: "plan", model: { providerID: "openai", modelID: "a-plan" } } })
+  modelHandler({ type: eventType, data: { sessionID: "ses_B", agent: "build", model: { providerID: "anthropic", modelID: "b-build" } } })
+  modelHandler({ type: eventType, data: { sessionID: "ses_A", agent: "build", model: { providerID: "openai", modelID: "a-build" } } })
   await new Promise(r => setTimeout(r, 50))
 
   const picksA = (metadata.get("ses_A") as any)?.planReviewDeferredPicks
@@ -872,18 +869,19 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (picksA?.plan?.modelID !== "a-plan" || picksA?.build?.modelID !== "a-build") {
     throw new Error("serialized writes lost ses_A picks: " + JSON.stringify(picksA))
   }
+  if ((metadata.get("ses_A") as any)?.keep !== true) throw new Error("metadata merge dropped existing keys")
   if (picksB?.build?.modelID !== "b-build" || picksB?.plan) {
     throw new Error("cross-session model contamination: " + JSON.stringify(picksB))
   }
-  console.log("[39] native selection writes serialize without cross-session contamination: ok")
+  console.log("[39] native per-agent model writes serialize without cross-session contamination: ok")
 }
 
 // 39b. Disposal unsubscribes and prevents an in-flight metadata read from
-//      committing stale selection state after a replacement plugin loads.
+//      committing a stale model event after a replacement plugin loads.
 {
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
-  let selectionHandler: any
+  let modelHandler: any
   let dispose: (() => void) | undefined
   let resolveRead: (() => void) | undefined
   let readStarted: (() => void) | undefined
@@ -903,21 +901,21 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
       },
       app: { log: async () => ({}) },
     },
-    state: { provider: [], selection: () => ({ models: {} }) },
+    state: { provider: [], modelSelectionEvents: true, selection: () => ({ models: {} }) },
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: () => "test" },
     lifecycle: { signal: new AbortController().signal, onDispose: (fn: () => void) => { dispose = fn; return () => {} } },
-    event: { on: (_type: string, handler: any) => { selectionHandler = handler; return () => { unsubscribed = true } } },
+    event: { on: (_type: string, handler: any) => { modelHandler = handler; return () => { unsubscribed = true } } },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
-  selectionHandler({ type: "tui.selection.changed", data: { current: { sessionID: "ses_disposed", models: { build: { providerID: "openai", modelID: "stale" } } } } })
+  modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_disposed", agent: "build", model: { providerID: "openai", modelID: "stale" } } })
   await started
   dispose?.()
   resolveRead?.()
   await new Promise((resolve) => setTimeout(resolve, 20))
-  if (!unsubscribed) throw new Error("dispose did not unsubscribe native selection handler")
-  if (updates !== 0) throw new Error("disposed plugin committed stale selection metadata")
-  console.log("[39b] disposal cancels queued native selection metadata writes: ok")
+  if (!unsubscribed) throw new Error("dispose did not unsubscribe native model handler")
+  if (updates !== 0) throw new Error("disposed plugin committed stale model metadata")
+  console.log("[39b] disposal cancels queued native model metadata writes: ok")
 }
 
 // 40. event hook accepts session.updated events from the v2 SDK shape
@@ -1115,26 +1113,29 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
 }
 
-// 42. Non-session startup selections never write metadata.
+// 42. Native model events for non-session IDs never write metadata.
 {
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
   let updates = 0
+  let modelHandler: any
   const fakeApi = {
     client: {
       session: { get: async () => ({ data: {} }), update: async () => { updates++; return { data: null } } },
       app: { log: async () => ({}) },
     },
-    state: { selection: () => ({ sessionID: "dummy", agent: "plan", models: { plan: { providerID: "x", modelID: "y" } } }) },
+    state: { modelSelectionEvents: true, selection: () => ({ sessionID: "dummy", agent: "plan", models: { plan: { providerID: "x", modelID: "y" } } }) },
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: () => "test" },
     lifecycle: { signal: new AbortController().signal, onDispose: () => () => {} },
-    event: { on: () => () => {} },
+    event: { on: (_type: string, handler: any) => { modelHandler = handler; return () => {} } },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
+  modelHandler({ type: "tui.model.selected", data: { sessionID: "dummy", agent: "plan", model: { providerID: "x", modelID: "y" } } })
+  modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_valid", agent: "general", model: { providerID: "x", modelID: "y" } } })
   await new Promise(r => setTimeout(r, 30))
   if (updates !== 0) throw new Error("invalid session ID must not write metadata")
-  console.log("[42] native selection ignores non-ses_ session IDs: ok")
+  console.log("[42] native model events ignore non-ses_ session IDs: ok")
 }
 
 // 45. chat.message hook handler captures per-session, per-agent model.

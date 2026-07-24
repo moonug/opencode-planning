@@ -16,15 +16,15 @@ type Selection = {
   models: Readonly<Record<string, SelectionModel>>
 }
 
-type SelectionChangedEvent = {
-  type: "tui.selection.changed"
-  data: { previous?: Selection; current: Selection }
+type ModelSelectedEvent = {
+  type: "tui.model.selected"
+  data: { sessionID?: string; agent: string; model: SelectionModel }
 }
 
 type NativeSelectionApi = {
-  state: { selection?: () => Selection }
+  state: { selection?: () => Selection; modelSelectionEvents?: true }
   event: {
-    on: (type: "tui.selection.changed", handler: (event: SelectionChangedEvent) => void) => () => void
+    on: (type: "tui.model.selected", handler: (event: ModelSelectedEvent) => void) => () => void
   }
 }
 
@@ -48,62 +48,57 @@ const tui: TuiPlugin = async (api) => {
   const native = api as TuiPluginApi & NativeSelectionApi
   const readSelection = native.state?.selection
 
-  if (typeof readSelection !== "function") {
+  if (typeof readSelection === "function" && native.state.modelSelectionEvents === true) {
+    const renderModels = () => {
+      const current = readSelection.call(native.state)
+      const theme = api.theme.current
+      const active = current.agent
+      const rows: Array<{ agent: string; model: SelectionModel | undefined }> = [
+        { agent: "plan", model: current.models.plan },
+        { agent: "build", model: current.models.build },
+      ]
+      return (
+        <box>
+          <text fg={theme.text}>
+            <b>Agent models</b>
+          </text>
+          {rows.map((row) => {
+            const isActive = active === row.agent
+            const dotFg = isActive ? theme.primary : theme.textMuted
+            const labelFg = isActive ? theme.primary : theme.text
+            return (
+              <box flexDirection="row" gap={1}>
+                <text flexShrink={0} fg={dotFg}>•</text>
+                <text fg={labelFg} wrapMode="word">
+                  <b>{row.agent.charAt(0).toUpperCase() + row.agent.slice(1)}</b>{" "}
+                  <span style={{ fg: theme.textMuted }}>{modelLabel(row.model, api.state.provider)}</span>
+                </text>
+              </box>
+            )
+          })}
+        </box>
+      )
+    }
+
+    api.slots.register({
+      order: 50,
+      slots: {
+        sidebar_content: renderModels,
+      },
+    })
+  } else {
     logInfo(api, "plan-review-TUI: native selection API unavailable; relying on chat.message fallback")
     return
   }
 
-  const renderModels = () => {
-    const current = readSelection.call(native.state)
-    const theme = api.theme.current
-    const active = current.agent
-    const rows: Array<{ agent: string; model: SelectionModel | undefined }> = [
-      { agent: "plan", model: current.models.plan },
-      { agent: "build", model: current.models.build },
-    ]
-    return (
-      <box>
-        <text fg={theme.text}>
-          <b>Agent models</b>
-        </text>
-        {rows.map((row) => {
-          const isActive = active === row.agent
-          const dotFg = isActive ? theme.primary : theme.textMuted
-          const labelFg = isActive ? theme.primary : theme.text
-          return (
-            <box flexDirection="row" gap={1}>
-              <text flexShrink={0} fg={dotFg}>•</text>
-              <text fg={labelFg} wrapMode="word">
-                <b>{row.agent.charAt(0).toUpperCase() + row.agent.slice(1)}</b>{" "}
-                <span style={{ fg: theme.textMuted }}>{modelLabel(row.model, api.state.provider)}</span>
-              </text>
-            </box>
-          )
-        })}
-      </box>
-    )
-  }
-
-  api.slots.register({
-    order: 50,
-    slots: {
-      sidebar_content: renderModels,
-    },
-  })
-
   let writeChain = Promise.resolve()
   let disposed = false
 
-  const recordSelection = (current: Selection): void => {
-    const sessionID = current.sessionID
+  const recordModel = ({ sessionID, agent, model }: ModelSelectedEvent["data"]): void => {
     if (!sessionID?.startsWith("ses_")) return
+    if ((agent !== "plan" && agent !== "build") || !model?.providerID || !model.modelID) return
 
     const capturedAt = Date.now()
-    const picks = (["plan", "build"] as const).flatMap((agent) => {
-      const model = current.models[agent]
-      return model ? [[agent, model] as const] : []
-    })
-    if (picks.length === 0) return
 
     writeChain = writeChain.then(async () => {
       if (disposed) return
@@ -115,12 +110,10 @@ const tui: TuiPlugin = async (api) => {
         ? { ...(previous as Record<string, unknown>) }
         : {}
 
-      for (const [agent, model] of picks) {
-        merged[agent] = {
-          providerID: model.providerID,
-          modelID: model.modelID,
-          pickedAt: capturedAt,
-        }
+      merged[agent] = {
+        providerID: model.providerID,
+        modelID: model.modelID,
+        pickedAt: capturedAt,
       }
       merged._writtenAt = new Date(capturedAt).toISOString()
 
@@ -128,20 +121,18 @@ const tui: TuiPlugin = async (api) => {
         sessionID,
         metadata: { ...metadata, planReviewDeferredPicks: merged },
       })
-      logInfo(api, `plan-review-TUI: native selection saved session=${sessionID} agents=${picks.map(([agent]) => agent).join(",")}`)
+      logInfo(api, `plan-review-TUI: native model saved session=${sessionID} agent=${agent}`)
     }).catch((error: unknown) => {
-      logInfo(api, `plan-review-TUI: native selection metadata write failed session=${sessionID}: ${(error as Error)?.message ?? String(error)}`)
+      logInfo(api, `plan-review-TUI: native model metadata write failed session=${sessionID}: ${(error as Error)?.message ?? String(error)}`)
     })
   }
 
-  const initial = readSelection.call(native.state)
-  recordSelection(initial)
-  const unsubscribe = native.event.on("tui.selection.changed", (event) => recordSelection(event.data.current))
+  const unsubscribe = native.event.on("tui.model.selected", (event) => recordModel(event.data))
   api.lifecycle.onDispose(() => {
     disposed = true
     unsubscribe()
   })
-  logInfo(api, `plan-review-TUI: ready native-selection build=${BUILD_TAG}`)
+  logInfo(api, `plan-review-TUI: ready native-model-events build=${BUILD_TAG}`)
 }
 
 export default { id: "plan-review-tui", tui }

@@ -16,7 +16,7 @@
 
 ## Native TUI selection
 
-The fork adds `api.state.selection()` and the local `tui.selection.changed` event. Use a small additive local type plus feature detection until published `@opencode-ai/plugin` types catch up.
+The fork adds `api.state.selection()`, `api.state.modelSelectionEvents`, and the local `tui.model.selected` event. Use a small additive local type plus feature detection until published `@opencode-ai/plugin` types catch up.
 
 Persist plan/build selections only for `ses_` IDs through serialized session metadata read-modify-writes. Never read global `model.json`, intercept Tab, or infer pending model picks. When the native API is absent, log the fallback and rely on `chat.message`.
 

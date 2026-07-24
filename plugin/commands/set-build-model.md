@@ -38,6 +38,6 @@ This command sits at priority #2 — it overrides the config but is itself
 overridden by any TUI model picker choice recorded for the build agent,
 or by a later build prompt.
 
-Note: the fork's TUI plugin tracks `api.state.selection()` and
-`tui.selection.changed`. Stock opencode falls back safely to
+Note: the fork's TUI plugin reads `api.state.selection()` for display and
+persists explicit `tui.model.selected` events. Stock opencode falls back safely to
 `chat.message`; neither path reads global `model.json`.

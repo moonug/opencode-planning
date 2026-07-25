@@ -284,6 +284,11 @@ async function getGlobalModel(client: any): Promise<ModelRef | undefined> {
     const res = await client.config.get()
     const model = (res as any)?.data?.model ?? (res as any)?.model
     if (typeof model === "string") return parseModelString(model)
+    if (model && typeof model === "object"
+      && typeof model.providerID === "string"
+      && typeof model.modelID === "string") {
+      return { providerID: model.providerID, modelID: model.modelID }
+    }
   } catch (err) {
     console.error(`plan-review: getGlobalModel failed: ${(err as Error)?.message ?? String(err)}`)
   }
@@ -789,14 +794,14 @@ Do NOT proceed with implementation until the plan is approved.
         }
         const subCmd = rawArgs.trim()
         if (subCmd === "reset") {
-          buildModels.clear()
+          buildModels.delete(sessionID)
           await client.session.prompt({
             path: { id: sessionID },
             body: {
               noReply: true,
               parts: [{
                 type: "text",
-                text: `plan-diag: build-event memory cleared. Next session.updated will repopulate it.`,
+                text: `plan-diag: build-event memory cleared for this session. Next session.updated will repopulate it.`,
               }],
             },
           })
@@ -844,18 +849,26 @@ Diagnostic lines \`plan-review: exitPlanMode ...\` and \`plan-review-TUI: ...\` 
       if (name !== "plan-review") return
 
       const filePath = rawArgs.trim()
-      if (!filePath) {
-        await logged(client, "error", "Usage: /plan-review <path-to-plan.md>")
-        return
-      }
       if (!sessionID) {
         await logged(client, "error", "plan-review: no active session")
+        return
+      }
+      if (!filePath) {
+        await logged(client, "error", "Usage: /plan-review <path-to-plan.md>")
+        await client.session.prompt({
+          path: { id: sessionID },
+          body: { noReply: true, parts: [{ type: "text", text: "Usage: /plan-review <path-to-plan.md>" }] },
+        }).catch((e: unknown) => logged(client, "error", `plan-review: usage prompt failed: ${(e as Error)?.message ?? String(e)}`))
         return
       }
 
       const absolutePath = resolve(filePath)
       if (!existsSync(absolutePath)) {
         await logged(client, "error", `plan-review: file not found: ${absolutePath}`)
+        await client.session.prompt({
+          path: { id: sessionID },
+          body: { noReply: true, parts: [{ type: "text", text: `plan-review: file not found: ${absolutePath}` }] },
+        }).catch((e: unknown) => logged(client, "error", `plan-review: not-found prompt failed: ${(e as Error)?.message ?? String(e)}`))
         return
       }
 
@@ -886,8 +899,8 @@ Diagnostic lines \`plan-review: exitPlanMode ...\` and \`plan-review-TUI: ...\` 
     },
 
     "tool.definition": async (input, output) => {
-      // Add plan_review to every agent's tool definitions so the model
-      // always sees it, even when the agent's default tools exclude it.
+      // plan_review visibility is injected via the config hook's
+      // primary_tools. This branch just logs for diagnostics.
       if (input.toolID === "plan_review") {
         await logged(client, "info", `plan-review: tool.definition fired for plan_review`)
         return

@@ -4,6 +4,9 @@
   "description": "opencode plugin: review plans in $EDITOR with per-agent model tracking",
   "type": "module",
   "main": "index.ts",
+  "engines": {
+    "node": ">=24"
+  },
   "exports": {
     ".": "./index.ts",
     "./tui": "./tui-plugin.tsx"

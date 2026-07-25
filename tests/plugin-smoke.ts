@@ -6,6 +6,20 @@ import { spawnSync } from "node:child_process"
 import { homedir } from "node:os"
 import "@opentui/solid/preload"
 
+// Force no-op EDITOR for the whole smoke run: tests that exercise
+// plan_review.execute call the python helper, which spawns $EDITOR. Without
+// forcing this, a system EDITOR=vim would open real vim and block on user
+// input in tests [36b]/[36c]/[9c] etc. Tests [2]/[3] override EDITOR with their
+// own sed/no-op scripts via spawnSync env, which still wins for those calls.
+// NOTE: do not set VISUAL here — plan-review.py prefers VISUAL over EDITOR
+// (lines 105-106/135-136), so a global VISUAL would leak past per-test EDITOR
+// overrides in spawnSync. Only force EDITOR.
+const _defaultNoopEditor = "/tmp/pr-smoke-default-noop.sh"
+writeFileSync(_defaultNoopEditor, "#!/bin/sh\nexit 0\n")
+chmodSync(_defaultNoopEditor, 0o755)
+process.env.EDITOR = _defaultNoopEditor
+delete process.env.VISUAL
+
 const pluginPath = new URL("../plugin/index.ts", import.meta.url).pathname
 const scriptPath = new URL("../plugin/bin/plan-review.py", import.meta.url).pathname
 const { rememberBuildModel, sessionUpdateInfo } = await import("../plugin/model-memory.ts")
@@ -1926,6 +1940,102 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
 
   console.log("[9] diagnostic log + /plan-diag handler: ok")
+}
+
+// 9b. /plan-diag reset is per-session: other sessions' build memory survives
+{
+  const logs: any[] = []
+  const prompts: any[] = []
+  const testHooks = await mod.default({
+    client: {
+      app: { log: async (opts: any) => { logs.push(opts) } },
+      session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+    } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+
+  // Populate build memory for TWO sessions.
+  for (const sid of ["ses_keep", "ses_reset"]) {
+    await testHooks.event({
+      event: {
+        type: "session.updated.1",
+        data: { sessionID: sid, info: { id: sid, agent: "build", model: { providerID: "ya-glm", id: sid === "ses_keep" ? "glm-keep" : "glm-reset" } } },
+      },
+    } as any)
+  }
+
+  // reset only ses_reset
+  prompts.length = 0
+  await testHooks.event({
+    event: { type: "command.executed", properties: { name: "plan-diag", arguments: "reset", sessionID: "ses_reset" } },
+  } as any)
+  if (!prompts.some((p: any) => p.body?.parts?.[0]?.text?.includes("cleared for this session"))) {
+    throw new Error("/plan-diag reset should say 'cleared for this session' (per-session fix B1)")
+  }
+
+  // ses_keep's build model must still be present in /plan-diag output
+  prompts.length = 0
+  await testHooks.event({
+    event: { type: "command.executed", properties: { name: "plan-diag", arguments: "", sessionID: "ses_keep" } },
+  } as any)
+  const diagText = prompts.find((p: any) => p.body?.parts?.[0]?.text?.includes("# plan-diag"))?.body.parts[0].text
+  if (!diagText) throw new Error("/plan-diag did not produce output for ses_keep")
+  if (!diagText.includes("glm-keep")) {
+    throw new Error("B1 regression: /plan-diag reset wiped another session's build memory. diag:\n" + diagText)
+  }
+
+  console.log("[9b] /plan-diag reset is per-session (B1): other session's build memory survives: ok")
+}
+
+// 9c. getGlobalModel handles object-shaped config.model (B2)
+{
+  const logs: any[] = []
+  const prompts: any[] = []
+  const fakeConfig = { data: { model: { providerID: "ya-glm", modelID: "glm-obj" } } }
+  const testHooks = await mod.default({
+    client: {
+      app: { log: async (opts: any) => { logs.push(opts) } },
+      session: { prompt: async (opts: any) => { prompts.push(opts); return {} } },
+      config: { get: async () => fakeConfig },
+    } as any,
+    project: {} as any,
+    directory: "/tmp",
+    worktree: "/tmp",
+    serverUrl: new URL("http://x"),
+    $,
+  })
+
+  // No-op EDITOR so runPlanReview returns empty diff (plan approval path).
+  const fakeFs = await import("node:fs")
+  const tmpEditor = "/tmp/pr-smoke-b2-editor.sh"
+  fakeFs.writeFileSync(tmpEditor, "#!/bin/sh\nexit 0\n")
+  fakeFs.chmodSync(tmpEditor, 0o755)
+  const oldEditor = process.env.EDITOR
+  process.env.EDITOR = tmpEditor
+  try {
+    await testHooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_global_obj", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+    )
+  } finally {
+    if (oldEditor === undefined) delete process.env.EDITOR
+    else process.env.EDITOR = oldEditor
+    fakeFs.rmSync(tmpEditor, { force: true })
+  }
+  const resolution = logs.find((l: any) => l.body?.message?.startsWith("plan-review: exitPlanMode resolution:"))
+  if (!resolution) throw new Error("B2: expected exitPlanMode resolution log, got logs:\n" + logs.map((l:any)=>l.body?.message).join("\n"))
+  const msg = resolution.body.message
+  if (!msg.includes("ya-glm/glm-obj")) {
+    throw new Error("B2 regression: object-shaped config.model not resolved. resolution: " + msg)
+  }
+  if (!msg.includes("source=config.model")) {
+    throw new Error("B2: expected source=config.model in resolution, got: " + msg)
+  }
+  console.log("[9c] getGlobalModel handles object-shaped config.model (B2): ok")
 }
 
 console.log("[OK] all smoke checks passed")

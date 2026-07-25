@@ -9,8 +9,10 @@ active session. Useful when build exited on the wrong model and you need
 to find out why the priority chain resolved that target.
 
 Usage: `/plan-diag` — prints current state
-       `/plan-diag reset` — clears in-memory build-event memory (forces
-                            re-detection on next session.updated)
+       `/plan-diag reset` — clears in-memory build-event memory for the
+                            current session only (forces re-detection on next
+                            session.updated). Other concurrent sessions keep
+                            their remembered build models.
 
 Output sections:
 

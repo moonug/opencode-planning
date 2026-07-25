@@ -589,18 +589,73 @@ def run_tests() -> int:
         """verify sentinel file is cleaned up on launch failure via _sentinel_spawn."""
 
         def test_sentinel_spawn_success_returns_zero(self) -> None:
-            """_sentinel_spawn returns 0 (never None) when editor closes.
-            regression: v0.2.3 unchecked sentinel.exists() after unlink."""
+            """_sentinel_spawn returns 0 when the sentinel file appears after polling.
+            regression: v0.2.3 unchecked sentinel.exists() after unlink.
+
+            The real flow: mkstemp creates the sentinel, we unlink it, spawn the
+            overlay (which touches it on editor close), then poll until it exists.
+            This test exercises the polling loop: the sentinel is genuinely absent
+            after unlink, and time.sleep recreates it (mimicking the spawned
+            shell's `touch`), so a regression that skipped the loop (or checked
+            exists() before unlink) would fail.
+            """
             from unittest.mock import patch
-            import os
+            state = {"sleeps": 0, "sentinel": None}
+
+            def fake_sleep(_s):
+                state["sleeps"] += 1
+                if state["sentinel"] is not None:
+                    state["sentinel"].touch()
+
+            def fake_run(cmd, *a, **kw):
+                # Capture the sentinel path from the wrapper string and
+                # schedule its creation on the first sleep call.
+                wrapper = cmd[-1] if isinstance(cmd, list) else None
+                if isinstance(wrapper, str) and "touch " in wrapper:
+                    import shlex as _sh
+                    parts = _sh.split(wrapper)
+                    touch_idx = parts.index("touch")
+                    if touch_idx + 1 < len(parts):
+                        state["sentinel"] = Path(parts[touch_idx + 1])
+                return None
+
             with (
-                patch("subprocess.run"),
-                patch("time.sleep"),
-                patch("os.unlink", side_effect=lambda p, *a, **kw:
-                      None if "plan-done-" in str(p) else os.unlink(p, *a, **kw)),
+                patch("subprocess.run", side_effect=fake_run),
+                patch("time.sleep", side_effect=fake_sleep),
             ):
                 result = _sentinel_spawn(["test-cmd"], "vim", Path("/tmp/fake-plan.md"))
             self.assertEqual(result, 0)
+            self.assertGreaterEqual(state["sleeps"], 1,
+                                    "polling loop never ran — sentinel.exists() must have been False at least once")
+
+        def test_sentinel_spawn_polls_until_file_appears(self) -> None:
+            """_sentinel_spawn polls until the sentinel appears; counts sleeps."""
+            from unittest.mock import patch
+            state = {"sleeps": 0, "sentinel": None}
+
+            def fake_sleep(_s):
+                state["sleeps"] += 1
+                if state["sleeps"] >= 3 and state["sentinel"] is not None:
+                    state["sentinel"].touch()
+
+            def fake_run(cmd, *a, **kw):
+                wrapper = cmd[-1] if isinstance(cmd, list) else None
+                if isinstance(wrapper, str) and "touch " in wrapper:
+                    import shlex as _sh
+                    parts = _sh.split(wrapper)
+                    touch_idx = parts.index("touch")
+                    if touch_idx + 1 < len(parts):
+                        state["sentinel"] = Path(parts[touch_idx + 1])
+                return None
+
+            with (
+                patch("subprocess.run", side_effect=fake_run),
+                patch("time.sleep", side_effect=fake_sleep),
+            ):
+                result = _sentinel_spawn(["test-cmd"], "vim", Path("/tmp/fake-plan.md"))
+            self.assertEqual(result, 0)
+            self.assertEqual(state["sleeps"], 3,
+                             f"expected exactly 3 sleeps before sentinel appears, got {state['sleeps']}")
 
         def test_sentinel_spawn_launch_failure_returns_none(self) -> None:
             """_sentinel_spawn returns None on CalledProcessError and cleans sentinel."""

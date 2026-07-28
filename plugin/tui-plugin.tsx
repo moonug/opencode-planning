@@ -16,16 +16,14 @@ type Selection = {
   models: Readonly<Record<string, SelectionModel>>
 }
 
-type ModelSelectedEvent = {
-  type: "tui.model.selected"
-  data: { sessionID?: string; agent: string; model: SelectionModel }
-}
-
 type NativeSelectionApi = {
   state: { selection?: () => Selection; modelSelectionEvents?: true }
-  event: {
-    on: (type: "tui.model.selected", handler: (event: ModelSelectedEvent) => void) => () => void
-  }
+}
+
+type ModelSelectedEventData = {
+  sessionID?: string
+  agent: string
+  model: SelectionModel
 }
 
 const logInfo = (api: TuiPluginApi, message: string): void => {
@@ -94,12 +92,51 @@ const tui: TuiPlugin = async (api) => {
   let writeChain = Promise.resolve()
   let disposed = false
 
-  const recordModel = ({ sessionID, agent, model }: ModelSelectedEvent["data"]): void => {
-    if (!sessionID?.startsWith("ses_")) return
-    if ((agent !== "plan" && agent !== "build") || !model?.providerID || !model.modelID) return
+  const pendingHomePicks: Record<string, { providerID: string; modelID: string; pickedAt: number }> = {}
+
+  const flushHomePicks = (sessionID: string): void => {
+    const agents = Object.keys(pendingHomePicks)
+    if (agents.length === 0) return
 
     const capturedAt = Date.now()
+    writeChain = writeChain.then(async () => {
+      if (disposed) return
+      const response = await api.client.session.get({ sessionID })
+      if (disposed) return
+      const metadata = response.data?.metadata ?? {}
+      const previous = metadata.planReviewDeferredPicks
+      const merged: Record<string, unknown> = previous && typeof previous === "object"
+        ? { ...(previous as Record<string, unknown>) }
+        : {}
 
+      for (const agent of agents) {
+        const pick = pendingHomePicks[agent]!
+        merged[agent] = { providerID: pick.providerID, modelID: pick.modelID, pickedAt: pick.pickedAt }
+        delete pendingHomePicks[agent]
+      }
+      merged._writtenAt = new Date(capturedAt).toISOString()
+
+      await api.client.session.update({
+        sessionID,
+        metadata: { ...metadata, planReviewDeferredPicks: merged },
+      })
+      logInfo(api, `plan-review-TUI: flushed home picks to session=${sessionID} agents=${agents.join(",")}`)
+    }).catch((error: unknown) => {
+      logInfo(api, `plan-review-TUI: flush home picks failed session=${sessionID}: ${(error as Error)?.message ?? String(error)}`)
+    })
+  }
+
+  const recordModel = ({ sessionID, agent, model }: ModelSelectedEventData): void => {
+    if ((agent !== "plan" && agent !== "build") || !model?.providerID || !model.modelID) return
+
+    if (!sessionID?.startsWith("ses_")) {
+      pendingHomePicks[agent] = { providerID: model.providerID, modelID: model.modelID, pickedAt: Date.now() }
+      return
+    }
+
+    flushHomePicks(sessionID)
+
+    const capturedAt = Date.now()
     writeChain = writeChain.then(async () => {
       if (disposed) return
       const response = await api.client.session.get({ sessionID })
@@ -127,10 +164,20 @@ const tui: TuiPlugin = async (api) => {
     })
   }
 
-  const unsubscribe = native.event.on("tui.model.selected", (event) => recordModel(event.data))
+  const unsubscribeModel = (api.event as any)["on"]("tui.model.selected", (event: any) => recordModel(event.data))
+  let previousSessionID: string | undefined
+  const unsubscribeSelection = (api.event as any)["on"]("tui.selection.changed", (event: any) => {
+    const current = event.data.current
+    const sid = current.sessionID
+    if (sid?.startsWith("ses_") && previousSessionID !== sid) {
+      flushHomePicks(sid)
+    }
+    previousSessionID = sid
+  })
   api.lifecycle.onDispose(() => {
     disposed = true
-    unsubscribe()
+    unsubscribeModel()
+    unsubscribeSelection()
   })
   logInfo(api, `plan-review-TUI: ready native-model-events build=${BUILD_TAG}`)
 }

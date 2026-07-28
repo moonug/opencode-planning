@@ -851,7 +851,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
   const metadata = new Map<string, Record<string, unknown>>([["ses_A", { keep: true }]])
-  let eventType = ""
+  const subscribedTypes: string[] = []
   let modelHandler: any
   const fakeApi = {
     client: {
@@ -868,14 +868,15 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: () => "test" },
     lifecycle: { signal: new AbortController().signal, onDispose: () => () => {} },
-    event: { on: (type: string, handler: any) => { eventType = type; modelHandler = handler; return () => {} } },
+    event: { on: (type: string, handler: any) => { subscribedTypes.push(type); if (type === "tui.model.selected") modelHandler = handler; return () => {} } },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
-  if (eventType !== "tui.model.selected") throw new Error("native model event was not subscribed")
+  if (!subscribedTypes.includes("tui.model.selected")) throw new Error("native model event was not subscribed")
+  if (!subscribedTypes.includes("tui.selection.changed")) throw new Error("selection.changed event was not subscribed")
 
-  modelHandler({ type: eventType, data: { sessionID: "ses_A", agent: "plan", model: { providerID: "openai", modelID: "a-plan" } } })
-  modelHandler({ type: eventType, data: { sessionID: "ses_B", agent: "build", model: { providerID: "anthropic", modelID: "b-build" } } })
-  modelHandler({ type: eventType, data: { sessionID: "ses_A", agent: "build", model: { providerID: "openai", modelID: "a-build" } } })
+  modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_A", agent: "plan", model: { providerID: "openai", modelID: "a-plan" } } })
+  modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_B", agent: "build", model: { providerID: "anthropic", modelID: "b-build" } } })
+  modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_A", agent: "build", model: { providerID: "openai", modelID: "a-build" } } })
   await new Promise(r => setTimeout(r, 50))
 
   const picksA = (metadata.get("ses_A") as any)?.planReviewDeferredPicks
@@ -896,11 +897,12 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
   let modelHandler: any
+  let selectionHandler: any
   let dispose: (() => void) | undefined
   let resolveRead: (() => void) | undefined
   let readStarted: (() => void) | undefined
   let updates = 0
-  let unsubscribed = false
+  let unsubscribedCount = 0
   const started = new Promise<void>((resolve) => { readStarted = resolve })
   const gate = new Promise<void>((resolve) => { resolveRead = resolve })
   const fakeApi = {
@@ -919,7 +921,11 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: () => "test" },
     lifecycle: { signal: new AbortController().signal, onDispose: (fn: () => void) => { dispose = fn; return () => {} } },
-    event: { on: (_type: string, handler: any) => { modelHandler = handler; return () => { unsubscribed = true } } },
+    event: { on: (type: string, handler: any) => {
+      if (type === "tui.model.selected") modelHandler = handler
+      if (type === "tui.selection.changed") selectionHandler = handler
+      return () => { unsubscribedCount++ }
+    } },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_disposed", agent: "build", model: { providerID: "openai", modelID: "stale" } } })
@@ -927,7 +933,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   dispose?.()
   resolveRead?.()
   await new Promise((resolve) => setTimeout(resolve, 20))
-  if (!unsubscribed) throw new Error("dispose did not unsubscribe native model handler")
+  if (unsubscribedCount < 2) throw new Error("dispose did not unsubscribe both handlers: " + unsubscribedCount)
   if (updates !== 0) throw new Error("disposed plugin committed stale model metadata")
   console.log("[39b] disposal cancels queued native model metadata writes: ok")
 }
@@ -1127,29 +1133,66 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
 }
 
-// 42. Native model events for non-session IDs never write metadata.
+// 42. Native model events for non-session IDs never write metadata immediately.
+//     Home picks for build/plan are cached and flushed to session metadata
+//     only when a valid ses_ session becomes active (via tui.selection.changed).
+//     This fixes the regression where picking build at home then submitting
+//     caused plan to overwrite build in deferredPicks.
 {
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
-  let updates = 0
+  let updates: any[] = []
   let modelHandler: any
+  let selectionHandler: any
+  const written: any[] = []
   const fakeApi = {
     client: {
-      session: { get: async () => ({ data: {} }), update: async () => { updates++; return { data: null } } },
+      session: {
+        get: async () => ({ data: {} }),
+        update: async (opts: any) => { updates.push(opts); return { data: null } },
+      },
       app: { log: async () => ({}) },
     },
-    state: { modelSelectionEvents: true, selection: () => ({ sessionID: "dummy", agent: "plan", models: { plan: { providerID: "x", modelID: "y" } } }) },
+    state: { modelSelectionEvents: true, selection: () => ({ sessionID: undefined, agent: "plan", models: {} }) },
     theme: { current: { primary: {}, textMuted: {} } },
     slots: { register: () => "test" },
     lifecycle: { signal: new AbortController().signal, onDispose: () => () => {} },
-    event: { on: (_type: string, handler: any) => { modelHandler = handler; return () => {} } },
+    event: { on: (type: string, handler: any) => {
+      if (type === "tui.model.selected") modelHandler = handler
+      if (type === "tui.selection.changed") selectionHandler = handler
+      return () => {}
+    } },
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
-  modelHandler({ type: "tui.model.selected", data: { sessionID: "dummy", agent: "plan", model: { providerID: "x", modelID: "y" } } })
-  modelHandler({ type: "tui.model.selected", data: { sessionID: "ses_valid", agent: "general", model: { providerID: "x", modelID: "y" } } })
+
+  // 1. Pick build model at home — no session ID yet. Should NOT write yet.
+  modelHandler({ type: "tui.model.selected", data: { sessionID: undefined, agent: "build", model: { providerID: "anthropic", modelID: "claude-4" } } })
+  await new Promise(r => setTimeout(r, 10))
+  if (updates.length !== 0) throw new Error("[42a] home build pick must not write immediately, got: " + updates.length)
+
+  // 2. Pick plan model at home — still no session. Should NOT write yet.
+  modelHandler({ type: "tui.model.selected", data: { sessionID: undefined, agent: "plan", model: { providerID: "openai", modelID: "gpt-5" } } })
+  await new Promise(r => setTimeout(r, 10))
+  if (updates.length !== 0) throw new Error("[42b] home plan pick must not write immediately, got: " + updates.length)
+
+  // 3. Emit a selection.changed to a valid session — should trigger flush.
+  selectionHandler({ type: "tui.selection.changed", data: { current: { sessionID: "ses_home_test", agent: "plan", models: {} } } })
   await new Promise(r => setTimeout(r, 30))
-  if (updates !== 0) throw new Error("invalid session ID must not write metadata")
-  console.log("[42] native model events ignore non-ses_ session IDs: ok")
+
+  if (updates.length !== 1) throw new Error("[42c] expected exactly 1 flush write, got: " + updates.length)
+  const flushed = updates[0]
+  if (!flushed?.metadata?.planReviewDeferredPicks) throw new Error("[42d] flush must write planReviewDeferredPicks")
+  const picks = flushed.metadata.planReviewDeferredPicks
+  if (picks.build?.modelID !== "claude-4") throw new Error(`[42e] build should be claude-4, got: ${JSON.stringify(picks.build)}`)
+  if (picks.plan?.modelID !== "gpt-5") throw new Error(`[42f] plan should be gpt-5, got: ${JSON.stringify(picks.plan)}`)
+  if (picks.build?.modelID === picks.plan?.modelID) throw new Error("[42g] build and plan must not be the same model")
+
+  // 4. Picking the same session again should not double-flush
+  selectionHandler({ type: "tui.selection.changed", data: { current: { sessionID: "ses_home_test", agent: "build", models: {} } } })
+  await new Promise(r => setTimeout(r, 30))
+  if (updates.length !== 1) throw new Error("[42h] re-triggering same session must not re-flush, got: " + updates.length)
+
+  console.log("[42] home picks deferred and flushed on session transition: ok")
 }
 
 // 45. chat.message hook handler captures per-session, per-agent model.

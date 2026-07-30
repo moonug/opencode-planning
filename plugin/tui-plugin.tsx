@@ -93,6 +93,7 @@ const tui: TuiPlugin = async (api) => {
   let disposed = false
 
   const pendingHomePicks: Record<string, { providerID: string; modelID: string; pickedAt: number }> = {}
+  let pendingInitialSelection: { plan?: { providerID: string; modelID: string }; build?: { providerID: string; modelID: string }; capturedAt: number } | null = null
 
   const flushHomePicks = (sessionID: string): void => {
     const agents = Object.keys(pendingHomePicks)
@@ -123,6 +124,61 @@ const tui: TuiPlugin = async (api) => {
       logInfo(api, `plan-review-TUI: flushed home picks to session=${sessionID} agents=${agents.join(",")}`)
     }).catch((error: unknown) => {
       logInfo(api, `plan-review-TUI: flush home picks failed session=${sessionID}: ${(error as Error)?.message ?? String(error)}`)
+    })
+  }
+
+  const flushInitialSelection = (sessionID: string): void => {
+    if (!pendingInitialSelection) return
+    const sel = pendingInitialSelection
+    pendingInitialSelection = null
+
+    const capturedAt = Date.now()
+    writeChain = writeChain.then(async () => {
+      if (disposed) return
+      const response = await api.client.session.get({ sessionID })
+      if (disposed) return
+      const metadata = response.data?.metadata ?? {}
+
+      const snapshot: Record<string, unknown> = {}
+      if (sel.plan) snapshot.plan = { providerID: sel.plan.providerID, modelID: sel.plan.modelID, pickedAt: capturedAt }
+      if (sel.build) snapshot.build = { providerID: sel.build.providerID, modelID: sel.build.modelID, pickedAt: capturedAt }
+      snapshot.capturedAt = new Date(capturedAt).toISOString()
+
+      await api.client.session.update({
+        sessionID,
+        metadata: { ...metadata, tuiCurrentSelection: snapshot },
+      })
+      logInfo(api, `plan-review-TUI: flushed initial selection to session=${sessionID}`)
+    }).catch((error: unknown) => {
+      logInfo(api, `plan-review-TUI: flush initial selection failed session=${sessionID}: ${(error as Error)?.message ?? String(error)}`)
+    })
+  }
+
+  const snapshotCurrentSelection = (sessionID: string, current: Selection): void => {
+    const planModel = current.models.plan
+    const buildModel = current.models.build
+    if (!planModel && !buildModel) return
+
+    const capturedAt = Date.now()
+    writeChain = writeChain.then(async () => {
+      if (disposed) return
+      const response = await api.client.session.get({ sessionID })
+      if (disposed) return
+      const metadata = response.data?.metadata ?? {}
+      const previous = (metadata.tuiCurrentSelection as Record<string, unknown> | undefined) ?? {}
+
+      const snapshot: Record<string, unknown> = { ...previous }
+      if (planModel) snapshot.plan = { providerID: planModel.providerID, modelID: planModel.modelID, pickedAt: capturedAt }
+      if (buildModel) snapshot.build = { providerID: buildModel.providerID, modelID: buildModel.modelID, pickedAt: capturedAt }
+      snapshot.capturedAt = new Date(capturedAt).toISOString()
+
+      await api.client.session.update({
+        sessionID,
+        metadata: { ...metadata, tuiCurrentSelection: snapshot },
+      })
+      logInfo(api, `plan-review-TUI: snapshot current selection session=${sessionID} plan=${planModel?.modelID ?? "-"} build=${buildModel?.modelID ?? "-"}`)
+    }).catch((error: unknown) => {
+      logInfo(api, `plan-review-TUI: snapshot current selection failed session=${sessionID}: ${(error as Error)?.message ?? String(error)}`)
     })
   }
 
@@ -164,13 +220,65 @@ const tui: TuiPlugin = async (api) => {
     })
   }
 
+  const readAndCaptureInitial = (): void => {
+    if (typeof readSelection !== "function") return
+    const current = readSelection.call(native.state)
+    const sid = current.sessionID
+    const capturedAt = Date.now()
+
+    if (sid?.startsWith("ses_")) {
+      const planModel = current.models.plan
+      const buildModel = current.models.build
+      if (!planModel && !buildModel) return
+      writeChain = writeChain.then(async () => {
+        if (disposed) return
+        const response = await api.client.session.get({ sessionID: sid })
+        if (disposed) return
+        const metadata = response.data?.metadata ?? {}
+        const snapshot: Record<string, unknown> = {}
+        if (planModel) snapshot.plan = { providerID: planModel.providerID, modelID: planModel.modelID, pickedAt: capturedAt }
+        if (buildModel) snapshot.build = { providerID: buildModel.providerID, modelID: buildModel.modelID, pickedAt: capturedAt }
+        snapshot.capturedAt = new Date(capturedAt).toISOString()
+        await api.client.session.update({ sessionID: sid, metadata: { ...metadata, tuiCurrentSelection: snapshot } })
+        logInfo(api, `plan-review-TUI: startup snapshot session=${sid} plan=${planModel?.modelID ?? "-"} build=${buildModel?.modelID ?? "-"}`)
+      }).catch((error: unknown) => {
+        logInfo(api, `plan-review-TUI: startup snapshot failed session=${sid}: ${(error as Error)?.message ?? String(error)}`)
+      })
+    } else {
+      const planModel = current.models.plan
+      const buildModel = current.models.build
+      if (!planModel && !buildModel) return
+      pendingInitialSelection = {
+        plan: planModel ? { providerID: planModel.providerID, modelID: planModel.modelID } : undefined,
+        build: buildModel ? { providerID: buildModel.providerID, modelID: buildModel.modelID } : undefined,
+        capturedAt,
+      }
+      logInfo(api, `plan-review-TUI: pending initial selection plan=${planModel?.modelID ?? "-"} build=${buildModel?.modelID ?? "-"}`)
+    }
+  }
+
+  readAndCaptureInitial()
+
   const unsubscribeModel = (api.event as any)["on"]("tui.model.selected", (event: any) => recordModel(event.data))
   let previousSessionID: string | undefined
   const unsubscribeSelection = (api.event as any)["on"]("tui.selection.changed", (event: any) => {
     const current = event.data.current
     const sid = current.sessionID
-    if (sid?.startsWith("ses_") && previousSessionID !== sid) {
+    const prevSid = previousSessionID
+
+    if (sid?.startsWith("ses_") && prevSid !== sid) {
       flushHomePicks(sid)
+      if (!prevSid?.startsWith("ses_") && pendingInitialSelection) {
+        flushInitialSelection(sid)
+      } else if (sid !== prevSid) {
+        snapshotCurrentSelection(sid, current)
+      }
+    } else if (sid?.startsWith("ses_") && sid === prevSid) {
+      const planModel = current.models.plan
+      const buildModel = current.models.build
+      if (planModel || buildModel) {
+        snapshotCurrentSelection(sid, current)
+      }
     }
     previousSessionID = sid
   })

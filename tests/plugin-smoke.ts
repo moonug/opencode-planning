@@ -673,7 +673,9 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   console.log(`[38b] TUI plugin logs v${EXPECTED_VERSION} and falls back safely: ok`)
 }
 
-// 38c. Native startup selection is display-only and never writes metadata.
+// 38c. Native startup captures current TUI selection as metadata snapshot.
+// For a valid ses_ session with models, one tuiCurrentSelection write is expected.
+// Selection callbacks are still display-only (sidebar reads state, no per-change writes).
 {
   const mod = await import("../plugin/tui-plugin.tsx" as any)
   const tuiPluginFn = (mod.default as any).tui
@@ -709,8 +711,8 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   }
   await tuiPluginFn(fakeApi, undefined, { id: "plan-review-tui", spec: "/dev/null" } as any)
   await new Promise((r) => setTimeout(r, 30))
-  if (updates.length !== 0) throw new Error("startup selection must not write metadata")
-  if (selectionCalls !== 0) throw new Error("startup must not snapshot selection")
+  if (updates.length !== 1) throw new Error("startup snapshot must write one tuiCurrentSelection metadata")
+  if (selectionCalls !== 1) throw new Error("startup must call selection once for snapshot")
   if (typeof slots[0]?.slots?.sidebar_content !== "function") throw new Error("native runtime must register sidebar_content")
   if (slots[0]?.slots?.home_prompt_right || slots[0]?.slots?.session_prompt_right) {
     throw new Error("native runtime must not register prompt-right slots")
@@ -719,26 +721,16 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   if (tuiSource.includes("createSignal")) throw new Error("sidebar must not cache selection in plugin-local Solid state")
   if (!tuiSource.includes("Agent models")) throw new Error("heading must be Agent models")
   if (tuiSource.includes('border={["bottom"]}')) throw new Error("sidebar must not have a divider — should be compact like MCP")
-  console.log("[38c] native startup has no metadata write and registers compact sidebar model block: ok")
+  console.log("[38c] native startup captures TUI selection as snapshot (1 write) and registers compact sidebar: ok")
 }
 
-// 38e. exitPlanMode promotes metadata.planReviewDeferredPicks into
-//      chatMessageMemory. Previously this happened in the
-//      chat.message hook, but the user's first real prompt fires
-//      chat.message BEFORE the TUI plugin's session.update can
-//      land, so the hook read empty metadata. exitPlanMode runs
-//      seconds-to-minutes later (when the user approves the plan),
-//      by which point the TUI plugin's metadata write has been
-//      committed. Promotion here is race-free.
-//
-//      Smoke covers: session has metadata deferred picks but
-//      chatMessageMemory is empty. exitPlanMode runs → the
-//      priority chain resolves to chat.message (build) →
-//      exitPlanMode logs "promoted deferredPicks: count=2".
+// 38e. exitPlanMode reads deferred picks directly from session metadata
+//      (via getDeferredPicks) and resolves them as "TUI explicit picker"
+//      candidates in the priority chain. No promotion to chatMessageMemory.
+//      The deferred picks {build:ya-glm/glm} win over empty chatMessageMemory.
 {
   const logs: any[] = []
   let sessionGetCalls = 0
-  let chatMessageMemory: any = undefined
   const sessionMetadata = {
     planReviewDeferredPicks: {
       build: { providerID: "ya-glm", modelID: "glm" },
@@ -749,9 +741,6 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const fakeClient = {
     app: { log: async (opts: any) => { logs.push(opts) } } as any,
     session: {
-      // Builder model source — empty so the priority chain must rely
-      // on chatMessageMemory (which the deferred-picks promotion
-      // will populate).
       list: async () => ({ data: [] }),
       get: async (opts: any) => {
         sessionGetCalls++
@@ -767,52 +756,22 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     serverUrl: new URL("http://x"),
     $,
   })
-  // Capture the chatMessageMemory the init set up (we don't close over
-  // it directly; instead we observe via the priority chain).
-  // We need an empty getBuildAgentModel/getPlanAgentModel response
-  // so chat.message (build) is the only source with data. Since
-  // chatMessageMemory starts empty for ses_meta, the priority
-  // chain falls through to lower sources without our promotion.
-  // We invoke exitPlanMode indirectly via the tool execute path.
-  chatMessageMemory = (testHooks as any).__chatMessageMemory__?.[testHooks.tool.plan_review]?.chatMessageMemory
-  // Drive exitPlanMode: call tool.plan_review.execute with the
-  // plan text and a sessionID in context, mock the script too so it
-  // exits clean. We mock the helper script via EDITOR env which is
-  // set at the top of the smoke file.
-  // For full coverage we re-do the test with chatMessageMemory
-  // pre-populated with the real chat.message fire BEFORE
-  // exitPlanMode, simulating the live flow.
+  // chat.message fires for a test agent (not plan/build) — no effect on resolution.
   await testHooks["chat.message"](
     {
       sessionID: "ses_meta",
-      // Use an agent that DOES NOT exist in deferred picks so the
-      // hook's own chatMessageMemory write doesn't shadow the
-      // upcoming promotion. The agent=test mimics a third agent.
       agent: "test",
-      model: { providerID: "opencode-go", modelID: "mimo-v2.5-pro" },
+      model: { providerID: "openai-go", modelID: "mimo-v2.5-pro" },
     } as any,
     {} as any,
   )
   await new Promise((r) => setTimeout(r, 30))
-  // Build agent model fetch (used in priority chain) — return nothing
-  // so chat.message memory is the only valid source.
-  // plan agent model fetch — same.
-  // config.model fetch — same.
-  // globalConfig via client.config.get → empty.
-  // config.get is invoked via ... actually it goes through
-  // /session/{id}/message stream hook config not getGlobalModel
-  // which uses client.config.get. Mock:
+  if (sessionGetCalls !== 0) {
+    throw new Error("chat.message hook should not call session.get, got calls: " + sessionGetCalls)
+  }
   if (!fakeClient.config) {
     fakeClient.config = { get: async () => ({ data: {} }) }
   }
-  // chat.message hook no longer reads metadata — that path was moved
-  // to exitPlanMode. sessionGetCalls after the hook must be 0.
-  if (sessionGetCalls !== 0) {
-    throw new Error("chat.message hook should not read metadata (moved to exitPlanMode), got calls: " + sessionGetCalls)
-  }
-  // Now drive exitPlanMode via tool execute path. We mock the
-  // helper to produce empty diff (approval). Set EDITOR to a noop
-  // sh script.
   const fakeFs = await import("node:fs")
   const tmpEditor = "/tmp/pr-smoke-exitplanmo.sh"
   fakeFs.writeFileSync(tmpEditor, "#!/bin/sh\nexit 0\n")
@@ -829,21 +788,16 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     else process.env.EDITOR = oldEditor
     fakeFs.rmSync(tmpEditor, { force: true })
   }
-  if (sessionGetCalls !== 1) {
-    throw new Error("exitPlanMode must call session.get once to read metadata, got calls: " + sessionGetCalls)
+  // exitPlanMode calls session.get multiple times (getTuiCurrentSelection, getDeferredPicks, etc.)
+  if (sessionGetCalls < 1) {
+    throw new Error("exitPlanMode must call session.get at least once, got calls: " + sessionGetCalls)
   }
-  const promoted = logs.find((l: any) => l.body?.message?.includes("exitPlanMode promoted deferredPicks"))
-  if (!promoted) {
-    throw new Error("exitPlanMode should log promoted deferredPicks, logs:\n" + logs.map((l:any)=>l.body?.message).join("\n"))
-  }
-  if (!promoted.body.message.includes("count=2")) {
-    throw new Error("expected count=2 in promote log, got: " + promoted.body.message)
-  }
+  // No "promoted deferredPicks" log since we removed that block.
   const resolution = logs.find((l: any) => l.body?.message?.startsWith("plan-review: exitPlanMode resolution:"))
-  if (!resolution?.body?.message?.includes("source=chat.message (build)")) {
-    throw new Error("expected chat.message (build) source after deferred promotion, got: " + resolution?.body?.message)
+  if (!resolution?.body?.message?.includes("source=TUI explicit picker (build)")) {
+    throw new Error("expected TUI explicit picker (build) source from deferred picks, got: " + resolution?.body?.message)
   }
-  console.log("[38e] exitPlanMode promotes deferredPicks from session.metadata: ok")
+  console.log("[38e] exitPlanMode resolves deferred picks as TUI explicit picker (build): ok")
 }
 
 // 39. Native model events write only their agent, serialize, and remain session-scoped.

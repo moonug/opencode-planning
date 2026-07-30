@@ -337,6 +337,79 @@ function formatProviderList(entries: ProviderListEntry[]): string {
   return lines.join("\n")
 }
 
+interface BuildCandidate extends ModelRef {
+  capturedAt: number
+  source: string
+}
+
+async function getSessionHistoryBuildMessage(client: any, sessionID: string): Promise<{ providerID: string; modelID: string; capturedAt: number } | undefined> {
+  try {
+    const res = await client.session.messages({ path: { id: sessionID } })
+    const data = (res as any)?.data ?? res
+    const list = Array.isArray(data) ? data : []
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m = list[i]
+      if (m?.info?.role === "user" && m?.info?.agent === "build" && m?.model?.providerID && m?.model?.modelID) {
+        const time = m.info.time?.created ? new Date(m.info.time.created).getTime() : Date.now()
+        return { providerID: m.model.providerID, modelID: m.model.modelID, capturedAt: time }
+      }
+    }
+  } catch (err) {
+    console.error(`plan-review: getSessionHistoryBuildMessage failed: ${(err as Error)?.message ?? String(err)}`)
+  }
+  return undefined
+}
+
+async function getTuiCurrentSelection(client: any, sessionID: string): Promise<{ plan?: BuildCandidate; build?: BuildCandidate } | undefined> {
+  try {
+    const res = await client.session.get({ path: { id: sessionID } })
+    const data = (res as any)?.data ?? res
+    const metadata = data?.metadata
+    const sel = metadata?.tuiCurrentSelection
+    if (!sel || typeof sel !== "object") return undefined
+    const result: { plan?: BuildCandidate; build?: BuildCandidate } = {}
+    if (sel.plan && typeof sel.plan === "object") {
+      const p = sel.plan as any
+      if (p.providerID && p.modelID) {
+        result.plan = { providerID: p.providerID, modelID: p.modelID, capturedAt: typeof p.pickedAt === "number" ? p.pickedAt : Date.now(), source: "TUI current selection (plan)" }
+      }
+    }
+    if (sel.build && typeof sel.build === "object") {
+      const b = sel.build as any
+      if (b.providerID && b.modelID) {
+        result.build = { providerID: b.providerID, modelID: b.modelID, capturedAt: typeof b.pickedAt === "number" ? b.pickedAt : Date.now(), source: "TUI current selection (build)" }
+      }
+    }
+    if (!result.plan && !result.build) return undefined
+    return result
+  } catch (err) {
+    console.error(`plan-review: getTuiCurrentSelection failed: ${(err as Error)?.message ?? String(err)}`)
+    return undefined
+  }
+}
+
+async function getDeferredPicks(client: any, sessionID: string): Promise<{ plan?: BuildCandidate; build?: BuildCandidate } | undefined> {
+  try {
+    const res = await client.session.get({ path: { id: sessionID } })
+    const data = (res as any)?.data ?? res
+    const deferred = data?.metadata?.planReviewDeferredPicks
+    if (!deferred || typeof deferred !== "object") return undefined
+    const result: { plan?: BuildCandidate; build?: BuildCandidate } = {}
+    for (const agent of ["plan", "build"] as const) {
+      const m = (deferred as any)[agent]
+      if (m && typeof m === "object" && typeof m.providerID === "string" && typeof m.modelID === "string") {
+        const pickTime = typeof m.pickedAt === "number" ? m.pickedAt : 0
+        result[agent] = { providerID: m.providerID, modelID: m.modelID, capturedAt: pickTime, source: `TUI explicit picker (${agent})` }
+      }
+    }
+    if (!result.plan && !result.build) return undefined
+    return result
+  } catch (err) {
+    console.error(`plan-review: getDeferredPicks failed: ${(err as Error)?.message ?? String(err)}`)
+    return undefined
+  }
+}
+
 async function exitPlanMode(
   client: any,
   buildModels: Map<string, ModelRef>,
@@ -348,84 +421,80 @@ async function exitPlanMode(
   if (!sessionID) return { status: "no_model" }
   await logged(client, "info", `plan-review: exitPlanMode called for session ${sessionID}`)
 
-  // Promote deferred picker picks stored by the TUI plugin into
-  // chatMessageMemory. Each pick carries a `pickedAt` timestamp; we
-  // only apply it when it is NEWER than the existing chat.message
-  // entry for that agent. This prevents stale metadata from
-  // overwriting a fresher model captured by chat.message on a
-  // subsequent approval.
-  let deferredPromoted = 0
-    try {
-      const sessionRes = await client.session.get({ path: { id: sessionID } })
-      const data = (sessionRes as any)?.data ?? sessionRes
-      const metadata = data?.metadata
-      const deferredPicks = metadata?.planReviewDeferredPicks
-      const picksKeys = deferredPicks && typeof deferredPicks === "object"
-        ? Object.keys(deferredPicks as Record<string, unknown>).join(",") : "<absent>"
-      await logged(
-        client,
-        "info",
-        `plan-review: exitPlanMode metadata check: session=${sessionID} keys=${metadata ? Object.keys(metadata).join(",") : "<null>"} deferred_agents=${picksKeys}`,
-      )
-      const deferred = metadata?.planReviewDeferredPicks
-    if (deferred && typeof deferred === "object") {
-      let perSession = chatMessageMemory.get(sessionID)
-      if (!perSession) {
-        perSession = new Map<string, TimedModelRef>()
-        chatMessageMemory.set(sessionID, perSession)
-      }
-      for (const [agentName, m] of Object.entries(deferred)) {
-        if (!m || typeof m !== "object") continue
-        if (agentName.startsWith("_")) continue
-        const providerID = (m as any).providerID
-        const modelID = (m as any).modelID
-        if (typeof providerID !== "string" || typeof modelID !== "string") continue
-        const pickTime = typeof (m as any).pickedAt === "number"
-          ? (m as any).pickedAt as number
-          : typeof (m as any)._writtenAt === "string"
-            ? new Date((m as any)._writtenAt).getTime() || 0
-            : 0
-        const existing = perSession.get(agentName)
-        // Legacy pick without timestamp: only apply when no entry exists yet.
-        if (pickTime === 0 && existing) continue
-        if (existing && existing.capturedAt >= pickTime) continue // stale
-        perSession.set(agentName, { providerID, modelID, capturedAt: pickTime })
-        deferredPromoted++
-      }
-      if (deferredPromoted > 0) {
-        await logged(client, "info", `plan-review: exitPlanMode promoted deferredPicks: count=${deferredPromoted} session=${sessionID}`)
-      }
-    }
-  } catch (err) {
-    await logged(client, "warn", `plan-review: exitPlanMode deferred-pick lookup failed: ${(err as Error).message}`)
-  }
-
   const overridden = buildModels.get(sessionID)
   const perAgent = chatMessageMemory.get(sessionID)
   const fromChat = perAgent?.get("build")
-  const [agentCfg, planCfg, globalCfg] = await Promise.all([
+
+  const [tuiSelection, historyBuild, agentCfg, planCfg, globalCfg] = await Promise.all([
+    withTimeoutSafe(getTuiCurrentSelection(client, sessionID), 3000, undefined),
+    withTimeoutSafe(getSessionHistoryBuildMessage(client, sessionID), 3000, undefined),
     withTimeoutSafe(getBuildAgentModel(client), 2000, undefined),
     withTimeoutSafe(getPlanAgentModel(client), 2000, undefined),
     withTimeoutSafe(getGlobalModel(client), 2000, undefined),
   ])
 
-  const fromChatPlan = perAgent?.get("plan")
+  const deferredPicks = await withTimeoutSafe(getDeferredPicks(client, sessionID), 3000, undefined)
 
   await logged(
     client,
     "info",
-    `plan-review: exitPlanMode chain: session=${sessionID} fromChat=${fromChat ? `${fromChat.providerID}/${fromChat.modelID}` : "∅"} fromChatPlan=${fromChatPlan ? `${fromChatPlan.providerID}/${fromChatPlan.modelID}` : "∅"} overridden=${overridden ? `${overridden.providerID}/${overridden.modelID}` : "∅"} agentCfg=${agentCfg ? `${agentCfg.providerID}/${agentCfg.modelID}` : "∅"} planCfg=${planCfg ? `${planCfg.providerID}/${planCfg.modelID}` : "∅"} globalCfg=${globalCfg ? `${globalCfg.providerID}/${globalCfg.modelID}` : "∅"}`,
+    `plan-review: exitPlanMode sources: session=${sessionID} ` +
+      `fromChat=${fromChat ? `${fromChat.providerID}/${fromChat.modelID}` : "∅"} ` +
+      `historyBuild=${historyBuild ? `${historyBuild.providerID}/${historyBuild.modelID}` : "∅"} ` +
+      `tuiCurrentBuild=${tuiSelection?.build ? `${tuiSelection.build.providerID}/${tuiSelection.build.modelID}` : "∅"} ` +
+      `tuiCurrentPlan=${tuiSelection?.plan ? `${tuiSelection.plan.providerID}/${tuiSelection.plan.modelID}` : "∅"} ` +
+      `deferredBuild=${deferredPicks?.build ? `${deferredPicks.build.providerID}/${deferredPicks.build.modelID}` : "∅"} ` +
+      `overridden=${overridden ? `${overridden.providerID}/${overridden.modelID}` : "∅"} ` +
+      `agentCfg=${agentCfg ? `${agentCfg.providerID}/${agentCfg.modelID}` : "∅"} ` +
+      `planCfg=${planCfg ? `${planCfg.providerID}/${planCfg.modelID}` : "∅"} ` +
+      `globalCfg=${globalCfg ? `${globalCfg.providerID}/${globalCfg.modelID}` : "∅"}`,
   )
 
-  let source: string
+  interface ResolvedCandidate extends ModelRef {
+    capturedAt: number
+    source: string
+  }
+
+  const candidates: Array<ResolvedCandidate> = []
+
+  if (fromChat) {
+    candidates.push({ providerID: fromChat.providerID, modelID: fromChat.modelID, capturedAt: fromChat.capturedAt, source: "chat.message (build)" })
+  }
+  if (deferredPicks?.build) {
+    candidates.push({ providerID: deferredPicks.build.providerID, modelID: deferredPicks.build.modelID, capturedAt: deferredPicks.build.capturedAt, source: deferredPicks.build.source })
+  }
+  if (tuiSelection?.build) {
+    candidates.push({ providerID: tuiSelection.build.providerID, modelID: tuiSelection.build.modelID, capturedAt: tuiSelection.build.capturedAt, source: tuiSelection.build.source })
+  }
+  if (historyBuild) {
+    candidates.push({ providerID: historyBuild.providerID, modelID: historyBuild.modelID, capturedAt: historyBuild.capturedAt, source: "session history (build)" })
+  }
+
+  const fromChatPlan = perAgent?.get("plan")
+
   let target: ModelRef | undefined
-  if (fromChat)         { target = fromChat;    source = "chat.message (build)" }
-  else if (overridden)  { target = overridden;  source = "build model memory" }
-  else if (fromChatPlan) { target = fromChatPlan; source = "chat.message (plan)" }
-  else if (agentCfg)    { target = agentCfg;    source = "agent.build.model" }
-  else if (globalCfg)   { target = globalCfg;   source = "config.model" }
-  else if (planCfg)     { target = planCfg;     source = "agent.plan.model (fallback)" }
-  else                  { source = "opencode default" }
+  let source: string
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => b.capturedAt - a.capturedAt)
+    const best = candidates[0]!
+    target = { providerID: best.providerID, modelID: best.modelID }
+    source = best.source
+  } else if (overridden) {
+    target = overridden; source = "build model memory"
+  } else if (fromChatPlan) {
+    target = { providerID: fromChatPlan.providerID, modelID: fromChatPlan.modelID }; source = "chat.message (plan)"
+  } else if (tuiSelection?.plan) {
+    target = { providerID: tuiSelection.plan.providerID, modelID: tuiSelection.plan.modelID }; source = "TUI current selection (plan)"
+  } else if (agentCfg) {
+    target = agentCfg; source = "agent.build.model"
+  } else if (globalCfg) {
+    target = globalCfg; source = "config.model"
+  } else if (planCfg) {
+    target = planCfg; source = "agent.plan.model (fallback)"
+  } else {
+    source = "opencode default"
+  }
 
   lastResolution.target = target
   lastResolution.source = source
@@ -504,11 +573,12 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   const lastShownModels = new Map<string, ProviderListEntry[]>()
   const chatMessageMemory = new Map<string, Map<string, TimedModelRef>>()
   // Keyed by sessionID → agent → model. Populated by chat.message hook
-  // (fires for every real and synthetic prompt). exitPlanMode reads this
-  // as its first-priority source. No model.json reads — model.json is
-  // global and leaks model choices across sessions. All model attribution
-  // is per-session: chatMessageMemory (sessionID), buildModels (sessionID),
-  // and session metadata (per-session row written by TUI plugin).
+  // (fires for every real and synthetic prompt). exitPlanMode uses it as
+  // the first candidate in a timestamp-ordered resolution chain.
+  // No model.json reads — model.json is global and leaks model choices
+  // across sessions. All model attribution is per-session:
+  // chatMessageMemory, buildModels, and session metadata (per-session row
+  // written by TUI plugin with tuiCurrentSelection and planReviewDeferredPicks).
 
   const plan_review = tool({
     description:
@@ -598,7 +668,9 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       // packages/opencode/src/session/prompt.ts:999. It is the safe
       // stock-opencode fallback when the fork's native local selection
       // API is absent. Use it as per-session, per-agent memory;
-      // exitPlanMode() prioritises it over any global file state.
+      // exitPlanMode() uses it as first candidate in timestamp-ordered
+      // resolution (chat.message → explicit picker → TUI snapshot →
+      // session history → /set-build-model → config defaults).
       if (input.sessionID && input.agent && input.model) {
         let perSession = chatMessageMemory.get(input.sessionID)
         if (!perSession) {
@@ -612,16 +684,6 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         })
         await logged(client, "info", `chat.message: session=${input.sessionID} agent=${input.agent} model=${input.model.providerID}/${input.model.modelID}`)
       }
-
-      // (Deferred-picker promotion moved out of this hook — see
-      // exitPlanMode's promotion block. It used to live here but
-      // races with the TUI plugin's metadata write: the user's
-      // first real prompt fires chat.message before the TUI's
-      // session.updated handler runs writeDeferredToMetadata, so
-      // this hook read empty metadata and promoted nothing.
-      // exitPlanMode runs much later (when the user approves the
-      // plan, seconds-to-minutes after the flush), by which point
-      // the metadata is guaranteed to be present.)
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -831,12 +893,15 @@ ${chatEntries}
 - last target resolved: ${lastResolution.target ? `${lastResolution.target.providerID}/${lastResolution.target.modelID} (source: ${lastResolution.source})` : "never called"}
 
 Resolution priority on plan approval:
-1. chat.message memory for build agent (TUI model.switched events)
-2. /set-build-model override
-3. chat.message memory for plan agent (fallback)
-4. agent.build.model from opencode.jsonc
-5. config.model global default
-6. agent.plan.model (last resort)
+1. chat.message (build agent, runtime)
+2. TUI explicit picker (build agent)
+3. TUI current selection (build agent, startup snapshot)
+4. session history (build agent, last user prompt)
+5. /set-build-model override
+6. TUI current selection (plan agent)
+7. agent.build.model from opencode.jsonc
+8. config.model global default
+9. agent.plan.model (last resort)
 
 Diagnostic lines \`plan-review: exitPlanMode ...\` and \`plan-review-TUI: ...\` appear in opencode log.
 `,

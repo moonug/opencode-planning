@@ -39,16 +39,14 @@ Restart opencode. The plugin self-installs on first load:
 
 ## Build-model resolution
 
-When a plan is approved, the session switches to the build agent. The build model is resolved per-session in this order (first match wins):
+When a plan is approved, the session switches to the build agent. The build model is resolved from **per-session sources only** (never global `model.json`, never plan's model):
 
-1. **chat.message memory (build)** — model captured directly or promoted from native TUI selection metadata
-2. **build model memory** — `rememberBuildModel` from `session.updated` events (agent-filtered: only `agent === "build"`)
-3. **chat.message memory (plan)** — fallback when no build-specific model is known
-4. **`agent.build.model`** — from opencode config
-5. **`config.model`** — global default
-6. **`agent.plan.model`** — last resort
+1. **`planReviewModels.build` record** — single per-session metadata key written by every pick path through `plugin/model-store.ts` (`chat.message` capture, `tui.model.selected`, home→session flush, `/set-build-model`). Precedence is decided at **write time**: explicit picks overwrite freely; `/set-build-model` sets `pinned: true` so future implicit captures leave it alone; home flush (`mergeHomeFlush`) only fills absent per-agent records. Legacy `planReviewDeferredPicks` key is read as a one-shot fallback; the next write migrates.
+2. **Session history** — model of the last build-agent user message
+3. **`agent.build.model`** — from opencode config
+4. **`config.model`** — global default
 
-If none resolve, the plugin refuses the auto-switch and prints instructions. Use `/plan-diag` to inspect.
+If none resolve, the plugin refuses the auto-switch and prints manual instructions — it never falls back to the plan agent's model. With write-time precedence on the single per-session record (`planReviewModels`), the sticky-model bug is structurally gone; a synthetic-prompt guard is kept as defense-in-depth so diagnostics stay clean. Use `/plan-diag` to inspect.
 
 ### How model tracking works
 
@@ -99,13 +97,18 @@ Override the helper path with `PLAN_REVIEW_SCRIPT=<absolute>` if not running fro
 ```
 opencode-planning/
 ├── plugin/                        # npm package root
-│   ├── index.ts                   # server plugin (tool + hooks)
+│   ├── index.ts                   # server plugin (tool + hooks, thin wiring)
 │   ├── tui-plugin.tsx             # Native selection tracking + sidebar block
-│   ├── model-memory.ts            # rememberBuildModel (agent-filtered)
+│   ├── model-store.ts             # shared RMW + per-session record (single source of truth)
+│   ├── resolution.ts              # exitPlanMode + resolveBuildModel
+│   ├── system-prompt.ts           # system.transform + messages.transform
+│   ├── commands.ts                # slash-command handlers
+│   ├── install.ts                 # self-install + tui.jsonc registration
+│   ├── helpers.ts                 # logged / visibleErr / withTimeoutSafe
 │   ├── package.json
 │   ├── bin/plan-review.py         # Python helper (stdlib only)
 │   └── commands/                  # slash commands (auto-symlinked)
-├── tests/plugin-smoke.ts          # end-to-end smoke
+├── tests/plugin-smoke.ts          # end-to-end smoke (~60 checks incl. P1–P4 regressions)
 └── .github/workflows/publish.yml  # npm Trusted Publishing (OIDC)
 ```
 

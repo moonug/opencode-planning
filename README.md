@@ -43,12 +43,10 @@ Restart opencode. The plugin self-installs on first load:
 
 When a plan is approved, the session switches to the build agent. The build model is resolved per-session in this order (first match wins):
 
-1. **chat.message memory (build)** — model captured directly or promoted from native TUI selection metadata
-2. **build model memory** — `rememberBuildModel` from `session.updated` events (agent-filtered: only `agent === "build"`)
-3. **chat.message memory (plan)** — fallback when no build-specific model is known
-4. **`agent.build.model`** — from opencode config
-5. **`config.model`** — global default
-6. **`agent.plan.model`** — last resort
+1. **`planReviewModels.build` record** — single per-session metadata key written by every pick path through `plugin/model-store.ts`. Legacy `planReviewDeferredPicks` key read as a one-shot fallback; the next write migrates.
+2. **Session history** — last build-agent user message model.
+3. **`agent.build.model`** — from opencode config.
+4. **`config.model`** — global default.
 
 If none resolve, the plugin refuses the auto-switch and prints instructions. Use `/plan-diag` to inspect.
 
@@ -101,13 +99,18 @@ Override the helper path with `PLAN_REVIEW_SCRIPT=<absolute>` if not running fro
 ```
 opencode-planning/
 ├── plugin/                        # npm package root
-│   ├── index.ts                   # server plugin (tool + hooks)
+│   ├── index.ts                   # server plugin (tool + hooks, thin wiring)
 │   ├── tui-plugin.tsx             # Native selection tracking + sidebar block
-│   ├── model-memory.ts            # rememberBuildModel (agent-filtered)
+│   ├── model-store.ts             # shared RMW + per-session record (single source of truth)
+│   ├── resolution.ts              # exitPlanMode + resolveBuildModel
+│   ├── system-prompt.ts           # system.transform + messages.transform
+│   ├── commands.ts                # slash-command handlers
+│   ├── install.ts                 # self-install + tui.jsonc registration
+│   ├── helpers.ts                 # logged / visibleErr / withTimeoutSafe
 │   ├── package.json
 │   ├── bin/plan-review.py         # Python helper (stdlib only)
 │   └── commands/                  # slash commands (auto-symlinked)
-├── tests/plugin-smoke.ts          # end-to-end smoke
+├── tests/plugin-smoke.ts          # end-to-end smoke (~70 checks incl. P1–P4 regressions)
 └── .github/workflows/publish.yml  # npm Trusted Publishing (OIDC)
 ```
 

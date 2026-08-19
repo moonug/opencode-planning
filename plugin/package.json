@@ -1,6 +1,6 @@
 {
   "name": "opencode-plan-review",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "description": "opencode plugin: review plans in $EDITOR with per-agent model tracking",
   "type": "module",
   "main": "index.ts",
@@ -14,7 +14,12 @@
   "files": [
     "index.ts",
     "tui-plugin.tsx",
-    "model-memory.ts",
+    "helpers.ts",
+    "install.ts",
+    "resolution.ts",
+    "system-prompt.ts",
+    "commands.ts",
+    "model-store.ts",
     "bin/",
     "commands/",
     "LICENSE",

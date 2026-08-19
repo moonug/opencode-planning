@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { logged, visibleErr } from "./helpers"
 import { installSelf, SCRIPT_PATH } from "./install"
-import { captureImplicit } from "./model-store"
+import { captureImplicit, v1SdkAdapter, type SdkAdapter } from "./model-store"
 import type { Agent } from "./model-store"
 import { exitPlanMode } from "./resolution"
 import type { ProviderListEntry } from "./resolution"
@@ -51,6 +51,12 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
 
   installSelf()
 
+  // The server-plugin host hands us a v1 SDK client. Build the matching
+  // adapter so the per-session model-store writer produces the right wire
+  // shape (metadata under `body`, not at the top level — hey-api on v1
+  // silently drops unknown top-level keys).
+  const sdk: SdkAdapter = v1SdkAdapter(client)
+
   // Window guard for our own synthetic switch prompts. While active, the
   // chat.message hook skips recording. With write-time precedence, the
   // switch prompt would write the same value back into the record
@@ -64,7 +70,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   void log // silence "unused" until exitPlanMode is called
 
   const onPlanApproved = async (sessionID: string, summary: string): Promise<void> => {
-    const exit = await exitPlanMode(client, log, syntheticPrompt, sessionID, summary)
+    const exit = await exitPlanMode(client, sdk, log, syntheticPrompt, sessionID, summary)
     if (exit.status === "no_model") {
       await logged(client, "warn", `plan-review: no build model after approval in ${sessionID}`)
     } else if (exit.status === "prompt_failed") {
@@ -90,12 +96,13 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-        const exit = await exitPlanMode(
-          client,
-          log,
-          syntheticPrompt,
-          context.sessionID,
-          "User closed editor without changes."
+      const exit = await exitPlanMode(
+        client,
+        sdk,
+        log,
+        syntheticPrompt,
+        context.sessionID,
+        "User closed editor without changes."
         )
         if (exit.status === "switched") {
           return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
@@ -177,7 +184,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const agent = input.agent as Agent
       const variant =
         input.variant && input.variant !== "default" ? input.variant : undefined
-      const record = await captureImplicit(client, input.sessionID, agent, {
+      const record = await captureImplicit(sdk, input.sessionID, agent, {
         providerID: input.model.providerID,
         modelID: input.model.modelID,
         ...(variant ? { variant } : {}),
@@ -206,6 +213,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const e = event as any
       const handled = await handleCommand(e, {
         client,
+        sdk,
         $,
         scriptPath: SCRIPT_PATH,
         lastShownModels,

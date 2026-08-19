@@ -5,6 +5,7 @@ import {
   writeCommand,
   readRecord,
   clearRecord,
+  type SdkAdapter,
 } from "./model-store"
 import { formatProviderList, listAvailableModels, parseModelString } from "./resolution"
 import type { ProviderListEntry } from "./resolution"
@@ -16,6 +17,7 @@ interface CommandEvent {
 
 export interface CommandHandlers {
   client: any
+  sdk: SdkAdapter
   $: any
   scriptPath: string
   lastShownModels: Map<string, ProviderListEntry[]>
@@ -42,7 +44,7 @@ export async function handleCommand(
       await logged(h.client, "error", "set-build-model: no active session")
       return true
     }
-    await handleSetBuildModel(h.client, sessionID, rawArgs.trim(), h.lastShownModels)
+    await handleSetBuildModel(h.client, h.sdk, sessionID, rawArgs.trim(), h.lastShownModels)
     return true
   }
   if (name === "plan-diag") {
@@ -50,7 +52,7 @@ export async function handleCommand(
       await logged(h.client, "error", "plan-diag: no active session")
       return true
     }
-    await handlePlanDiag(h.client, sessionID, rawArgs.trim())
+    await handlePlanDiag(h.client, h.sdk, sessionID, rawArgs.trim())
     return true
   }
   if (name === "plan-review") {
@@ -66,6 +68,7 @@ export async function handleCommand(
 
 async function handleSetBuildModel(
   client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   arg: string,
   lastShownModels: Map<string, ProviderListEntry[]>
@@ -90,7 +93,7 @@ async function handleSetBuildModel(
       })
       return
     }
-    await writeCommand(client, sessionID, "build", { providerID: entry.providerID, modelID: entry.modelID })
+    await writeCommand(sdk, sessionID, "build", { providerID: entry.providerID, modelID: entry.modelID })
     await client.session.prompt({
       path: { id: sessionID },
       body: {
@@ -113,7 +116,7 @@ async function handleSetBuildModel(
       await logged(client, "error", `set-build-model: invalid format "${arg}". Expected "provider/model-id".`)
       return
     }
-    await writeCommand(client, sessionID, "build", parsed)
+    await writeCommand(sdk, sessionID, "build", parsed)
     await client.session.prompt({
       path: { id: sessionID },
       body: {
@@ -148,11 +151,12 @@ async function handleSetBuildModel(
 
 async function handlePlanDiag(
   client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   subCmd: string
 ): Promise<void> {
   if (subCmd === "reset") {
-    await clearRecord(client, sessionID)
+    await clearRecord(sdk, sessionID)
     await client.session.prompt({
       path: { id: sessionID },
       body: {
@@ -167,7 +171,7 @@ async function handlePlanDiag(
     })
     return
   }
-  const record = await readRecord(client, sessionID)
+  const record = await readRecord(sdk, sessionID)
   const lines: string[] = []
   for (const agent of ["plan", "build"] as const) {
     const r = record[agent]

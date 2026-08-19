@@ -106,14 +106,66 @@ function parseLegacy(raw: unknown): ModelsRecord {
   return out
 }
 
-async function fetchMetadata(client: any, sessionID: string): Promise<Record<string, unknown>> {
-  try {
-    const res = await client.session.get({ path: { id: sessionID } })
-    return ((res as any)?.data?.metadata ?? {}) as Record<string, unknown>
-  } catch (err) {
-    console.error(`plan-review: fetchMetadata failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`)
-    return {}
+/**
+ * The two plugin hosts hand out different SDK clients:
+ *  - server plugin (`@opencode-ai/sdk`)  → v1: hey-api runtime only
+ *    serializes `options.body`; metadata must be passed under body.
+ *  - TUI plugin    (`@opencode-ai/sdk/v2`) → flat params; metadata
+ *    is a top-level field that the SDK packs into body itself.
+ * Callers in index.ts / tui-plugin.tsx build an `sdk` adapter once at
+ * startup and pass it to updateRecord/readRecord/clearRecord, so the
+ * SDK shape is fixed per plugin type and never guessed at runtime.
+ */
+export type SdkAdapter = {
+  getMetadata: (sessionID: string) => Promise<Record<string, unknown>>
+  setMetadata: (sessionID: string, metadata: Record<string, unknown>) => Promise<unknown>
+}
+
+/** Build an adapter for the v1 SDK (server plugin host). */
+export function v1SdkAdapter(client: any): SdkAdapter {
+  return {
+    async getMetadata(sessionID) {
+      try {
+        const res = await client.session.get({ path: { id: sessionID } })
+        return ((res as any)?.data?.metadata ?? {}) as Record<string, unknown>
+      } catch (err) {
+        console.error(
+          `plan-review: v1 getMetadata failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`
+        )
+        return {}
+      }
+    },
+    async setMetadata(sessionID, metadata) {
+      return client.session.update({
+        path: { id: sessionID },
+        body: { metadata },
+      })
+    },
   }
+}
+
+/** Build an adapter for the v2 SDK (TUI plugin host). */
+export function v2SdkAdapter(client: any): SdkAdapter {
+  return {
+    async getMetadata(sessionID) {
+      try {
+        const res = await client.session.get({ sessionID })
+        return ((res as any)?.data?.metadata ?? {}) as Record<string, unknown>
+      } catch (err) {
+        console.error(
+          `plan-review: v2 getMetadata failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`
+        )
+        return {}
+      }
+    },
+    async setMetadata(sessionID, metadata) {
+      return client.session.update({ sessionID, metadata })
+    },
+  }
+}
+
+async function fetchMetadata(sdk: SdkAdapter, sessionID: string): Promise<Record<string, unknown>> {
+  return sdk.getMetadata(sessionID)
 }
 
 /**
@@ -125,12 +177,12 @@ async function fetchMetadata(client: any, sessionID: string): Promise<Record<str
  * read and before the write, skips the PUT (used to honor TUI disposal).
  */
 export async function updateRecord(
-  client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   updater: (current: ModelsRecord) => ModelsRecord | undefined,
   aborted?: () => boolean,
 ): Promise<ModelsRecord> {
-  const existing = await fetchMetadata(client, sessionID)
+  const existing = await fetchMetadata(sdk, sessionID)
   const current = parseRecord(existing[METADATA_KEY])
   const hasCurrent = current.plan !== undefined || current.build !== undefined
   const seed: ModelsRecord = hasCurrent ? current : parseLegacy(existing[LEGACY_METADATA_KEY])
@@ -138,7 +190,7 @@ export async function updateRecord(
   if (!next || next === seed) return seed
   if (aborted?.()) return seed
   try {
-    await client.session.update({ path: { id: sessionID }, metadata: { ...existing, [METADATA_KEY]: next } })
+    await sdk.setMetadata(sessionID, { ...existing, [METADATA_KEY]: next })
   } catch (err) {
     console.error(`plan-review: updateRecord failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`)
     throw err
@@ -146,8 +198,8 @@ export async function updateRecord(
   return next
 }
 
-export async function readRecord(client: any, sessionID: string): Promise<ModelsRecord> {
-  const existing = await fetchMetadata(client, sessionID)
+export async function readRecord(sdk: SdkAdapter, sessionID: string): Promise<ModelsRecord> {
+  const existing = await fetchMetadata(sdk, sessionID)
   const current = parseRecord(existing[METADATA_KEY])
   if (current.plan !== undefined || current.build !== undefined) return current
   return parseLegacy(existing[LEGACY_METADATA_KEY])
@@ -159,13 +211,13 @@ export async function readRecord(client: any, sessionID: string): Promise<Models
  * agent's entry — last-write-wins for implicit captures.
  */
 export async function captureImplicit(
-  client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   agent: Agent,
   model: ModelRef,
 ): Promise<PickRecord | undefined> {
   const at = Date.now()
-  return updateRecord(client, sessionID, (cur) => {
+  return updateRecord(sdk, sessionID, (cur) => {
     const existing = cur[agent]
     if (existing?.pinned === true) return cur
     return { ...cur, [agent]: { ...model, source: "chat", at } }
@@ -177,14 +229,14 @@ export async function captureImplicit(
  * write if the caller has disposed (used by the TUI plugin's write chain).
  */
 export async function writePicker(
-  client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   agent: Agent,
   model: ModelRef,
   aborted?: () => boolean,
 ): Promise<PickRecord | undefined> {
   const at = Date.now()
-  return updateRecord(client, sessionID, (cur) => {
+  return updateRecord(sdk, sessionID, (cur) => {
     if (aborted?.()) return cur
     return { ...cur, [agent]: { ...model, source: "picker", at } }
   }, aborted).then((rec) => rec[agent])
@@ -195,13 +247,13 @@ export async function writePicker(
  * alone. Overwrites freely.
  */
 export async function writeCommand(
-  client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   agent: Agent,
   model: ModelRef,
 ): Promise<PickRecord | undefined> {
   const at = Date.now()
-  return updateRecord(client, sessionID, (cur) => {
+  return updateRecord(sdk, sessionID, (cur) => {
     return { ...cur, [agent]: { ...model, source: "command", at, pinned: true } }
   }).then((rec) => rec[agent])
 }
@@ -214,13 +266,13 @@ export async function writeCommand(
  * recorded), no metadata write is issued. Honors `aborted` like writePicker.
  */
 export async function mergeHomeFlush(
-  client: any,
+  sdk: SdkAdapter,
   sessionID: string,
   picks: Partial<Record<Agent, ModelRef>>,
   aborted?: () => boolean,
 ): Promise<Agent[]> {
   const written: Agent[] = []
-  await updateRecord(client, sessionID, (cur) => {
+  await updateRecord(sdk, sessionID, (cur) => {
     let next: ModelsRecord = cur
     let allocated = false
     const at = Date.now()
@@ -241,12 +293,12 @@ export async function mergeHomeFlush(
 }
 
 /** Remove the persisted record for a session (used by /plan-diag reset). */
-export async function clearRecord(client: any, sessionID: string): Promise<void> {
+export async function clearRecord(sdk: SdkAdapter, sessionID: string): Promise<void> {
   try {
-    const existing = await fetchMetadata(client, sessionID)
+    const existing = await fetchMetadata(sdk, sessionID)
     const next = { ...existing }
     delete next[METADATA_KEY]
-    await client.session.update({ path: { id: sessionID }, metadata: next })
+    await sdk.setMetadata(sessionID, next)
   } catch (err) {
     console.error(`plan-review: clearRecord failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`)
   }

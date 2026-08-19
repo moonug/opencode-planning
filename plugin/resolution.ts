@@ -1,5 +1,5 @@
 import { withTimeoutSafe } from "./helpers"
-import { readRecord, sourceLabel, type ModelsRecord } from "./model-store"
+import { readRecord, sourceLabel, type ModelsRecord, type SdkAdapter } from "./model-store"
 
 export type ModelRef = { providerID: string; modelID: string; variant?: string }
 
@@ -133,9 +133,10 @@ export async function getSessionHistoryBuildMessage(
  */
 export async function resolveBuildModel(
   client: any,
+  sdk: SdkAdapter,
   sessionID: string
 ): Promise<{ target?: ModelRef; source: string }> {
-  const record: ModelsRecord = await readRecord(client, sessionID)
+  const record: ModelsRecord = await readRecord(sdk, sessionID)
   if (record.build) {
     const m = record.build
     return {
@@ -156,6 +157,7 @@ export async function resolveBuildModel(
 
 export async function exitPlanMode(
   client: any,
+  sdk: SdkAdapter,
   log: (level: "info" | "warn" | "error", message: string) => Promise<void>,
   syntheticPrompt: { active: boolean; sessionID?: string },
   sessionID: string | undefined,
@@ -164,7 +166,7 @@ export async function exitPlanMode(
   if (!sessionID) return { status: "no_model" }
   await log("info", `plan-review: exitPlanMode called for session ${sessionID}`)
 
-  const { target, source } = await resolveBuildModel(client, sessionID)
+  const { target, source } = await resolveBuildModel(client, sdk, sessionID)
   await log(
     "info",
     `plan-review: exitPlanMode resolution: session=${sessionID} target=${target ? `${target.providerID}/${target.modelID}` : "undefined"} source=${source}`

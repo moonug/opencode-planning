@@ -3,6 +3,17 @@
 ## Errors
 
 - `catch {}` — forbidden. Empty catch swallows errors and turns debugging into hell. At minimum: log it, rethrow, or add a comment explaining why it's intentionally ignored.
+- The fork TUI's `local.tsx` had a `.catch(() => {})` on the `model.json` restore — it bit us because the restore silently never applied. The TUI cannot import opencode's log API; use `console.error` (terminal stderr is visible in the TUI) and add a unit test against a fixture file.
+
+## Plugin SDK contract (v1 vs v2)
+
+The two plugin hosts hand out DIFFERENT SDK clients:
+- Server plugin host → `@opencode-ai/sdk` (v1, hey-api runtime). `client.session.update` body type is `{ title?: string }`; the runtime only serializes `options.body`. **Anything at the top level is silently dropped on the wire** — no schema rejection, just an empty body that the server then silently ignores. Metadata MUST be passed under `body: { metadata: ... }`.
+- TUI plugin host → `@opencode-ai/sdk/v2` (v2, flat params). `client.session.update({ sessionID, metadata })` packs `metadata` into body server-side. **Metadata MUST be at the top level here**, NOT under `body`.
+
+Use `plugin/model-store.ts::v1SdkAdapter(client)` / `v2SdkAdapter(client)` and pass the adapter to `updateRecord` / `readRecord` / `clearRecord`. Don't call `client.session.update/get` directly in the plugin code — the SDK shapes are different and a typo silently drops the write.
+
+**Fake-client smoke tests don't prove server compatibility** — they accept whatever shape the plugin passes and can't tell if a real hey-api runtime would drop keys. v0.3.0 shipped with two wrong call shapes (top-level `metadata` for v1, `{path:{id}}` for v2) and every smoke check passed. The new `[contract:update-body]` check fixes that by using a v1-shaped fake that mirrors hey-api's `body`-only serialization. Add a new contract test for every new SDK call shape.
 
 ## opencode plugin architecture
 
@@ -31,6 +42,17 @@ Persist plan/build selections only for `ses_` IDs through serialized session met
 - Tag push (`git tag vX.Y.Z && git push origin vX.Y.Z`) triggers the workflow automatically.
 - Configure at npmjs.com → package → Settings → Trusted Publisher: org, repo, workflow filename (`publish.yml`).
 
+## Release QA checklist (manual — TUI can't be fully smoke-tested)
+
+Before every plugin release or fork rebuild, run on a real terminal:
+
+1. **Startup**: launch fresh `opencode` — startup log shows `plan-review: plugin init v0.3.x` and `plan-review-TUI: plugin loaded v0.3.x` for the EXPECTED version. Recent block in model picker shows your last 10 used models. Per-agent current model = `~/.local/state/opencode/model.json` `agents.{plan,build}` (no nanobanana default fallback).
+2. **Persistence**: pick a model for `build` via `/model` in the picker, exit, reopen. Per-agent model restored.
+3. **Build resolution**: in a fresh session, run `/plan-diag` — should print the per-agent record. Approve a plan → exitPlanMode must resolve and switch agent + model without "No build model resolved" unless the user truly never picked anything.
+4. **DB check**: after picking build, `sqlite3 ~/.local/share/opencode/opencode.db "SELECT metadata FROM session WHERE id='<id>'"` must contain a non-empty `planReviewModels` object (no planReviewDeferredPicks only).
+5. **FORK binary version**: `opencode-fork --version` reports `1.18.15+moonug.selection.N` for the CURRENT build (rebuild if stale).
+6. **No stale instances**: kill any long-running `opencode` from before the version bump — they hold pre-refactor plugin code in memory and produce confusing logs.
+
 ## Known opencode bugs
 
 - **"dummy" sessionID**: opencode uses `sessionID: "dummy"` in route on `--continue` startup. Components fire API calls with it → `Expected a string starting with "ses"` validation error. Not caused by our plugin — it's opencode's internal race between route placeholder and session list loading.
@@ -39,6 +61,7 @@ Persist plan/build selections only for `ses_` IDs through serialized session met
 
 - **Variant (effort) storage**: `packages/tui/src/context/local.tsx` → `modelStore.variant` map. Per-agent key `${agent}/${providerID}/${modelID}`; legacy per-model `${providerID}/${modelID}` read as fallback. `selectionSnapshot` variant callback receives `(agentName, model)`.
 - **TUI tests**: `bun test test/context/local.test.ts` from `packages/tui/` — covers `selectionSnapshot`, model pinning, variant resolution. Run after any `local.tsx` change.
+- **Restore tests**: `bun test test/util/model-restore.test.ts` — covers `applyModelRestore` against real fixture files (round-trips through `readJson`). Run after any `local.tsx` restore-path change.
 
 ## Fork binary build
 

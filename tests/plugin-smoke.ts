@@ -110,50 +110,54 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
   const fakeClient = {
     session: {
       get: async ({ path }: any) => ({ data: { metadata: stored.get(path.id) ?? {} } }),
-      update: async ({ path, metadata }: any) => {
-        stored.set(path.id, metadata)
-        recorded.push({ key: path.id, value: metadata })
+      update: async ({ path, body }: any) => {
+        // The v1 SDK adapter passes metadata under body. Match that here so
+        // a regression moving metadata back to the top level surfaces as a
+        // missing key on `recorded[i].value`.
+        const next = body?.metadata
+        if (next) stored.set(path.id, next)
+        recorded.push({ key: path.id, value: next })
         return { data: null }
       },
     },
   } as any
 
   // captureImplicit writes chat-capture record
-  await modelStore.captureImplicit(fakeClient, "ses_a", "build", { providerID: "ya-glm", modelID: "glm" })
+  await modelStore.captureImplicit(modelStore.v1SdkAdapter(fakeClient), "ses_a", "build", { providerID: "ya-glm", modelID: "glm" })
   if (recorded.length !== 1) throw new Error("captureImplicit did not write metadata")
   if (recorded[0].value.planReviewModels.build?.source !== "chat") throw new Error("captureImplicit source wrong")
 
   // writeCommand sets pinned:true
-  await modelStore.writeCommand(fakeClient, "ses_a", "build", { providerID: "anthropic", modelID: "claude-sonnet-4" })
+  await modelStore.writeCommand(modelStore.v1SdkAdapter(fakeClient), "ses_a", "build", { providerID: "anthropic", modelID: "claude-sonnet-4" })
   if (recorded[1].value.planReviewModels.build?.pinned !== true) throw new Error("writeCommand did not set pinned")
   if (recorded[1].value.planReviewModels.build?.source !== "command") throw new Error("writeCommand source wrong")
 
   // captureImplicit must SKIP a pinned record (no overwrite)
   const beforeCount = recorded.length
-  await modelStore.captureImplicit(fakeClient, "ses_a", "build", { providerID: "openai", modelID: "gpt-x" })
+  await modelStore.captureImplicit(modelStore.v1SdkAdapter(fakeClient), "ses_a", "build", { providerID: "openai", modelID: "gpt-x" })
   if (recorded.length !== beforeCount) throw new Error("captureImplicit must skip pinned records")
-  const finalBuild = (await modelStore.readRecord(fakeClient, "ses_a")).build
+  const finalBuild = (await modelStore.readRecord(modelStore.v1SdkAdapter(fakeClient), "ses_a")).build
   if (finalBuild?.providerID !== "anthropic") throw new Error("pinned record lost its model: " + JSON.stringify(finalBuild))
 
   // writePicker overwrites freely (explicit beats pinned)
-  await modelStore.writePicker(fakeClient, "ses_a", "build", { providerID: "openai", modelID: "gpt-y" })
-  const after = (await modelStore.readRecord(fakeClient, "ses_a")).build
+  await modelStore.writePicker(modelStore.v1SdkAdapter(fakeClient), "ses_a", "build", { providerID: "openai", modelID: "gpt-y" })
+  const after = (await modelStore.readRecord(modelStore.v1SdkAdapter(fakeClient), "ses_a")).build
   if (after?.providerID !== "openai") throw new Error("writePicker did not overwrite: " + JSON.stringify(after))
 
   // mergeHomeFlush fills absent agents only
   recorded.length = 0
-  await modelStore.mergeHomeFlush(fakeClient, "ses_b", {
+  await modelStore.mergeHomeFlush(modelStore.v1SdkAdapter(fakeClient), "ses_b", {
     plan: { providerID: "ya-glm", modelID: "glm" },
     build: { providerID: "openai", modelID: "gpt-z" },
   })
-  const home = (await modelStore.readRecord(fakeClient, "ses_b"))
+  const home = (await modelStore.readRecord(modelStore.v1SdkAdapter(fakeClient), "ses_b"))
   if (home.plan?.source !== "home-flush" || home.build?.source !== "home-flush") {
     throw new Error("home-flush source wrong: " + JSON.stringify(home))
   }
 
   // mergeHomeFlush does NOT overwrite existing records
   recorded.length = 0
-  const written = await modelStore.mergeHomeFlush(fakeClient, "ses_b", {
+  const written = await modelStore.mergeHomeFlush(modelStore.v1SdkAdapter(fakeClient), "ses_b", {
     plan: { providerID: "anthropic", modelID: "claude-x" }, // already has plan=glm
     build: { providerID: "anthropic", modelID: "claude-y" }, // already has build=gpt-z
   })
@@ -181,7 +185,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     },
   } as any
 
-  const rec = await modelStore.readRecord(fakeClient, "ses_legacy")
+  const rec = await modelStore.readRecord(modelStore.v1SdkAdapter(fakeClient), "ses_legacy")
   if (rec.build?.providerID !== "openai" || rec.build?.source !== "picker") {
     throw new Error("legacy build pick not parsed: " + JSON.stringify(rec.build))
   }
@@ -189,6 +193,54 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     throw new Error("legacy plan pick should be tagged home-flush: " + JSON.stringify(rec.plan))
   }
   console.log("[6] model-store: legacy planReviewDeferredPicks read fallback: ok")
+}
+
+// [contract:update-body] updateRecord sends metadata under body, not at the top
+//    level. The fork ships a v1 SDK client (`@opencode-ai/sdk`) whose
+//    body type is `{ title?: string }` and whose hey-api runtime only
+//    serializes `options.body`. Putting `metadata` at the top level silently
+//    drops it on the wire — no schema rejection, just empty metadata on the
+//    server. This fake mimics that runtime exactly so a regression moves the
+//    metadata back into a shape the server will actually persist.
+{
+  const stored = new Map<string, Record<string, any>>()
+  const recorded: Array<{ path: any; body: any }> = []
+  // mimic hey-api: the patch method only sees `body`; top-level keys that are
+  // not `body`/`path`/`query`/`url`/`headers` are ignored at the wire level
+  const fakeClient = {
+    session: {
+      get: async ({ path }: any) => ({ data: { metadata: stored.get(path.id) ?? {} } }),
+      update: async (options: any) => {
+        recorded.push({ path: options.path, body: options.body })
+        const id = options.path?.id
+        const next = options.body?.metadata
+        if (id && next) stored.set(id, next)
+        return { data: null }
+      },
+    },
+  } as any
+
+  await modelStore.captureImplicit(modelStore.v1SdkAdapter(fakeClient), "ses_contract", "build", {
+    providerID: "openai",
+    modelID: "gpt-x",
+  })
+  if (recorded.length !== 1) throw new Error("updateRecord should have issued one PUT")
+  const put = recorded[0]
+  if (!put.body || !put.body.metadata || !put.body.metadata.planReviewModels) {
+    throw new Error(
+      "updateRecord sent metadata at top level or missing — body=" + JSON.stringify(put.body)
+    )
+  }
+  if (put.body.metadata.planReviewModels.build?.providerID !== "openai") {
+    throw new Error("persisted metadata wrong: " + JSON.stringify(put.body.metadata))
+  }
+  // the legacy fake shape (top-level metadata) would NOT have produced any
+  // persisted record with this fake — verify the negative path
+  const beforeLegacy = stored.get("ses_contract") ?? {}
+  if (!beforeLegacy.planReviewModels) {
+    throw new Error("legacy shape would have silently dropped the write")
+  }
+  console.log("[contract:update-body] updateRecord persists via body.metadata: ok")
 }
 
 // 7. exitPlanMode refuses when no target resolved — exercise via plan_review.execute
@@ -242,7 +294,7 @@ function parseModelString(s: string): { providerID: string; modelID: string } | 
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -434,7 +486,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async ({ path }: any) => ({ data: { metadata: meta.get(path.id) ?? {} } }),
-      update: async ({ path, metadata }: any) => { meta.set(path.id, metadata); return { data: null } },
+      update: async ({ path, body }: any) => { if (body?.metadata) meta.set(path.id, body.metadata); return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -510,7 +562,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -584,7 +636,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -659,7 +711,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       messages: async () => ({ data: [] }),
       // Faithful server simulation: chat.message fires for every prompt.
       prompt: async (opts: any) => {
@@ -974,9 +1026,14 @@ const logs: any[] = []
   const fakeApi = {
     client: {
       session: {
-        get: async ({ path }: any) => ({ data: { metadata: metadata.get(path.id) ?? {} } }),
-        update: async ({ path, metadata: next }: any) => {
-          metadata.set(path.id, next)
+        get: async ({ sessionID, path }: any) => ({ data: { metadata: metadata.get(sessionID ?? path?.id) ?? {} } }),
+        update: async ({ sessionID, path, body, metadata: next }: any) => {
+          // The TUI plugin uses the v2 adapter which passes {sessionID, metadata}
+          // flat; the server plugin uses v1 which nests metadata under body. Match
+          // both so this fake works for either path.
+          const id = sessionID ?? path?.id
+          const value = body?.metadata ?? next
+          if (id && value) metadata.set(id, value)
           return { data: null }
         },
       },
@@ -1968,7 +2025,7 @@ const logs: any[] = []
     app: { log: async (opts: any) => { logs.push(opts) } },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -2020,7 +2077,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -2189,7 +2246,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: { model: "anthropic/claude-sonnet-4" } }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
       messages: async () => ({
         data: [{ info: { role: "user", agent: "build" }, model: { providerID: "minimax-coding-plan", modelID: "MiniMax-M3" } }],
@@ -2243,7 +2300,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async () => ({ data: { metadata: stored } }),
-      update: async ({ metadata }: any) => { stored = metadata; return { data: null } },
+      update: async ({ body }: any) => { if (body?.metadata) stored = body.metadata; return { data: null } },
       prompt: async (opts: any) => { prompts.push(opts); return {} },
     },
   }
@@ -2875,7 +2932,7 @@ const logs: any[] = []
     config: { get: async () => ({ data: {} }) },
     session: {
       get: async ({ path }: any) => ({ data: { metadata: meta.get(path.id) ?? {} } }),
-      update: async ({ path, metadata }: any) => { meta.set(path.id, metadata); return { data: null } },
+      update: async ({ path, body }: any) => { if (body?.metadata) meta.set(path.id, body.metadata); return { data: null } },
       prompt: async () => ({}),
     },
   }

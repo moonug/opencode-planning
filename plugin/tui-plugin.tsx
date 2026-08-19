@@ -1,6 +1,13 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { mergeHomeFlush, writePicker, type ModelRef, type Agent } from "./model-store"
+import {
+  mergeHomeFlush,
+  writePicker,
+  v2SdkAdapter,
+  type ModelRef,
+  type Agent,
+  type SdkAdapter,
+} from "./model-store"
 
 const VERSION = require("./package.json").version
 const BUILD_TAG = `v${VERSION}`
@@ -90,6 +97,9 @@ const tui: TuiPlugin = async (api) => {
   let writeChain = Promise.resolve()
   let disposed = false
 
+  // The TUI host hands us a v2 SDK client. Build the matching adapter.
+  const sdk: SdkAdapter = v2SdkAdapter(api.client)
+
   // Draft-scope picks made before a session exists. Only EXPLICIT picker
   // choices (tui.model.selected) land here. The flush merges them into a
   // session record ONLY when the session is brand new (merge-if-absent
@@ -135,7 +145,7 @@ const tui: TuiPlugin = async (api) => {
           logInfo(api, `plan-review-TUI: dropped home draft for existing session=${sessionID}`)
           return
         }
-        const written = await mergeHomeFlush(api.client, sessionID, toFlush, () => disposed)
+        const written = await mergeHomeFlush(sdk, sessionID, toFlush, () => disposed)
         if (disposed) return
         // Drop only the picks that actually landed; a record-absent agent
         // is fine to retry on the next transition.
@@ -161,7 +171,7 @@ const tui: TuiPlugin = async (api) => {
       .then(async () => {
         if (disposed) return
         await writePicker(
-          api.client,
+          sdk,
           sessionID,
           agent as Agent,
           {

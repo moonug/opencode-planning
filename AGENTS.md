@@ -60,7 +60,9 @@ Before every plugin release or fork rebuild, run on a real terminal:
 ## Fork TUI internals
 
 - **Variant (effort) storage**: `packages/tui/src/context/local.tsx` → `modelStore.variant` map. Per-agent key `${agent}/${providerID}/${modelID}`; legacy per-model `${providerID}/${modelID}` read as fallback. `selectionSnapshot` variant callback receives `(agentName, model)`.
-- **TUI tests**: `bun test test/context/local.test.ts` from `packages/tui/` — covers `selectionSnapshot`, model pinning, variant resolution. Run after any `local.tsx` change.
+- **Sticky model overrides (nanobanana flicker fix)**: `local.tsx::resolveAgentModel` — when the provider list flaps (auth refresh / sync re-batch) an agent's override fails `isModelValid`; the resolver then returns the agent's `lastValid` entry (last-known-GOOD; entries enter the map only after passing validation, so they are NOT re-validated against the flapping list) instead of the shared fallback. Never make `resolveModel`'s fallback reachable for an agent that ever had a valid pick — one submitted prompt in that window poisons the session history. Discards log rate-limited (1/10s) via `console.error`.
+- **unbindSession keeps session overrides when the draft lacks the agent** — clearing would resolve to the shared fallback on home. The persisted draft (model.json `agents`) is still the frozen `homeAgents` only, so RC1b isolation is unchanged.
+- **TUI tests**: `bun test test/context/local.test.ts` from `packages/tui/` — covers `selectionSnapshot`, model pinning, variant resolution, sticky flaps `[N1]–[N3]`. Run after any `local.tsx` change.
 - **Restore tests**: `bun test test/util/model-restore.test.ts` — covers `applyModelRestore` against real fixture files (round-trips through `readJson`). Run after any `local.tsx` restore-path change.
 
 ## Fork binary build
@@ -69,6 +71,9 @@ Before every plugin release or fork rebuild, run on a real terminal:
 - Build: `OPENCODE_VERSION="1.18.15+moonug.selection.N" bun run script/build.ts --single --skip-install` (in `packages/opencode/`)
 - **Always** pass `OPENCODE_VERSION` — without it the version becomes `0.0.0-<branch>-<timestamp>` (preview junk)
 - Increment the `.N` build metadata suffix on each rebuild
+- **Binary provenance guard**: `opencode --version` must ALWAYS report `1.18.15+moonug.selection.N`. Any other suffix (e.g. `tui-selection-events.3`) means an autonomous loop rebuilt dist from its own tree — that binary's content is unverified. Stop, inspect `git status` in the fork, and rebuild with the proper `OPENCODE_VERSION`.
+- **Autonomous loops must not leave uncommitted changes in the fork tree** — they silently end up inside the next binary build. Commit or stash before any `build.ts` run.
+- **`--single` builds only current platform; `--skip-install` skips native dep reinstall (fine for TUI-only changes)**
 - `--single` builds only current platform; `--skip-install` skips native dep reinstall (fine for TUI-only changes)
 - **model.json `agents` field** (per-agent home-draft overrides): `~/.local/state/opencode/model.json` now carries an `agents: {plan?…, build?…}` map alongside the existing `recent`/`favorite`/`variant`. The TUI plugin's live-read flush reads these at session transition; the fork TUI itself restores them at startup so new sessions carry the user's last per-agent picks across restarts. Do not read global `model.json` from the plugin.
 - **Scope isolation invariants (local.tsx)**: (1) the async model.json restore must never write into a bound session scope — if `modelStore.sessionID` is already set (`--continue`), persisted agents merge into the frozen `homeAgents` draft only, never the store; (2) `unbindSession` clears every known agent override and seeds the frozen draft back — session history-restored models must never become the home draft (one session would poison `save()`/model.json and every future session).

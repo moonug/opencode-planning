@@ -8,9 +8,9 @@ Override which model the session switches to when `/plan-review` (or the
 `plan_review` tool) approves a plan and the session auto-exits to the
 build agent.
 
-The override is stored in **this plugin's in-memory session memory** —
-it is lost when opencode restarts. For a persistent override, configure
-`agent.build.model` in `opencode.jsonc`.
+The override is stored in durable plugin storage for this session and
+survives opencode restarts. For a default shared by new sessions, configure
+the build agent model in `opencode.jsonc`.
 
 Usage:
 
@@ -24,20 +24,15 @@ Usage:
 
 Resolution priority on plan approval (first match wins):
 
-1. `chat.message` memory (build agent) — last model used by the build
-   agent in this session, captured directly or promoted from native TUI
-   selection metadata
-2. `/set-build-model` override (this command, in-memory, session-scoped)
-3. `chat.message` memory (plan agent) — fallback when build agent never
-   picked
-4. `agent.build.model` from `opencode.jsonc`
-5. `config.model` global default
-6. `agent.plan.model` (last resort)
+1. Durable `planReviewModels.build` record captured for this session
+2. Last build-agent model reconstructed from session history
+3. Build-agent model from `opencode.jsonc`
+4. Global default model
 
-This command sits at priority #2 — it overrides the config but is itself
-overridden by any TUI model picker choice recorded for the build agent,
-or by a later build prompt.
+This command pins the durable record. Later implicit prompt captures leave
+the pin alone. An explicit committed picker choice or another
+`/set-build-model` replaces it; `/plan-diag reset` clears it.
 
-Note: the fork's TUI plugin reads `api.state.selection()` for display and
-persists explicit `tui.model.selected` events. Stock opencode falls back safely to
-`chat.message`; neither path reads global `model.json`.
+OpenCode V2 publishes durable `session.model.selected` events when a model
+selection is committed. The server plugin attributes those events to the
+active agent; it never reads global `model.json`.

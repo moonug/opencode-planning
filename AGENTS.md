@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## V2 branch override
+
+- On the `v2` branch, `plugin/server.ts` / `plugin/v2.ts` and `plugin/tui.tsx` / `plugin/tui-v2.tsx` are the active package entrypoints. `plugin/index.ts` and `plugin/tui-plugin.tsx` are retained V1 references only.
+- Configure the package through V2 `plugins`; V2 discovers the exported `./tui` entrypoint from the same package. Do not run the V1 self-installer or add command/TUI symlinks.
+- Persist V2 per-session model choices in plugin storage under `session.<sessionID>.models`. Existing `session.metadata.planReviewModels` is a read-only migration fallback.
+- Capture committed model choices from public `session.model.selected` events and the session `prompt` hook. Do not depend on the V1 fork's private TUI selection API.
+- Validate with `npm run typecheck`, `npm run test:v2`, `python3 bin/plan-review.py --test`, and a private V2 server. Do not restart a shared service while it owns the current session.
+
+The V1 guidance below applies only when maintaining the retained legacy entrypoints or the V1 branch.
+
 ## Errors
 
 - `catch {}` — forbidden. Empty catch swallows errors and turns debugging into hell. At minimum: log it, rethrow, or add a comment explaining why it's intentionally ignored.

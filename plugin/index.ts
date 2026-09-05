@@ -41,7 +41,7 @@ async function runPlanReview($: any, planText: string): Promise<string> {
   }
 }
 
-export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
+export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory }) => {
   await logged(client, "info", `plan-review: plugin init v${VERSION} build=v${VERSION}`)
   await logged(
     client,
@@ -216,6 +216,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
         sdk,
         $,
         scriptPath: SCRIPT_PATH,
+        directory,
         lastShownModels,
         onPlanApproved,
       })

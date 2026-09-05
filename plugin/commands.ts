@@ -20,6 +20,7 @@ export interface CommandHandlers {
   sdk: SdkAdapter
   $: any
   scriptPath: string
+  directory: string
   lastShownModels: Map<string, ProviderListEntry[]>
   onPlanApproved: (sessionID: string, summary: string) => Promise<void>
 }
@@ -60,7 +61,7 @@ export async function handleCommand(
       await logged(h.client, "error", "plan-review: no active session")
       return true
     }
-    await handlePlanReview(h.client, h.$, h.scriptPath, sessionID, rawArgs.trim(), h.onPlanApproved)
+    await handlePlanReview(h.client, h.$, h.scriptPath, h.directory, sessionID, rawArgs.trim(), h.onPlanApproved)
     return true
   }
   return false
@@ -142,7 +143,7 @@ async function handleSetBuildModel(
       parts: [
         {
           type: "text",
-          text: `# set-build-model picker\n\nAvailable models (${entries.length}):\n\n${formatProviderList(entries)}\n\nReply with:\n- \`/set-build-model <number>\` to pick from this list (e.g. \`/set-build-model 5\`)\n- \`/set-build-model <provider>/<model-id>\` to set directly (e.g. \`/set-build-model ya-glm/glm\`)\n\nStored in this session's planReviewModels metadata (pinned, survives restart). For runtime model picker use the opencode UI (Ctrl-X M).`,
+          text: `# set-build-model picker\n\nAvailable models (${entries.length}):\n\n${formatProviderList(entries)}\n\nReply with:\n- \`/set-build-model <number>\` to pick from this list (e.g. \`/set-build-model 5\`)\n- \`/set-build-model <provider>/<model-id>\` to set directly (e.g. \`/set-build-model ya-glm/glm\`)\n\nStored in durable plugin storage as this session's planReviewModels record (pinned, survives restart). For the runtime model picker use the opencode UI (Ctrl-X M).`,
         },
       ],
     },
@@ -194,15 +195,15 @@ ${lines.join("\n")}
 
 Resolution priority on plan approval:
 1. planReviewModels.build record (chat | picker | home-flush | command)
-2. session history scan (last build-agent user message model)
-3. agent.build.model from opencode.jsonc
+2. session history scan (last build-agent message model)
+3. agents.build.model from opencode.jsonc
 4. config.model global default
 5. refuse → user picks manually
 
 Records with source=command are pinned; chat.message captures skip pinned
 agents. Run \`/plan-diag reset\` to clear the record for this session.
 
-Diagnostic lines \`plan-review: exitPlanMode ...\` and \`plan-review-TUI: ...\` appear in opencode log.
+Diagnostic lines \`plan-review: exitPlanMode ...\` appear in the opencode log.
 `,
         },
       ],
@@ -214,6 +215,7 @@ async function handlePlanReview(
   client: any,
   $: any,
   scriptPath: string,
+  directory: string,
   sessionID: string,
   filePath: string,
   onApproved: (sessionID: string, summary: string) => Promise<void>
@@ -228,7 +230,7 @@ async function handlePlanReview(
       .catch((e: unknown) => logged(client, "error", `plan-review: usage prompt failed: ${(e as Error)?.message ?? String(e)}`))
     return
   }
-  const absolutePath = resolve(filePath)
+  const absolutePath = resolve(directory, filePath)
   if (!existsSync(absolutePath)) {
     await logged(client, "error", `plan-review: file not found: ${absolutePath}`)
     await client.session
@@ -245,18 +247,22 @@ async function handlePlanReview(
   const diff = await runPlanReview($, scriptPath, planContent)
   const trimmed = diff.trim()
 
-  const feedback = trimmed
-    ? `# Plan Review Feedback\n\nFile: \`${absolutePath}\`\n\n${FEEDBACK_HEADER}${diff}\n${REVISION_PROMPT}`
-    : `# Plan Review Approved\n\nFile: \`${absolutePath}\` — no changes.`
-
   try {
-    await client.session.prompt({
-      path: { id: sessionID },
-      body: { parts: [{ type: "text", text: feedback }] },
-    })
     if (!trimmed) {
       await onApproved(sessionID, `User approved \`${absolutePath}\`.`)
+      return
     }
+    await client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        parts: [
+          {
+            type: "text",
+            text: `# Plan Review Feedback\n\nFile: \`${absolutePath}\`\n\n${FEEDBACK_HEADER}${diff}\n${REVISION_PROMPT}`,
+          },
+        ],
+      },
+    })
   } catch (err) {
     await logged(client, "error", `plan-review: failed to send feedback: ${(err as Error).message}`)
   }

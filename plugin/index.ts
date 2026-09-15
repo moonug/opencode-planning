@@ -24,12 +24,45 @@ const REVISION_PROMPT =
   "making changes, this tool returns an empty/no-diff result and the " +
   "plan is approved."
 
+const TEMP_PREPARE_ERROR =
+  "plan-review could not prepare the temp plan file (mkdtemp/writeFileSync failed). " +
+  "Check TMPDIR free space and permissions, then retry."
+
+const SPAWN_ERROR_HINT =
+  "If this session lives on an arc worktree mount (arcadia-wt), the macfuse (FUSE) " +
+  "mount may be stalled — check `ls` on the project directory and retry."
+
+function describeHelperFailure(err: unknown): string {
+  const e = err as (Error & { code?: string | number; exitCode?: number }) | undefined
+  const message = e?.message && e.message.length > 0 ? e.message : String(err)
+  const parts = [`plan-review helper failed: ${message}`]
+  if (e?.code !== undefined) parts.push(`(code ${e.code})`)
+  if (e?.exitCode !== undefined && e.exitCode !== 0) parts.push(`(exit ${e.exitCode})`)
+  parts.push(SPAWN_ERROR_HINT)
+  return parts.join(" ")
+}
+
 async function runPlanReview($: any, planText: string): Promise<string> {
-  const tmpDir = mkdtempSync(join(tmpdir(), "opencode-plan-review-"))
-  const tmpPath = join(tmpDir, "plan.md")
-  writeFileSync(tmpPath, planText, "utf8")
+  let tmpDir: string
+  let tmpPath: string
+  try {
+    tmpDir = mkdtempSync(join(tmpdir(), "opencode-plan-review-"))
+    tmpPath = join(tmpDir, "plan.md")
+    writeFileSync(tmpPath, planText, "utf8")
+  } catch (err) {
+    console.error(`plan-review: ${TEMP_PREPARE_ERROR}: ${(err as Error)?.message ?? String(err)}`)
+    throw new Error(`${TEMP_PREPARE_ERROR} Underlying error: ${(err as Error)?.message ?? String(err)}`)
+  }
   try {
     return await $`${SCRIPT_PATH} --file ${tmpPath}`.text()
+  } catch (err) {
+    // Never let the tool surface an empty error: opencode records
+    // `status: "error"` with whatever message we throw, and an empty string
+    // gives the model (and the user) nothing to act on. Spawn failures on
+    // stalled arc FUSE mounts are the known case.
+    const described = describeHelperFailure(err)
+    console.error(`plan-review: ${described}`)
+    throw new Error(described)
   } finally {
     try {
       rmSync(tmpDir, { recursive: true, force: true })

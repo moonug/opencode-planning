@@ -63,6 +63,22 @@ Before every plugin release or fork rebuild, run on a real terminal:
 5. **FORK binary version**: `opencode-fork --version` reports `1.18.15+moonug.selection.N` for the CURRENT build (rebuild if stale).
 6. **No stale instances**: kill any long-running `opencode` from before the version bump — they hold pre-refactor plugin code in memory and produce confusing logs.
 
+## Diagnostics (log/DB locations + evidence patterns)
+
+- **Server log**: `~/.local/share/opencode/log/opencode.log`. Key greps:
+  - `plan-review: plugin init|plugin loaded` — which plugin version EACH running instance actually holds (run-id in `run=` field; long-running instances keep pre-refactor code in memory — check this FIRST when logs look wrong)
+  - `schema rejection kind=Payload` — server rejected an SDK call; correlate its timestamp with `HOOK FIRED` lines 1–3ms earlier to identify the caller
+  - `stream providerID=... session.id=` — ground truth for the model the server ACTUALLY streamed (TUI display can differ)
+  - `created id=... version=...` — reveals which binary created a session (binary-provenance forensics)
+- **Session DB**: `sqlite3 ~/.local/share/opencode/opencode.db "SELECT id, directory, substr(metadata,1,300) FROM session ORDER BY time_updated DESC"` — `time_*` are ms epochs; `metadata` holds `planReviewModels`.
+- **TUI state**: `~/.local/state/opencode/model.json` (recent/favorite/variant/agents). `~/.local/state/opencode/prompt-history.jsonl` contains verbatim user complaints — useful to correlate bug reports with timestamps.
+- **`ENXIO` on lstat/realpath for `~/arcadia-wt/**`**: a stalled macfuse `arc` mount, not a plugin bug. Symptoms: server `ENXIO: no such device or address, lstat '<wt path>'`, TUI retries `failed ref=err_*`, `glob`/tool failures in the same window, `plan_review` `status:"error"`. Check `ls` on the directory, wait for the mount to recover, retry. From plugin v0.3.2 the tool always reports non-empty text (errno + FUSE hint) instead of a bare error.
+
+## Environment gotchas
+
+- Fork pre-push hook runs repo-wide `bun typecheck`, which FAILS on pre-existing `@opencode-ai/app#typecheck` errors (desktop/drizzle-orm missing) — pushing with `--no-verify` is the established norm there.
+- `gh run watch` requires an explicit run ID when non-interactive (`gh run list --workflow=Publish --limit=1 --json databaseId -q '.[0].databaseId'`).
+
 ## Known opencode bugs
 
 - **"dummy" sessionID**: opencode uses `sessionID: "dummy"` in route on `--continue` startup. Components fire API calls with it → `Expected a string starting with "ses"` validation error. Not caused by our plugin — it's opencode's internal race between route placeholder and session list loading.
@@ -84,7 +100,6 @@ Before every plugin release or fork rebuild, run on a real terminal:
 - **Binary provenance guard**: `opencode --version` must ALWAYS report `1.18.15+moonug.selection.N`. Any other suffix (e.g. `tui-selection-events.3`) means an autonomous loop rebuilt dist from its own tree — that binary's content is unverified. Stop, inspect `git status` in the fork, and rebuild with the proper `OPENCODE_VERSION`.
 - **Autonomous loops must not leave uncommitted changes in the fork tree** — they silently end up inside the next binary build. Commit or stash before any `build.ts` run.
 - **`--single` builds only current platform; `--skip-install` skips native dep reinstall (fine for TUI-only changes)**
-- `--single` builds only current platform; `--skip-install` skips native dep reinstall (fine for TUI-only changes)
 - **model.json `agents` field** (per-agent home-draft overrides): `~/.local/state/opencode/model.json` now carries an `agents: {plan?…, build?…}` map alongside the existing `recent`/`favorite`/`variant`. The TUI plugin's live-read flush reads these at session transition; the fork TUI itself restores them at startup so new sessions carry the user's last per-agent picks across restarts. Do not read global `model.json` from the plugin.
 - **Scope isolation invariants (local.tsx)**: (1) the async model.json restore must never write into a bound session scope — if `modelStore.sessionID` is already set (`--continue`), persisted agents merge into the frozen `homeAgents` draft only, never the store; (2) `unbindSession` clears every known agent override and seeds the frozen draft back — session history-restored models must never become the home draft (one session would poison `save()`/model.json and every future session).
 - **Synthetic-prompt guard (plugin)**: the server fires `chat.message` for EVERY prompt, including exitPlanMode's own noReply switch prompt. A plugin-instance-scoped `{active, sessionID}` window guard makes the hook skip recording during that call. With write-time precedence on the single record, the sticky-model bug is structurally gone (the switch prompt would write the same value back), but the guard is kept as defense-in-depth so diagnostics stay clean. Smoke test 36f.

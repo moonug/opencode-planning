@@ -3148,4 +3148,51 @@ const logs: any[] = []
   console.log("[P4] no plan-model leak: build refuses when only plan has a model: ok")
 }
 
+// PR-readable-error. Regression for ses_f6f600deeffe: the python helper could
+// not be spawned (stalled macfuse/arc mount → ENXIO) and opencode recorded
+// `status: "error"` with an EMPTY message, so neither the model nor the user
+// had anything to act on. runPlanReview must always throw non-empty,
+// actionable text.
+{
+  const runFailure = async (err: unknown): Promise<string> => {
+    const fake$: any = () => ({ text: async () => { throw err } })
+    const failingHooks = await mod.default({
+      client: { app: { log: async () => {} }, session: { prompt: async () => {} } } as any,
+      project: {} as any,
+      directory: "/tmp",
+      worktree: "/tmp",
+      serverUrl: new URL("http://x"),
+      $: fake$,
+    })
+    try {
+      await failingHooks.tool.plan_review.execute(
+        { plan: "x" },
+        { sessionID: "ses_pr_error", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+      )
+    } catch (e) {
+      return (e as Error)?.message ?? ""
+    }
+    return ""
+  }
+
+  const enxio = Object.assign(
+    new Error("ENXIO: no such device or address, lstat '/Users/x/arcadia-wt/ghostinvship/junk/moonug'"),
+    { code: "ENXIO" },
+  )
+  const enxioText = await runFailure(enxio)
+  if (!enxioText.includes("plan-review helper failed")) {
+    throw new Error(`[PR-readable-error] helper failure not described: "${enxioText}"`)
+  }
+  if (!enxioText.includes("ENXIO")) throw new Error(`[PR-readable-error] underlying errno missing: "${enxioText}"`)
+  if (!enxioText.includes("macfuse")) throw new Error(`[PR-readable-error] FUSE hint missing: "${enxioText}"`)
+
+  // The exact defect: an error carrying NO message must still surface text.
+  const nameless = await runFailure(new Error(""))
+  if (nameless.trim().length === 0) throw new Error("[PR-readable-error] empty error message reached the tool")
+  if (!nameless.includes("plan-review helper failed")) {
+    throw new Error(`[PR-readable-error] empty-message failure not described: "${nameless}"`)
+  }
+  console.log("[PR-readable-error] helper spawn failures always surface actionable text: ok")
+}
+
 console.log("[OK] all smoke checks passed")

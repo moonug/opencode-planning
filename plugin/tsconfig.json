@@ -3,7 +3,7 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022"],
+    "lib": ["ES2023", "DOM"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
@@ -12,7 +12,17 @@
     "jsxImportSource": "@opentui/solid",
     "allowImportingTsExtensions": false,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@opencode-ai/plugin/v2": ["../../opencode-v2/packages/plugin/src/v2/promise/index.ts"],
+      "@opencode-ai/plugin/v2/*": ["../../opencode-v2/packages/plugin/src/v2/promise/*"],
+      "@opencode-ai/plugin/*": ["../../opencode-v2/packages/plugin/src/*"],
+      "@opencode-ai/schema/*": ["../../opencode-v2/packages/schema/src/*"],
+      "@opencode-ai/client/*": ["../../opencode-v2/packages/client/src/*"],
+      "@opencode-ai/ai": ["../../opencode-v2/packages/ai/src/index.ts"],
+      "@opencode-ai/ai/*": ["../../opencode-v2/packages/ai/src/*"],
+      "effect": ["../../opencode-v2/node_modules/effect"]
+    }
   },
-  "include": ["index.ts", "tui-plugin.tsx", "v2/**/*.ts"]
+  "include": ["index.ts", "tui-plugin.tsx", "tui-v2.tsx", "v2/**/*.ts", "v2/**/*.tsx"]
 }

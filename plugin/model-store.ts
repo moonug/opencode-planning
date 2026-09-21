@@ -133,18 +133,17 @@ export function v2SdkAdapter(client: V2SessionClient): SdkAdapter {
   }
 }
 
+/**
+ * The V2 Promise session slice this adapter needs, derived from the real host
+ * type so the wire shape cannot drift from `session.instructions.entry`.
+ */
 export type SessionInstructions = {
-  readonly instructions: {
-    readonly entry: {
-      readonly list: (input: { readonly sessionID: string }) => Promise<ReadonlyArray<{ key: string; value: unknown }>>
-      readonly put: (input: { readonly sessionID: string; readonly key: string; readonly value: unknown }) => Promise<void>
-      readonly remove: (input: { readonly sessionID: string; readonly key: string }) => Promise<void>
-    }
-  }
+  readonly instructions: import("./v2/context").Context["session"]["instructions"]
 }
 
 /** Build the V2 Promise adapter backed by durable instruction entries. */
 export function v2InstructionAdapter(session: SessionInstructions): SdkAdapter {
+  type EntryPutValue = Parameters<typeof session.instructions.entry.put>[0]["value"]
   return {
     async getMetadata(sessionID) {
       const entries = await session.instructions.entry.list({ sessionID })
@@ -155,7 +154,9 @@ export function v2InstructionAdapter(session: SessionInstructions): SdkAdapter {
     async setMetadata(sessionID, metadata) {
       const value = metadata[METADATA_KEY]
       if (value === undefined) return session.instructions.entry.remove({ sessionID, key: METADATA_KEY })
-      return session.instructions.entry.put({ sessionID, key: METADATA_KEY, value })
+      // The record is plain JSON by construction (providerID/modelID strings,
+      // variant string, numeric timestamp) — cast at the host boundary only.
+      return session.instructions.entry.put({ sessionID, key: METADATA_KEY, value: value as EntryPutValue })
     },
   }
 }

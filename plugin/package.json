@@ -1,20 +1,23 @@
 {
   "name": "opencode-plan-review",
-  "version": "0.3.2",
-  "description": "opencode plugin: review plans in $EDITOR with per-agent model tracking",
+  "version": "0.4.0-alpha.1",
+  "description": "opencode2 plugin: review plans in $EDITOR with per-agent model tracking",
   "type": "module",
-  "main": "index.ts",
+  "main": "v2/index.ts",
   "engines": {
     "node": ">=24"
   },
   "exports": {
-    ".": "./index.ts",
-    "./tui": "./tui-plugin.tsx",
-    "./v2": "./v2/index.ts"
+    ".": "./v2/index.ts",
+    "./tui": "./tui-v2.tsx",
+    "./v1": "./index.ts",
+    "./v1/tui": "./tui-plugin.tsx"
   },
   "files": [
+    "v2/",
     "index.ts",
     "tui-plugin.tsx",
+    "tui-v2.tsx",
     "helpers.ts",
     "install.ts",
     "resolution.ts",
@@ -23,12 +26,12 @@
     "model-store.ts",
     "bin/",
     "commands/",
-    "v2/",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "bun script/typecheck.ts",
+    "test": "bun test ../tests/ && bun tests/v2-tui-smoke.tsx"
   },
   "keywords": [
     "opencode",
@@ -44,14 +47,26 @@
     "url": "https://github.com/moonug/opencode-planning"
   },
   "dependencies": {
-    "@opentui/solid": "0.4.5",
-    "@opencode-ai/plugin": "*",
-    "jsonc-parser": "^3.3.1",
-    "solid-js": "1.9.12",
-    "effect": "^4.0.0-beta.83"
+    "effect": "4.0.0-beta.98",
+    "jsonc-parser": "^3.3.1"
+  },
+  "peerDependencies": {
+    "@opentui/solid": ">=0.5.6",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opentui/solid": "0.5.6",
     "@types/node": "^26.1.1",
+    "solid-js": "1.9.12",
     "typescript": "^7.0.2"
   }
 }

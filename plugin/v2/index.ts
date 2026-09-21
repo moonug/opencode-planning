@@ -4,8 +4,9 @@ import { spawn } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setBuildModel, planDiag } from "./commands"
-import { type Context, type Model, type Tool } from "./context"
+import { type Context, type Model, type Tool, type ToolContext } from "./context"
 import { log } from "./helpers"
+import { describeHelperFailure, describeTempPrepareFailure } from "../helper-errors"
 import { SCRIPT_PATH } from "../install"
 import { captureImplicit, v2InstructionAdapter } from "../model-store"
 import { exitPlanMode } from "./resolution"
@@ -47,9 +48,8 @@ export const PlanReviewPlugin = {
         "Returns a diff, or empty output when approved; approval switches to the build agent using the per-session build model.",
       input: Schema.Struct({ plan: Schema.String }),
       output: Schema.String,
-      execute: async (input, toolContext) => {
-        const args = input as PlanReviewInput
-        const result = await runPlanReview(args.plan)
+      execute: async (input: PlanReviewInput, toolContext: ToolContext) => {
+        const result = await runPlanReview(input.plan)
         if (result.trim()) return FEEDBACK_HEADER + result + REVISION_PROMPT
 
         const exit = await exitPlanMode(context, sdk, log, toolContext.sessionID, "User closed editor without changes.")
@@ -66,8 +66,8 @@ export const PlanReviewPlugin = {
       description: "Persist the build model for this session. Pass an empty model to show the available model list.",
       input: Schema.Struct({ model: Schema.optional(Schema.String) }),
       output: Schema.String,
-      execute: async (input, toolContext) =>
-        setBuildModel(context, sdk, toolContext.sessionID, (input as SetBuildModelInput).model ?? "", lastShownModels),
+      execute: async (input: SetBuildModelInput, toolContext: ToolContext) =>
+        setBuildModel(context, sdk, toolContext.sessionID, input.model ?? "", lastShownModels),
     }
 
     const plan_diag: Tool = {
@@ -75,14 +75,35 @@ export const PlanReviewPlugin = {
       description: "Show or reset the persisted per-session plan/build model record.",
       input: Schema.Struct({ reset: Schema.optional(Schema.Boolean) }),
       output: Schema.String,
-      execute: async (input, toolContext) =>
-        planDiag(context, sdk, toolContext.sessionID, (input as PlanDiagInput).reset === true),
+      execute: async (input: PlanDiagInput, toolContext: ToolContext) =>
+        planDiag(context, sdk, toolContext.sessionID, input.reset === true),
     }
 
     registrations.push(await context.tool.transform((draft) => {
       draft.add(plan_review)
       draft.add(set_build_model)
       draft.add(plan_diag)
+    }))
+
+    // Ported from the superseded plugin/v2.ts. Agent permission rules are the
+    // opencode2 equivalent of the V1 `config` hook's per-agent permission map:
+    // plan_review is available to plan and hidden from build.
+    registrations.push(await context.agent.transform((draft) => {
+      if (draft.get("plan")) {
+        draft.update("plan", (agent) => {
+          agent.permissions = agent.permissions.filter(
+            (rule) => rule.action !== "plan_review" && rule.action !== "plan_exit",
+          )
+          agent.permissions.push({ action: "plan_review", resource: "*", effect: "allow" })
+          agent.permissions.push({ action: "plan_exit", resource: "*", effect: "deny" })
+        })
+      }
+      if (draft.get("build")) {
+        draft.update("build", (agent) => {
+          agent.permissions = agent.permissions.filter((rule) => rule.action !== "plan_review")
+          agent.permissions.push({ action: "plan_review", resource: "*", effect: "deny" })
+        })
+      }
     }))
 
     registrations.push(await context.session.hook("context", async (event) => {
@@ -109,22 +130,25 @@ export const PlanReviewPlugin = {
 export default PlanReviewPlugin
 
 async function runPlanReview(planText: string): Promise<string> {
-  const tmpDir = mkdtempSync(join(tmpdir(), "opencode-plan-review-"))
-  const tmpPath = join(tmpDir, "plan.md")
-  writeFileSync(tmpPath, planText, "utf8")
+  let tmpDir: string
+  let tmpPath: string
   try {
-    return await new Promise((resolve, reject) => {
-      const child = spawn(SCRIPT_PATH, ["--file", tmpPath], { stdio: ["ignore", "pipe", "pipe"] })
-      const stdout: Buffer[] = []
-      const stderr: Buffer[] = []
-      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
-      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
-      child.once("error", reject)
-      child.once("close", (code) => {
-        if (code === 0) return resolve(Buffer.concat(stdout).toString("utf8"))
-        reject(new Error(Buffer.concat(stderr).toString("utf8") || `plan-review exited with code ${code}`))
-      })
-    })
+    tmpDir = mkdtempSync(join(tmpdir(), "opencode-plan-review-"))
+    tmpPath = join(tmpDir, "plan.md")
+    writeFileSync(tmpPath, planText, "utf8")
+  } catch (error) {
+    const described = describeTempPrepareFailure(error)
+    console.error(`plan-review: ${described}`)
+    throw new Error(described)
+  }
+  try {
+    return await runHelper(tmpPath)
+  } catch (error) {
+    // Never surface an empty error: opencode stores the thrown message as the
+    // tool error, so a bare `status: "error"` tells the user nothing.
+    const described = describeHelperFailure(error)
+    console.error(`plan-review: ${described}`)
+    throw new Error(described)
   } finally {
     try {
       rmSync(tmpDir, { recursive: true, force: true })
@@ -132,4 +156,19 @@ async function runPlanReview(planText: string): Promise<string> {
       console.error(`plan-review: failed to clean temp dir ${tmpDir}: ${(error as Error).message}`)
     }
   }
+}
+
+function runHelper(tmpPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(SCRIPT_PATH, ["--file", tmpPath], { stdio: ["ignore", "pipe", "pipe"] })
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
+    child.once("error", reject)
+    child.once("close", (code) => {
+      if (code === 0) return resolve(Buffer.concat(stdout).toString("utf8"))
+      reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `plan-review exited with code ${code}`))
+    })
+  })
 }

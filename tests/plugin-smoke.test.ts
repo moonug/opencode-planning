@@ -126,11 +126,28 @@ const entries = new Map<string, unknown>()
 const hooks = new Map<string, (event: unknown) => Promise<void> | void>()
 const tools = new Map<string, Tool>()
 const transitions: Array<{ type: string; value: unknown }> = []
+const agents: Array<{ id: string; permissions: Array<{ action: string; resource: string; effect: string }> }> = [
+  { id: "plan", permissions: [] },
+  { id: "build", permissions: [] },
+]
 
 const context = {
   options: {},
   agent: {
     get: async () => ({ model: { providerID: "provider", id: "model" } }),
+    transform: async (callback: (draft: unknown) => void) => {
+      callback({
+        list: () => agents,
+        get: (id: string) => agents.find((agent) => agent.id === id),
+        default: () => undefined,
+        update: (id: string, update: (agent: (typeof agents)[number]) => void) => {
+          const agent = agents.find((item) => item.id === id)
+          if (agent) update(agent)
+        },
+        remove: () => undefined,
+      })
+      return { dispose: async () => undefined }
+    },
   },
   catalog: {
     model: {
@@ -170,6 +187,13 @@ assert.equal(tools.size, 3)
 assert.ok(tools.has("plan_review"))
 assert.ok(tools.has("set_build_model"))
 assert.ok(tools.has("plan_diag"))
+
+// Ported from the superseded plugin/v2.ts: plan may call plan_review, build may not.
+const planRules = agents.find((agent) => agent.id === "plan")!.permissions.map((rule) => `${rule.action}:${rule.effect}`)
+assert.ok(planRules.includes("plan_review:allow"), planRules.join(","))
+assert.ok(planRules.includes("plan_exit:deny"), planRules.join(","))
+const buildRules = agents.find((agent) => agent.id === "build")!.permissions.map((rule) => `${rule.action}:${rule.effect}`)
+assert.ok(buildRules.includes("plan_review:deny"), buildRules.join(","))
 
 await hooks.get("model.request")?.({
   sessionID: "ses_smoke",

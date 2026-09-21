@@ -9,8 +9,12 @@ export function withTimeoutSafe<T>(p: Promise<T>, ms: number, fallback: T): Prom
 }
 
 export const log: Logger = async (level, message) => {
-  if (level === "info" || level === "debug") return
-  const write = level === "error" ? console.error : console.warn
+  // The v2 host context exposes no log API (app carries only name/version/
+  // channel), so terminal output is the only startup diagnostics channel.
+  // Keep debug out of it, but never silence info: the `plugin init v...` line
+  // is how QA verifies which build actually loaded.
+  if (level === "debug") return
+  const write = level === "error" ? console.error : level === "warn" ? console.warn : console.log
   write(`plan-review: ${message}`)
 }
 

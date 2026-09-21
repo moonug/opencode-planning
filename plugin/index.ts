@@ -74,7 +74,7 @@ async function runPlanReview($: any, planText: string): Promise<string> {
   }
 }
 
-export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory }) => {
+export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
   await logged(client, "info", `plan-review: plugin init v${VERSION} build=v${VERSION}`)
   await logged(
     client,
@@ -98,7 +98,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory
 
   const lastShownModels = new Map<string, ProviderListEntry[]>()
 
-  const log = (level: "info" | "warn" | "error", message: string): Promise<void> =>
+  const log = (level: "debug" | "info" | "warn" | "error", message: string): Promise<void> =>
     logged(client, level, message)
   void log // silence "unused" until exitPlanMode is called
 
@@ -129,13 +129,13 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory
       const result = await runPlanReview($, args.plan)
       const trimmed = result.trim()
       if (!trimmed) {
-      const exit = await exitPlanMode(
-        client,
-        sdk,
-        log,
-        syntheticPrompt,
-        context.sessionID,
-        "User closed editor without changes."
+        const exit = await exitPlanMode(
+          client,
+          sdk,
+          log,
+          syntheticPrompt,
+          context.sessionID,
+          "User closed editor without changes."
         )
         if (exit.status === "switched") {
           return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
@@ -155,7 +155,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory
     tool: { plan_review },
 
     // Whitelist plan_review in primary_tools (mirrors plannotator). Keeps the
-    // tool visible to primary agents even when an `agent.tools` map would
+    // tool visible to primary agents even when an agent.tools map would
     // otherwise filter it out.
     config: async (opencodeConfig) => {
       await logged(client, "info", "plan-review: config hook fired")
@@ -249,7 +249,6 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory
         sdk,
         $,
         scriptPath: SCRIPT_PATH,
-        directory,
         lastShownModels,
         onPlanApproved,
       })
@@ -272,4 +271,4 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl, directory
   }
 }
 
-export default PlanReviewPlugin
+export default { id: "opencode-plan-review", server: PlanReviewPlugin }

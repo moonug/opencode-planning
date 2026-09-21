@@ -16,7 +16,7 @@ export interface ProviderListEntry {
 }
 
 export function parseModelString(s: string): ModelRef | undefined {
-  const m = s.trim().match(/^([^/\s]+)\/(.+)$/)
+  const m = s.trim().match(/^([^\/\s]+)\/(.+)$/)
   if (!m) return undefined
   return { providerID: m[1]!, modelID: m[2]! }
 }

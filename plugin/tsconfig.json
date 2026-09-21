@@ -14,5 +14,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "server.ts", "v2.ts", "tui.tsx", "tui-v2.tsx", "tui-plugin.tsx"]
+  "include": ["index.ts", "tui-plugin.tsx", "v2/**/*.ts"]
 }

@@ -97,8 +97,9 @@ const tui: TuiPlugin = async (api) => {
   let writeChain = Promise.resolve()
   let disposed = false
 
-  // The TUI host hands us a v2 SDK client. Build the matching adapter.
-  const sdk: SdkAdapter = v2SdkAdapter(api.client)
+  // The TUI host hands us the legacy v2 client. Its session metadata fields
+  // are flat parameters, unlike the server host's v1 body shape.
+  const sdk: SdkAdapter = v2SdkAdapter(api.client.session)
 
   // Draft-scope picks made before a session exists. Only EXPLICIT picker
   // choices (tui.model.selected) land here. The flush merges them into a

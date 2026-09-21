@@ -1,7 +1,7 @@
 /**
  * Single source of truth for per-session model picks.
  *
- * Each session carries ONE metadata record (`planReviewModels`) holding at
+ * Each session carries ONE instruction entry (`planReviewModels`) holding at
  * most one entry per agent (plan / build). All writers — chat.message
  * capture, TUI explicit picker, home→session flush, /set-build-model — go
  * through this module via `updateRecord` (single GET → mutate → PUT). No
@@ -107,18 +107,57 @@ function parseLegacy(raw: unknown): ModelsRecord {
 }
 
 /**
- * The two plugin hosts hand out different SDK clients:
- *  - server plugin (`@opencode-ai/sdk`)  → v1: hey-api runtime only
- *    serializes `options.body`; metadata must be passed under body.
- *  - TUI plugin    (`@opencode-ai/sdk/v2`) → flat params; metadata
- *    is a top-level field that the SDK packs into body itself.
- * Callers in index.ts / tui-plugin.tsx build an `sdk` adapter once at
- * startup and pass it to updateRecord/readRecord/clearRecord, so the
- * SDK shape is fixed per plugin type and never guessed at runtime.
+ * The plugin hosts expose different session APIs. Keep the store independent
+ * of those wire shapes by adapting each host at its boundary.
  */
 export type SdkAdapter = {
   getMetadata: (sessionID: string) => Promise<Record<string, unknown>>
   setMetadata: (sessionID: string, metadata: Record<string, unknown>) => Promise<unknown>
+}
+
+type V2SessionClient = {
+  get: (input: { sessionID: string }) => Promise<{ data?: { metadata?: Record<string, unknown> } }>
+  update: (input: { sessionID: string; metadata: Record<string, unknown> }) => Promise<unknown>
+}
+
+/** Build the adapter for the legacy TUI's v2 client (`/session` API). */
+export function v2SdkAdapter(client: V2SessionClient): SdkAdapter {
+  return {
+    async getMetadata(sessionID) {
+      const response = await client.get({ sessionID })
+      return response.data?.metadata ?? {}
+    },
+    async setMetadata(sessionID, metadata) {
+      return client.update({ sessionID, metadata })
+    },
+  }
+}
+
+export type SessionInstructions = {
+  readonly instructions: {
+    readonly entry: {
+      readonly list: (input: { readonly sessionID: string }) => Promise<ReadonlyArray<{ key: string; value: unknown }>>
+      readonly put: (input: { readonly sessionID: string; readonly key: string; readonly value: unknown }) => Promise<void>
+      readonly remove: (input: { readonly sessionID: string; readonly key: string }) => Promise<void>
+    }
+  }
+}
+
+/** Build the V2 Promise adapter backed by durable instruction entries. */
+export function v2InstructionAdapter(session: SessionInstructions): SdkAdapter {
+  return {
+    async getMetadata(sessionID) {
+      const entries = await session.instructions.entry.list({ sessionID })
+      const record = entries.find((entry) => entry.key === METADATA_KEY)?.value
+      if (!record || typeof record !== "object" || Array.isArray(record)) return {}
+      return { [METADATA_KEY]: record }
+    },
+    async setMetadata(sessionID, metadata) {
+      const value = metadata[METADATA_KEY]
+      if (value === undefined) return session.instructions.entry.remove({ sessionID, key: METADATA_KEY })
+      return session.instructions.entry.put({ sessionID, key: METADATA_KEY, value })
+    },
+  }
 }
 
 /** Build an adapter for the v1 SDK (server plugin host). */
@@ -140,26 +179,6 @@ export function v1SdkAdapter(client: any): SdkAdapter {
         path: { id: sessionID },
         body: { metadata },
       })
-    },
-  }
-}
-
-/** Build an adapter for the v2 SDK (TUI plugin host). */
-export function v2SdkAdapter(client: any): SdkAdapter {
-  return {
-    async getMetadata(sessionID) {
-      try {
-        const res = await client.session.get({ sessionID })
-        return ((res as any)?.data?.metadata ?? {}) as Record<string, unknown>
-      } catch (err) {
-        console.error(
-          `plan-review: v2 getMetadata failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`
-        )
-        return {}
-      }
-    },
-    async setMetadata(sessionID, metadata) {
-      return client.session.update({ sessionID, metadata })
     },
   }
 }

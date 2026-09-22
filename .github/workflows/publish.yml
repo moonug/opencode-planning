@@ -65,6 +65,7 @@ jobs:
           test -f v2/index.ts || { echo "v2/index.ts missing"; exit 1; }
           test -f helper-errors.ts || { echo "helper-errors.ts missing"; exit 1; }
           test -f tui-v2.tsx || { echo "tui-v2.tsx missing"; exit 1; }
+          test -f commands-v2.jsonc || { echo "commands-v2.jsonc missing"; exit 1; }
           test -f bin/plan-review.py || { echo "bin/plan-review.py missing"; exit 1; }
           echo "tarball contents verified"
         working-directory: plugin

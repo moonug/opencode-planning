@@ -1,0 +1,25 @@
+// Slash commands for the plan-review plugin on opencode2.
+//
+// opencode2 declares slash commands in the config document (`commands`), and a
+// plugin cannot register them (the host's CommandDraft has no `add`). Merge this
+// snippet into ~/.config/opencode-v2/opencode.jsonc, or drop equivalent markdown
+// files into ~/.config/opencode-v2/commands/*.md, which the host also scans.
+//
+// `$ARGUMENTS` is replaced with everything typed after the command name; a
+// template with no placeholder gets the raw input appended as a new paragraph.
+{
+  "commands": {
+    "plan-diag": {
+      "description": "Show the plan-review model record for this session",
+      "template": "Call the plan_diag tool and show its output verbatim."
+    },
+    "set-build-model": {
+      "description": "Pin the build model used when a plan is approved",
+      "template": "Call the set_build_model tool with model set to \"$ARGUMENTS\". If nothing follows the command, call it with no argument to list the available models."
+    },
+    "plan-review": {
+      "description": "Open the current plan in $EDITOR for review",
+      "template": "Call the plan_review tool with the plan you want the user to review as the plan argument. $ARGUMENTS"
+    }
+  }
+}

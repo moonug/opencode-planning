@@ -1,6 +1,6 @@
 {
   "name": "opencode-plan-review",
-  "version": "0.4.0-alpha.1",
+  "version": "0.4.0-alpha.2",
   "description": "opencode2 plugin: review plans in $EDITOR with per-agent model tracking",
   "type": "module",
   "main": "v2/index.ts",
@@ -28,6 +28,7 @@
     "model-store.ts",
     "bin/",
     "commands/",
+    "commands-v2.jsonc",
     "LICENSE",
     "README.md"
   ],

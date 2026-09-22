@@ -4,7 +4,7 @@
 
 Plan review plugin for [opencode](https://opencode.ai). Opens plans in `$EDITOR`, returns a unified diff of the user's edits as feedback for the model.
 
-> **Branch note:** this is the `v2` branch (version `0.4.0-alpha.1`), targeting **opencode2** — the Effect-based host checkout at `~/projects/opencode-v2`. The published `0.3.x` line for opencode V1 lives on `main`; the V1 sections below are retained for reference.
+> **Branch note:** this is the `v2` branch (version `0.4.0-alpha.2`), targeting **opencode2** — the Effect-based host checkout at `~/projects/opencode-v2`. The published `0.3.x` line for opencode V1 lives on `main`; the V1 sections below are retained for reference.
 
 ## V2 (opencode2) quick start
 
@@ -23,8 +23,13 @@ What differs from V1:
 - per-session model picks are stored as durable session instruction entries (`planReviewModels`), not session metadata round-trips;
 - model picks are captured from the `model.request` hook (primary requests only), not `chat.message`;
 - `plan_review`, `set_build_model`, `plan_diag` are tools; opencode2 has no plugin command registration, so declare `/plan-diag`-style shortcuts in `config.commands` if you want them;
+- explicit picker picks arrive as `session.model.selected` events and are attributed to the session's current agent (the event carries no agent);
 - agent permissions are patched through `agent.transform` rules (plan may call `plan_review`, build may not);
 - the TUI sidebar (`./tui` → `plugin/tui-v2.tsx`) reads only public session data.
+
+### Slash commands
+
+Copy [`plugin/commands-v2.jsonc`](plugin/commands-v2.jsonc) into `~/.config/opencode-v2/opencode.jsonc` (merge the `commands` key) to get `/plan-diag`, `/set-build-model` and `/plan-review`. The host substitutes `$ARGUMENTS` with whatever follows the command name. Equivalent markdown files under `~/.config/opencode-v2/commands/*.md` are scanned too.
 
 Requirements: Python 3.x (stdlib only) and an opencode2 build containing the plugin hook commit — see `AGENTS.md` for the rebuild recipe.
 

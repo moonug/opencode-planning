@@ -93,7 +93,7 @@ Before every plugin release or fork rebuild, run on a real terminal:
 ## Diagnostics (log/DB locations + evidence patterns)
 
 - **Server log**: `~/.local/share/opencode/log/opencode.log`. Key greps:
-  - `plan-review: plugin init|plugin loaded` — which plugin version EACH running instance actually holds (run-id in `run=` field; long-running instances keep pre-refactor code in memory — check this FIRST when logs look wrong)
+  - `plan-review: plugin init|plugin loaded` — V1 fork only: the v2 plugin logs via `console.log`, which never reaches this file, so for opencode2 sessions the activation evidence is `opencode2 plugin list` + `debug agents` (see the V2 override section). For V1 it shows which plugin version EACH running instance actually holds (run-id in `run=` field; long-running instances keep pre-refactor code in memory — check this FIRST when logs look wrong)
   - `schema rejection kind=Payload` — server rejected an SDK call; correlate its timestamp with `HOOK FIRED` lines 1–3ms earlier to identify the caller
   - `stream providerID=... session.id=` — ground truth for the model the server ACTUALLY streamed (TUI display can differ)
   - `created id=... version=...` — reveals which binary created a session (binary-provenance forensics)

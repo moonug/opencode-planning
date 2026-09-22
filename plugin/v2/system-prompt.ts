@@ -9,22 +9,40 @@ export type ContextHook = {
   readonly system: Array<SystemBlock>
 }
 
-/** Add plan-review instructions to plan turns without touching build turns. */
+/** Add plan-review instructions to plan turns only; never defect the host fiber. */
 export async function systemTransform(logger: Logger, event: ContextHook): Promise<void> {
-  await logged(
-    logger,
-    "info",
-    `plan-review: session context hook fired: session=${event.sessionID} agent=${event.agent} system_blocks=${event.system.length}`,
-  )
-  if (event.agent === "build") return
+  // Allowlist, not blacklist: the session context hook also fires for
+  // subagents and one-shot sessions with arbitrary agent names
+  // (generate-node), and title/compaction paths must stay untouched. Only
+  // the plan agent should see these blocks.
+  if (event.agent !== "plan") return
 
+  try {
+    await systemTransformUnsafe(logger, event)
+  } catch (err) {
+    // The host runs plugin hooks inline with no error recovery: a throw here
+    // defects the request fiber. Leave the system prompt unmodified instead.
+    await logged(
+      logger,
+      "error",
+      `systemTransform failed, system prompt left unmodified: ${(err as Error)?.message ?? String(err)}`,
+    )
+  }
+}
+
+async function systemTransformUnsafe(logger: Logger, event: ContextHook): Promise<void> {
   let rewrites = 0
   for (const block of event.system) {
     const before = block.text
     block.text = before.replace(/\bplan_exit\b/g, "plan_review").replace(/\bExitPlanMode\b/g, "plan_review")
     if (block.text !== before) rewrites++
   }
-  if (rewrites > 0) await logged(logger, "info", `plan-review: rewrote plan_exit in ${rewrites} system block(s)`)
+  await logged(
+    logger,
+    "debug",
+    `context hook: session=${event.sessionID} agent=${event.agent} blocks=${event.system.length}`,
+  )
+  if (rewrites > 0) await logged(logger, "info", `rewrote plan_exit in ${rewrites} system block(s)`)
   event.system.push({
     type: "text",
     text: [
@@ -34,5 +52,5 @@ export async function systemTransform(logger: Logger, event: ContextHook): Promi
       "Call `plan_review` with the full plan markdown as the `plan` argument. If the plan is rejected, revise it and call `plan_review` again.",
     ].join("\n"),
   })
-  await logged(logger, "info", `plan-review: system prompt injected (${event.system.length} blocks)`)
+  await logged(logger, "debug", `plan blocks injected (${event.system.length} blocks)`)
 }

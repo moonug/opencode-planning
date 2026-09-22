@@ -20,8 +20,7 @@
       "@opencode-ai/schema/*": ["../../opencode-v2/packages/schema/src/*"],
       "@opencode-ai/client/*": ["../../opencode-v2/packages/client/src/*"],
       "@opencode-ai/ai": ["../../opencode-v2/packages/ai/src/index.ts"],
-      "@opencode-ai/ai/*": ["../../opencode-v2/packages/ai/src/*"],
-      "effect": ["../../opencode-v2/node_modules/effect"]
+      "@opencode-ai/ai/*": ["../../opencode-v2/packages/ai/src/*"]
     }
   },
   "include": ["index.ts", "tui-plugin.tsx", "tui-v2.tsx", "v2/**/*.ts", "v2/**/*.tsx"]

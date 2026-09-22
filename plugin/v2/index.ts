@@ -57,7 +57,7 @@ export const PlanReviewPlugin = {
           return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
         if (exit.status === "no_model")
           return "Plan approved by user, but no build model resolved. See the session message above and choose one before continuing."
-        return `Plan approved by user, but failed to switch to build agent: ${exit.error}.`
+        return `Plan approved by user, but the build handoff failed: ${exit.error}.`
       },
     }
 
@@ -131,14 +131,24 @@ export default PlanReviewPlugin
 
 async function runPlanReview(planText: string): Promise<string> {
   let tmpDir: string
-  let tmpPath: string
   try {
     tmpDir = mkdtempSync(join(tmpdir(), "opencode-plan-review-"))
-    tmpPath = join(tmpDir, "plan.md")
+  } catch (error) {
+    const described = describeTempPrepareFailure(error)
+    console.error(`plan-review: ${described}`)
+    throw new Error(described)
+  }
+  const tmpPath = join(tmpDir, "plan.md")
+  try {
     writeFileSync(tmpPath, planText, "utf8")
   } catch (error) {
     const described = describeTempPrepareFailure(error)
     console.error(`plan-review: ${described}`)
+    try {
+      rmSync(tmpDir, { recursive: true, force: true })
+    } catch (cleanupErr) {
+      console.error(`plan-review: failed to clean temp dir ${tmpDir}: ${(cleanupErr as Error).message}`)
+    }
     throw new Error(described)
   }
   try {

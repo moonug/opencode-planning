@@ -146,10 +146,19 @@ export function v2InstructionAdapter(session: SessionInstructions): SdkAdapter {
   type EntryPutValue = Parameters<typeof session.instructions.entry.put>[0]["value"]
   return {
     async getMetadata(sessionID) {
-      const entries = await session.instructions.entry.list({ sessionID })
-      const record = entries.find((entry) => entry.key === METADATA_KEY)?.value
-      if (!record || typeof record !== "object" || Array.isArray(record)) return {}
-      return { [METADATA_KEY]: record }
+      // Fail open like v1SdkAdapter: an unreachable entry store must not take
+      // down plan resolution (resolution falls back to agent/config/history).
+      try {
+        const entries = await session.instructions.entry.list({ sessionID })
+        const record = entries.find((entry) => entry.key === METADATA_KEY)?.value
+        if (!record || typeof record !== "object" || Array.isArray(record)) return {}
+        return { [METADATA_KEY]: record }
+      } catch (err) {
+        console.error(
+          `plan-review: v2 getMetadata failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`
+        )
+        return {}
+      }
     },
     async setMetadata(sessionID, metadata) {
       const value = metadata[METADATA_KEY]
@@ -188,6 +197,22 @@ async function fetchMetadata(sdk: SdkAdapter, sessionID: string): Promise<Record
   return sdk.getMetadata(sessionID)
 }
 
+// Per-session in-flight write chains. The instructions.entry read-modify-
+// write is only atomic if concurrent writers for the same session serialize;
+// the host gives no scheduling order between the model.request hook, the
+// context hook path, and a TUI write landing on the same record.
+const inFlight = new Map<string, Promise<unknown>>()
+
+function serializeWrite<T>(sessionID: string, run: () => Promise<T>): Promise<T> {
+  const previous = inFlight.get(sessionID) ?? Promise.resolve()
+  const next = previous.then(run)
+  inFlight.set(
+    sessionID,
+    next.catch(() => undefined),
+  )
+  return next
+}
+
 /**
  * Single GET → mutate → PUT. The updater receives the merged record (with
  * legacy fallback applied) and returns either the next record or undefined
@@ -202,20 +227,22 @@ export async function updateRecord(
   updater: (current: ModelsRecord) => ModelsRecord | undefined,
   aborted?: () => boolean,
 ): Promise<ModelsRecord> {
-  const existing = await fetchMetadata(sdk, sessionID)
-  const current = parseRecord(existing[METADATA_KEY])
-  const hasCurrent = current.plan !== undefined || current.build !== undefined
-  const seed: ModelsRecord = hasCurrent ? current : parseLegacy(existing[LEGACY_METADATA_KEY])
-  const next = updater(seed)
-  if (!next || next === seed) return seed
-  if (aborted?.()) return seed
-  try {
-    await sdk.setMetadata(sessionID, { ...existing, [METADATA_KEY]: next })
-  } catch (err) {
-    console.error(`plan-review: updateRecord failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`)
-    throw err
-  }
-  return next
+  return serializeWrite(sessionID, async () => {
+    const existing = await fetchMetadata(sdk, sessionID)
+    const current = parseRecord(existing[METADATA_KEY])
+    const hasCurrent = current.plan !== undefined || current.build !== undefined
+    const seed: ModelsRecord = hasCurrent ? current : parseLegacy(existing[LEGACY_METADATA_KEY])
+    const next = updater(seed)
+    if (!next || next === seed) return seed
+    if (aborted?.()) return seed
+    try {
+      await sdk.setMetadata(sessionID, { ...existing, [METADATA_KEY]: next })
+    } catch (err) {
+      console.error(`plan-review: updateRecord failed for session=${sessionID}: ${(err as Error)?.message ?? String(err)}`)
+      throw err
+    }
+    return next
+  })
 }
 
 export async function readRecord(sdk: SdkAdapter, sessionID: string): Promise<ModelsRecord> {
@@ -228,7 +255,11 @@ export async function readRecord(sdk: SdkAdapter, sessionID: string): Promise<Mo
 /**
  * chat.message capture. Skips when the existing record is pinned (an
  * explicit /set-build-model for that agent). Otherwise overwrites the
- * agent's entry — last-write-wins for implicit captures.
+ * agent's entry — last-write-wins for implicit captures. When the captured
+ * model equals the recorded one, returns the SAME record reference so
+ * updateRecord skips the durable write: the model.request hook fires for
+ * EVERY primary request, and rewriting an identical entry each turn would
+ * flood the session with no-op instruction entries.
  */
 export async function captureImplicit(
   sdk: SdkAdapter,
@@ -240,6 +271,13 @@ export async function captureImplicit(
   return updateRecord(sdk, sessionID, (cur) => {
     const existing = cur[agent]
     if (existing?.pinned === true) return cur
+    if (
+      existing &&
+      existing.providerID === model.providerID &&
+      existing.modelID === model.modelID &&
+      (existing.variant ?? undefined) === (model.variant ?? undefined)
+    )
+      return cur
     return { ...cur, [agent]: { ...model, source: "chat", at } }
   }).then((rec) => rec[agent])
 }

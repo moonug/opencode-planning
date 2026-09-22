@@ -46,18 +46,29 @@ jobs:
         run: python3 bin/plan-review.py --test
         working-directory: plugin
 
-      - name: Smoke tests
-        run: EDITOR=true bun ../tests/plugin-smoke.ts
+      - name: Unit tests
+        # plugin-smoke.test.ts reaches into a sibling opencode checkout
+        # (../../opencode/...) that does not exist on CI runners; the hermetic
+        # suite below covers the store and error helpers. Run the full suite
+        # locally via `bun test ../tests/`.
+        run: EDITOR=true bun test ../tests/model-store.test.ts ../tests/helper-errors.test.ts
+        working-directory: plugin
+
+      - name: TUI smoke
+        run: bun tests/v2-tui-smoke.tsx
         working-directory: plugin
 
       - name: Verify tarball contents
         run: |
           test -f LICENSE || { echo "LICENSE missing"; exit 1; }
           test -f tui-plugin.tsx || { echo "tui-plugin.tsx missing"; exit 1; }
+          test -f v2/index.ts || { echo "v2/index.ts missing"; exit 1; }
+          test -f helper-errors.ts || { echo "helper-errors.ts missing"; exit 1; }
+          test -f tui-v2.tsx || { echo "tui-v2.tsx missing"; exit 1; }
           test -f bin/plan-review.py || { echo "bin/plan-review.py missing"; exit 1; }
           echo "tarball contents verified"
         working-directory: plugin
 
       - name: Publish
-        run: npm publish --access public
+        run: npm publish --access public --tag alpha
         working-directory: plugin

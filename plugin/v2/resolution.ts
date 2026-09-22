@@ -115,16 +115,16 @@ export async function exitPlanMode(
   summary: string,
 ): Promise<ExitResult> {
   if (!sessionID) return { status: "no_model" }
-  await log("info", `plan-review: exitPlanMode called for session ${sessionID}`)
+  await log("info", `exitPlanMode called for session ${sessionID}`)
 
   const { target, source } = await resolveBuildModel(context, sdk, sessionID)
   await log(
     "info",
-    `plan-review: exitPlanMode resolution: session=${sessionID} target=${target ? `${target.providerID}/${target.modelID}` : "undefined"} source=${source}`,
+    `exitPlanMode resolution: session=${sessionID} target=${target ? `${target.providerID}/${target.modelID}` : "undefined"} source=${source}`,
   )
 
   if (!target) {
-    const text = `Plan approved. ${summary}\n\nNo build model resolved. Run \`/set-build-model <provider>/<model>\` (or \`/set-build-model\` for a picker), then approve again.`
+    const text = `Plan approved. ${summary}\n\nNo build model resolved. Call the \`set_build_model\` tool with no arguments to list available models (or with \`provider/model-id\` to pin one), then approve again.`
     try {
       await context.session.synthetic({ sessionID, text, delivery: "steer", resume: true })
     } catch (err) {
@@ -133,8 +133,17 @@ export async function exitPlanMode(
     return { status: "no_model" }
   }
 
+  // Stage-by-stage: one combined try collapsed three distinct failure modes
+  // (agent switch, model switch, prompt delivery) into one message, so the
+  // user could not tell whether the build agent was already active.
   try {
     await context.session.switchAgent({ sessionID, agent: "build" })
+  } catch (err) {
+    const error = `failed to switch to the build agent: ${(err as Error)?.message ?? String(err)}`
+    await log("error", `exitPlanMode: ${error}`)
+    return { status: "prompt_failed", error }
+  }
+  try {
     await context.session.switchModel({
       sessionID,
       model: {
@@ -143,18 +152,24 @@ export async function exitPlanMode(
         ...(target.variant ? { variant: target.variant } : {}),
       },
     })
+  } catch (err) {
+    const error = `switched to the build agent, but failed to set model ${target.providerID}/${target.modelID}: ${(err as Error)?.message ?? String(err)}`
+    await log("error", `exitPlanMode: ${error}`)
+    return { status: "prompt_failed", error }
+  }
+  try {
     await context.session.synthetic({
       sessionID,
       text: `Plan approved. ${summary} Build model: ${target.providerID}/${target.modelID} (source: ${source}). Proceed with implementation.`,
       delivery: "steer",
       resume: true,
     })
-    return { status: "switched", target, source }
   } catch (err) {
-    const error = (err as Error)?.message ?? String(err)
-    await log("error", `failed to switch to build: ${error}`)
+    const error = `switched to the build agent (${target.providerID}/${target.modelID}), but failed to deliver the proceed prompt: ${(err as Error)?.message ?? String(err)}`
+    await log("error", `exitPlanMode: ${error}`)
     return { status: "prompt_failed", error }
   }
+  return { status: "switched", target, source }
 }
 
 function fromModel(model: Model): ModelRef {

@@ -19,6 +19,7 @@
     "tui-plugin.tsx",
     "tui-v2.tsx",
     "helpers.ts",
+    "helper-errors.ts",
     "install.ts",
     "resolution.ts",
     "system-prompt.ts",

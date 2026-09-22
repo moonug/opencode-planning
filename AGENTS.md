@@ -24,6 +24,12 @@ This branch targets the opencode2 host (`~/projects/opencode-v2`, branch `vibegu
 - `lastShownModels` (per-session provider list cache) never evicts entries for finished sessions.
 - The TUI sidebar's history fallback can mis-attribute a `model-switched` event (the event carries no agent), so a session that switched agents and models in the same turn may show the model under the wrong agent.
 
+**Host-blocked V1 features (not portable, by design)**
+- `experimental.primary_tools` injection — opencode2 has no mechanism at all (`ConfigV2.Agent` in `packages/core/src/config/agent.ts` has no `tools` field); porting it means a host-core feature, not a plugin change.
+- `tool.definition` rewrites — V1 suppressed `plan_review` and rewrote the `plan_exit` description; the promise `tool.transform` draft only has `add`.
+- `messages.transform` — exists only as a V1 type, there is no v2 hook.
+- See the V1 sections below for what these did.
+
 **Host build requirement**
 - The v2 plugin needs an opencode2 build containing the `vibeguard-hooks` commit `feat(plugin): expose model.request/text.complete hooks and session instructions`.
 - Rebuild: `cd ../opencode-v2/packages/cli && bun run build --single --skip-install --outdir=dist-opencode2`; `~/.local/bin/opencode2-bin` is a symlink into that dist, so it refreshes in place.

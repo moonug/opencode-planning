@@ -24,6 +24,7 @@ What differs from V1:
 - model picks are captured from the `model.request` hook (primary requests only), not `chat.message`;
 - `plan_review`, `set_build_model`, `plan_diag` are tools; opencode2 has no plugin command registration, so declare `/plan-diag`-style shortcuts in `config.commands` if you want them;
 - explicit picker picks arrive as `session.model.selected` events and are attributed to the session's current agent (the event carries no agent);
+- V1's `experimental.primary_tools` injection, tool-description rewrites and `messages.transform` have no opencode2 equivalent (host-blocked; see `AGENTS.md`);
 - agent permissions are patched through `agent.transform` rules (plan may call `plan_review`, build may not);
 - the TUI sidebar (`./tui` → `plugin/tui-v2.tsx`) reads only public session data.
 

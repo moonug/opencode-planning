@@ -1,107 +1,74 @@
 /** @jsxImportSource @opentui/solid */
-import type { RGBA } from "@opentui/core"
-import type { ModelRef } from "./model-store"
+/**
+ * opencode2 TUI sidebar: per-agent (plan/build) model picks for the session.
+ *
+ * Real host API: `Plugin.define({ id, setup })` from `@opencode-ai/plugin/v2/tui`,
+ * `context.ui.slot(name, render)` (packages/plugin/src/v2/tui/context.ts:183).
+ * The plugin context exposes no theme, so this view uses no colors — the active
+ * agent is marked with a glyph instead.
+ *
+ * The TUI loads this through the plugin DIRECTORY entry in the v2 config: for a
+ * directory target it resolves `<dir>/tui` (tui/src/plugin/context.tsx:348), which
+ * is why `plugin/tui.tsx` re-exports this module.
+ */
+import { Plugin } from "@opencode-ai/plugin/v2/tui"
+import { createMemo, For } from "solid-js"
 
-type Context = {
-  location?: { directory?: string; workspaceID?: string }
-  theme: {
-    text: {
-      default: RGBA
-      subdued: RGBA
-      action: { primary: { default: RGBA } }
-    }
-  }
-  data: {
-    session: {
-      get(sessionID: string): { agent?: string; model?: { providerID: string; id: string; variant?: string } } | undefined
-      message: { list(sessionID: string): Array<Record<string, any>> }
-    }
-    location: {
-      model: {
-        list(location?: Context["location"]): Array<{ providerID: string; id: string; name?: string }> | undefined
-      }
-    }
-  }
-  ui: {
-    slot(claim: {
-      append: "sidebar.content"
-      render(input: { sessionID: string }): unknown
-    }): () => void
-  }
+type ModelRef = { readonly providerID: string; readonly id: string; readonly variant?: string }
+
+const AGENTS = ["plan", "build"] as const
+
+function isKnownAgent(value: unknown): value is (typeof AGENTS)[number] {
+  return value === "plan" || value === "build"
 }
 
-function modelsForSession(context: Context, sessionID: string) {
-  const models: Partial<Record<"plan" | "build", ModelRef>> = {}
+function modelsForSession(context: Plugin.Context, sessionID: string) {
+  const models: Partial<Record<(typeof AGENTS)[number], ModelRef>> = {}
   let active: string | undefined
 
   for (const message of context.data.session.message.list(sessionID)) {
     if (message.type === "agent-switched") active = message.agent
-    if (message.type === "model-switched" && (active === "plan" || active === "build")) {
-      models[active] = {
-        providerID: message.model.providerID,
-        modelID: message.model.id,
-        ...(message.model.variant ? { variant: message.model.variant } : {}),
-      }
-    }
-    const agent: "plan" | "build" | undefined =
-      message.agent === "plan" || message.agent === "build" ? message.agent : undefined
-    if (message.type === "assistant" && agent) {
-      models[agent] = {
-        providerID: message.model.providerID,
-        modelID: message.model.id,
-        ...(message.model.variant ? { variant: message.model.variant } : {}),
-      }
-    }
+    if (message.type === "model-switched" && isKnownAgent(active)) models[active] = message.model
+    if (message.type === "assistant" && isKnownAgent(message.agent)) models[message.agent] = message.model
   }
 
   const session = context.data.session.get(sessionID)
-  if ((session?.agent === "plan" || session?.agent === "build") && session.model) {
-    models[session.agent] = {
-      providerID: session.model.providerID,
-      modelID: session.model.id,
-      ...(session.model.variant ? { variant: session.model.variant } : {}),
-    }
-  }
+  if (isKnownAgent(session?.agent) && session.model) models[session.agent] = session.model
   return { active: session?.agent, models }
 }
 
-function modelLabel(context: Context, model: ModelRef | undefined) {
+function modelLabel(context: Plugin.Context, model: ModelRef | undefined) {
   if (!model) return "-"
   const info = context.data.location.model
     .list(context.location)
-    ?.find((item) => item.providerID === model.providerID && item.id === model.modelID)
-  return `${info?.name ?? model.modelID} · ${model.providerID}${model.variant ? ` · ${model.variant}` : ""}`
+    ?.find((item) => item.providerID === model.providerID && item.id === model.id)
+  return `${info?.name ?? model.id} · ${model.providerID}${model.variant ? ` · ${model.variant}` : ""}`
 }
 
-export default {
-  id: "plan-review.tui",
-  setup(context: Context) {
-    return context.ui.slot({
-      append: "sidebar.content",
-      render: ({ sessionID }) => {
-        const state = modelsForSession(context, sessionID)
-        return (
-          <box>
-            <text fg={context.theme.text.default}>
-              <b>Agent models</b>
+function View(props: { context: Plugin.Context; sessionID: string }) {
+  const state = createMemo(() => modelsForSession(props.context, props.sessionID))
+  return (
+    <box>
+      <text>
+        <b>Agent models</b>
+      </text>
+      <For each={AGENTS}>
+        {(agent) => (
+          <box flexDirection="row" gap={1}>
+            <text flexShrink={0}>{state().active === agent ? "▸" : "•"}</text>
+            <text wrapMode="word">
+              <b>{agent.charAt(0).toUpperCase() + agent.slice(1)}</b> {modelLabel(props.context, state().models[agent])}
             </text>
-            {(["plan", "build"] as const).map((agent) => {
-              const selected = state.active === agent
-              return (
-                <box flexDirection="row" gap={1}>
-                  <text flexShrink={0} fg={selected ? context.theme.text.action.primary.default : context.theme.text.subdued}>
-                    •
-                  </text>
-                  <text fg={selected ? context.theme.text.action.primary.default : context.theme.text.default} wrapMode="word">
-                    <b>{agent.charAt(0).toUpperCase() + agent.slice(1)}</b>{" "}
-                    <span style={{ fg: context.theme.text.subdued }}>{modelLabel(context, state.models[agent])}</span>
-                  </text>
-                </box>
-              )
-            })}
           </box>
-        )
-      },
-    })
-  },
+        )}
+      </For>
+    </box>
+  )
 }
+
+export default Plugin.define({
+  id: "plan-review.tui",
+  setup(context) {
+    return context.ui.slot("sidebar.content", (props) => <View context={context} sessionID={props.sessionID} />)
+  },
+})

@@ -1,20 +1,17 @@
 /** @jsxImportSource @opentui/solid */
 import "@opentui/solid/preload"
-import { RGBA } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import plugin from "../tui-v2"
 
-const color = RGBA.fromInts(200, 200, 200)
+// Real host shape: context = { options, location, client, data, keymap, ui },
+// and ui.slot(name, render) (packages/plugin/src/v2/tui/context.ts:183).
+let slotName: string | undefined
 let render: ((input: { sessionID: string }) => unknown) | undefined
 const cleanup = plugin.setup({
+  options: {},
   location: { directory: "/workspace" },
-  theme: {
-    text: {
-      default: color,
-      subdued: color,
-      action: { primary: { default: color } },
-    },
-  },
+  client: {},
+  keymap: {},
   data: {
     session: {
       get: () => ({ agent: "plan", model: { providerID: "ya-glm", id: "glm" } }),
@@ -38,14 +35,16 @@ const cleanup = plugin.setup({
     },
   },
   ui: {
-    slot: (claim) => {
-      render = claim.render
+    slot: (name: string, view: (input: { sessionID: string }) => unknown) => {
+      slotName = name
+      render = view
       return () => {}
     },
   },
-})
+} as never)
 
 if (plugin.id !== "plan-review.tui" || !render) throw new Error("TUI plugin did not register its sidebar slot")
+if (slotName !== "sidebar.content") throw new Error(`TUI plugin registered slot ${slotName}, expected sidebar.content`)
 const app = await testRender(() => render!({ sessionID: "ses_test" }), { width: 50, height: 8 })
 try {
   await app.renderOnce()

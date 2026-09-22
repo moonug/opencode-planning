@@ -14,6 +14,8 @@
     "noEmit": true,
     "types": ["node"],
     "paths": {
+      "@opencode-ai/plugin/v2/tui": ["../../opencode-v2/packages/plugin/src/v2/tui/index.ts"],
+      "@opencode-ai/plugin/v2/tui/*": ["../../opencode-v2/packages/plugin/src/v2/tui/*"],
       "@opencode-ai/plugin/v2": ["../../opencode-v2/packages/plugin/src/v2/promise/index.ts"],
       "@opencode-ai/plugin/v2/*": ["../../opencode-v2/packages/plugin/src/v2/promise/*"],
       "@opencode-ai/plugin/*": ["../../opencode-v2/packages/plugin/src/*"],
@@ -23,5 +25,5 @@
       "@opencode-ai/ai/*": ["../../opencode-v2/packages/ai/src/*"]
     }
   },
-  "include": ["index.ts", "tui-plugin.tsx", "tui-v2.tsx", "v2/**/*.ts", "v2/**/*.tsx"]
+  "include": ["index.ts", "tui-plugin.tsx", "tui.tsx", "tui-v2.tsx", "v2/**/*.ts", "v2/**/*.tsx"]
 }

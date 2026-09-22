@@ -9,7 +9,7 @@
   },
   "exports": {
     ".": "./v2/index.ts",
-    "./tui": "./tui-v2.tsx",
+    "./tui": "./tui.tsx",
     "./v1": "./index.ts",
     "./v1/tui": "./tui-plugin.tsx"
   },
@@ -17,6 +17,7 @@
     "v2/",
     "index.ts",
     "tui-plugin.tsx",
+    "tui.tsx",
     "tui-v2.tsx",
     "helpers.ts",
     "helper-errors.ts",

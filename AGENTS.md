@@ -1,12 +1,32 @@
 # AGENTS.md
 
-## V2 branch override
+## V2 branch override (opencode2)
 
-- On the `v2` branch, `plugin/server.ts` / `plugin/v2.ts` and `plugin/tui.tsx` / `plugin/tui-v2.tsx` are the active package entrypoints. `plugin/index.ts` and `plugin/tui-plugin.tsx` are retained V1 references only.
-- Configure the package through V2 `plugins`; V2 discovers the exported `./tui` entrypoint from the same package. Do not run the V1 self-installer or add command/TUI symlinks.
-- Persist V2 per-session model choices in plugin storage under `session.<sessionID>.models`. Existing `session.metadata.planReviewModels` is a read-only migration fallback.
-- Capture committed model choices from public `session.model.selected` events and the session `prompt` hook. Do not depend on the V1 fork's private TUI selection API.
-- Validate with `npm run typecheck`, `npm run test:v2`, `python3 bin/plan-review.py --test`, and a private V2 server. Do not restart a shared service while it owns the current session.
+This branch targets the opencode2 host (`~/projects/opencode-v2`, branch `vibeguard-hooks`), not the V1 fork. Everything below overrides the V1 guidance in this file.
+
+**Entrypoints**
+- Server plugin: package root `.` → `plugin/v2/index.ts`, default export `{ id, setup }` (promise plugin API). Load it by plugin DIRECTORY path in `~/.config/opencode-v2/opencode.jsonc`: `"plugins": ["/Users/moonug/projects/opencode-planning-v2/plugin"]`.
+- TUI: `./tui` → `plugin/tui-v2.tsx` (sidebar widget; reads only public session data).
+- `plugin/index.ts` / `plugin/tui-plugin.tsx` are retained V1 references. Do not run the V1 self-installer or create command/TUI symlinks on this branch.
+
+**Host contract (verified against the real source, not fakes)**
+- Types come from `@opencode-ai/plugin/v2` via tsconfig `paths` → the `../opencode-v2` checkout. The checkout's promise-bridge work (the `model.request`/`text.complete` hooks and `instructions` on SessionDomain) is load-bearing: never reset or stash that checkout.
+- Persistence: `session.instructions.entry.{list,put,remove}` (`v2InstructionAdapter` in `model-store.ts`). The old `context.storage` design (removed `plugin/v2.ts`) does not exist in the host.
+- Model capture: `session.hook("model.request")`, guard `kind === "primary"`. It fires AFTER the primary model is locked; `event.model` is a read-only `Model.Ref {id, providerID, variant?}`; the hook may reshape only `system`, `messages`, `headers`.
+- Tools: promise tools declare `input`/`output` as Effect Schemas and return the plain decoded output value (`Schema.String` → string). Do NOT wrap in `{structured, content}` — that is an internal host shape.
+- Permissions: `agent.transform` + `AgentInfo.permissions` rules `{action, resource, effect}` (plan: `plan_review` allow, `plan_exit` deny; build: `plan_review` deny).
+- Commands: opencode2 declares slash commands in `config.commands` (template text). `CommandDraft` has no `add`, so a plugin cannot register commands — the v2 tools (`set_build_model`, `plan_diag`) replace the V1 slash commands.
+
+**Host build requirement**
+- The v2 plugin needs an opencode2 build containing the `vibeguard-hooks` commit `feat(plugin): expose model.request/text.complete hooks and session instructions`.
+- Rebuild: `cd ../opencode-v2/packages/cli && bun run build --single --skip-install --outdir=dist-opencode2`; `~/.local/bin/opencode2-bin` is a symlink into that dist, so it refreshes in place.
+- The wrapper `~/.local/bin/opencode2` sets `OPENCODE_CONFIG_DIR` (`OPENCODE_V2_CONFIG_DIR` to override). A running daemon keeps the config from its start: kill stale `opencode2 serve --service` processes after a rebuild (SIGTERM is ignored; use SIGKILL). Plugin reload is all-or-nothing per location — one throwing plugin (e.g. `ponytail-v2` calling the removed `editor.add`) leaves the location with ZERO plugins.
+- Plugin config quirks: ids are paths, duplicate ids abort the whole reload, and removal syntax is `-<id>`.
+- After the first boot `plugin list` can return empty while activation settles; query again.
+
+**Validation**
+- `bun run typecheck` (wraps tsc; ignores the checkout's own pre-existing diagnostics), `bun test ../tests/`, `python3 bin/plan-review.py --test`, `bun tests/v2-tui-smoke.tsx`.
+- E2E: `~/.local/bin/opencode2 plugin list` must contain `opencode-plan-review`; `~/.local/bin/opencode2 debug agents` must show the plan/build `plan_review` rules.
 
 The V1 guidance below applies only when maintaining the retained legacy entrypoints or the V1 branch.
 

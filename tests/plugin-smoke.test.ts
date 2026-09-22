@@ -156,7 +156,8 @@ const context = {
     },
   },
   session: {
-    get: async () => ({}),
+    get: async (input: { sessionID: string }) =>
+      input.sessionID === "ses_picker" ? { agent: "build", model: { providerID: "anthropic", id: "claude-4" } } : {},
     messages: async () => [],
     prompt: async () => undefined,
     synthetic: async (input: unknown) => transitions.push({ type: "synthetic", value: input }),
@@ -180,6 +181,23 @@ const context = {
       return { dispose: async () => void tools.clear() }
     },
   },
+  // Real envelope verified against the generated client types:
+  // SessionModelSelected = { type: "session.model.selected", data: { sessionID, model } }.
+  // Yields exactly one event, then parks until the plugin aborts its subscription.
+  event: {
+    subscribe: (options?: { signal?: AbortSignal }) => ({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          type: "session.model.selected",
+          data: { sessionID: "ses_picker", model: { providerID: "anthropic", id: "claude-4" } },
+        }
+        await new Promise<void>((resolve) => {
+          if (options?.signal?.aborted) return resolve()
+          options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+        })
+      },
+    }),
+  } as unknown as Context["event"],
 } satisfies Context
 
 const cleanup = await PlanReviewPlugin.setup(context)
@@ -187,6 +205,15 @@ assert.equal(tools.size, 3)
 assert.ok(tools.has("plan_review"))
 assert.ok(tools.has("set_build_model"))
 assert.ok(tools.has("plan_diag"))
+
+// Picker capture: the host event carries no agent, so the plugin attributes it
+// to the session's current agent via session.get (the fake returns "build").
+await new Promise((resolve) => setTimeout(resolve, 20))
+const pickerRecord = entries.get("planReviewModels") as {
+  build?: { providerID?: string; modelID?: string; source?: string }
+}
+assert.equal(pickerRecord.build?.source, "picker")
+assert.equal(pickerRecord.build?.modelID, "claude-4")
 
 // Ported from the superseded plugin/v2.ts: plan may call plan_review, build may not.
 const planRules = agents.find((agent) => agent.id === "plan")!.permissions.map((rule) => `${rule.action}:${rule.effect}`)

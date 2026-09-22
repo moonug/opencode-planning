@@ -33,6 +33,15 @@ export type PickRecord = ModelRef & { source: Source; at: number; pinned?: boole
 
 export type ModelsRecord = Partial<Record<Agent, PickRecord>>
 
+export function sameModel(existing: ModelRef | undefined, model: ModelRef): boolean {
+  if (!existing) return false
+  return (
+    existing.providerID === model.providerID &&
+    existing.modelID === model.modelID &&
+    (existing.variant ?? undefined) === (model.variant ?? undefined)
+  )
+}
+
 export const METADATA_KEY = "planReviewModels"
 
 const LEGACY_METADATA_KEY = "planReviewDeferredPicks"
@@ -271,20 +280,18 @@ export async function captureImplicit(
   return updateRecord(sdk, sessionID, (cur) => {
     const existing = cur[agent]
     if (existing?.pinned === true) return cur
-    if (
-      existing &&
-      existing.providerID === model.providerID &&
-      existing.modelID === model.modelID &&
-      (existing.variant ?? undefined) === (model.variant ?? undefined)
-    )
-      return cur
+    if (sameModel(existing, model)) return cur
     return { ...cur, [agent]: { ...model, source: "chat", at } }
   }).then((rec) => rec[agent])
 }
 
 /**
- * Explicit picker event. Overwrites freely. Honors `aborted` to skip the
- * write if the caller has disposed (used by the TUI plugin's write chain).
+ * Explicit picker event. Overwrites a DIFFERENT model freely; an identical
+ * model is a no-op — that is what stops the host's `session.model.selected`
+ * echo (exitPlanMode's own switchModel) from rewriting the entry it just
+ * resolved, so a pinned entry keeps its flag and source. Honors `aborted` to
+ * skip the write if the caller has disposed (used by the TUI plugin's write
+ * chain).
  */
 export async function writePicker(
   sdk: SdkAdapter,
@@ -296,6 +303,7 @@ export async function writePicker(
   const at = Date.now()
   return updateRecord(sdk, sessionID, (cur) => {
     if (aborted?.()) return cur
+    if (sameModel(cur[agent], model)) return cur
     return { ...cur, [agent]: { ...model, source: "picker", at } }
   }, aborted).then((rec) => rec[agent])
 }

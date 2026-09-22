@@ -8,8 +8,8 @@ import { type Context, type Model, type Tool, type ToolContext } from "./context
 import { log } from "./helpers"
 import { describeHelperFailure, describeTempPrepareFailure } from "../helper-errors"
 import { SCRIPT_PATH } from "../install"
-import { captureImplicit, v2InstructionAdapter } from "../model-store"
-import { exitPlanMode } from "./resolution"
+import { captureImplicit, v2InstructionAdapter, writePicker } from "../model-store"
+import { exitPlanMode, type PickerGuard } from "./resolution"
 import { systemTransform, type ContextHook } from "./system-prompt"
 
 const VERSION = require("../package.json").version
@@ -39,6 +39,7 @@ export const PlanReviewPlugin = {
     const sdk = v2InstructionAdapter(context.session)
     const lastShownModels = new Map<string, import("./resolution").ProviderListEntry[]>()
     const registrations: Array<{ readonly dispose: () => Promise<void> }> = []
+    const pickerGuard: PickerGuard = { active: false }
 
     await log("info", `plugin init v${VERSION} build=v${VERSION}`)
     const plan_review: Tool = {
@@ -52,7 +53,7 @@ export const PlanReviewPlugin = {
         const result = await runPlanReview(input.plan)
         if (result.trim()) return FEEDBACK_HEADER + result + REVISION_PROMPT
 
-        const exit = await exitPlanMode(context, sdk, log, toolContext.sessionID, "User closed editor without changes.")
+        const exit = await exitPlanMode(context, sdk, log, toolContext.sessionID, "User closed editor without changes.", pickerGuard)
         if (exit.status === "switched")
           return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
         if (exit.status === "no_model")
@@ -120,8 +121,48 @@ export const PlanReviewPlugin = {
       }).catch((error: unknown) => log("warn", `model capture failed: ${(error as Error)?.message ?? String(error)}`))
     }))
 
+    // Explicit picker picks. The host event carries only {sessionID, model}, so
+    // attribute it to the session's current agent at event time — the same rule
+    // the TUI sidebar uses when walking history. Without this, a build pick only
+    // reaches the record once the user actually sends a build message, so
+    // approving a plan right after picking would fall through to agent/default.
+    const pickerEvents = new AbortController()
+    void (async () => {
+      while (!pickerEvents.signal.aborted) {
+        try {
+          for await (const event of context.event.subscribe({ signal: pickerEvents.signal })) {
+            if (event.type !== "session.model.selected") continue
+            const { sessionID, model } = event.data
+            if (pickerGuard.active && pickerGuard.sessionID === sessionID) continue
+            const session = await context.session.get({ sessionID })
+            const agent = session?.agent
+            if (agent !== "plan" && agent !== "build") continue
+            await writePicker(
+              sdk,
+              sessionID,
+              agent,
+              {
+                providerID: model.providerID,
+                modelID: model.id,
+                ...(model.variant ? { variant: model.variant } : {}),
+              },
+              () => pickerEvents.signal.aborted,
+            )
+          }
+        } catch (error) {
+          if (pickerEvents.signal.aborted) return
+          await log(
+            "warn",
+            `model.selected subscription dropped (${(error as Error)?.message ?? String(error)}); retrying`,
+          )
+          await new Promise((resolve) => setTimeout(resolve, 5_000))
+        }
+      }
+    })()
+
     await log("info", `tool registration ready v${VERSION}`)
     return async () => {
+      pickerEvents.abort()
       await Promise.all(registrations.map((registration) => registration.dispose()))
     }
   },

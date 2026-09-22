@@ -9,6 +9,15 @@ export type ExitResult =
   | { status: "no_model" }
   | { status: "prompt_failed"; error: string }
 
+/**
+ * Plugin-instance-scoped window guard for exitPlanMode's OWN switchModel call.
+ * The host broadcasts that switch as `session.model.selected`, which the picker
+ * capture would otherwise record as an explicit pick. `writePicker`'s equality
+ * skip already makes the echo a no-op; this guard is defense-in-depth (same
+ * shape as the V1 synthetic-prompt guard) so diagnostics stay clean.
+ */
+export type PickerGuard = { active: boolean; sessionID?: string }
+
 export interface ProviderListEntry {
   providerID: string
   providerName?: string
@@ -113,6 +122,7 @@ export async function exitPlanMode(
   log: Logger,
   sessionID: string | undefined,
   summary: string,
+  pickerGuard?: PickerGuard,
 ): Promise<ExitResult> {
   if (!sessionID) return { status: "no_model" }
   await log("info", `exitPlanMode called for session ${sessionID}`)
@@ -133,43 +143,56 @@ export async function exitPlanMode(
     return { status: "no_model" }
   }
 
-  // Stage-by-stage: one combined try collapsed three distinct failure modes
-  // (agent switch, model switch, prompt delivery) into one message, so the
-  // user could not tell whether the build agent was already active.
-  try {
-    await context.session.switchAgent({ sessionID, agent: "build" })
-  } catch (err) {
-    const error = `failed to switch to the build agent: ${(err as Error)?.message ?? String(err)}`
-    await log("error", `exitPlanMode: ${error}`)
-    return { status: "prompt_failed", error }
+  if (pickerGuard) {
+    pickerGuard.active = true
+    pickerGuard.sessionID = sessionID
   }
   try {
-    await context.session.switchModel({
-      sessionID,
-      model: {
-        providerID: target.providerID,
-        id: target.modelID,
-        ...(target.variant ? { variant: target.variant } : {}),
-      },
-    })
-  } catch (err) {
-    const error = `switched to the build agent, but failed to set model ${target.providerID}/${target.modelID}: ${(err as Error)?.message ?? String(err)}`
-    await log("error", `exitPlanMode: ${error}`)
-    return { status: "prompt_failed", error }
+    // Stage-by-stage: one combined try collapsed three distinct failure modes
+    // (agent switch, model switch, prompt delivery) into one message, so the
+    // user could not tell whether the build agent was already active.
+    try {
+      await context.session.switchAgent({ sessionID, agent: "build" })
+    } catch (err) {
+      const error = `failed to switch to the build agent: ${(err as Error)?.message ?? String(err)}`
+      await log("error", `exitPlanMode: ${error}`)
+      return { status: "prompt_failed", error }
+    }
+    try {
+      await context.session.switchModel({
+        sessionID,
+        model: {
+          providerID: target.providerID,
+          id: target.modelID,
+          ...(target.variant ? { variant: target.variant } : {}),
+        },
+      })
+    } catch (err) {
+      const error = `switched to the build agent, but failed to set model ${target.providerID}/${target.modelID}: ${(err as Error)?.message ?? String(err)}`
+      await log("error", `exitPlanMode: ${error}`)
+      return { status: "prompt_failed", error }
+    }
+    try {
+      await context.session.synthetic({
+        sessionID,
+        text: `Plan approved. ${summary} Build model: ${target.providerID}/${target.modelID} (source: ${source}). Proceed with implementation.`,
+        delivery: "steer",
+        resume: true,
+      })
+    } catch (err) {
+      const error = `switched to the build agent (${target.providerID}/${target.modelID}), but failed to deliver the proceed prompt: ${(err as Error)?.message ?? String(err)}`
+      await log("error", `exitPlanMode: ${error}`)
+      return { status: "prompt_failed", error }
+    }
+    return { status: "switched", target, source }
+  } finally {
+    // Cleared on EVERY outcome — a throwing switch must never latch the guard
+    // and swallow the user's real picks for the rest of the session.
+    if (pickerGuard) {
+      pickerGuard.active = false
+      pickerGuard.sessionID = undefined
+    }
   }
-  try {
-    await context.session.synthetic({
-      sessionID,
-      text: `Plan approved. ${summary} Build model: ${target.providerID}/${target.modelID} (source: ${source}). Proceed with implementation.`,
-      delivery: "steer",
-      resume: true,
-    })
-  } catch (err) {
-    const error = `switched to the build agent (${target.providerID}/${target.modelID}), but failed to deliver the proceed prompt: ${(err as Error)?.message ?? String(err)}`
-    await log("error", `exitPlanMode: ${error}`)
-    return { status: "prompt_failed", error }
-  }
-  return { status: "switched", target, source }
 }
 
 function fromModel(model: Model): ModelRef {

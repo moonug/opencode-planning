@@ -109,14 +109,15 @@ Key files: `plugin/tui-plugin.tsx` (native model events, serialized metadata wri
 
 ## Files
 
-- `bin/plan-review.py` — Python helper. All editor-overlay logic, difflib, sentinel pattern, fallback cascade. Pure stdlib.
+- `bin/plan-review.py` — Python helper. All editor-overlay logic, difflib, sentinel pattern, fallback cascade. Pure stdlib. Tracks the long-running editor child and kills it on SIGTERM/SIGINT/SIGHUP (exit 128+signo) so an aborted review never orphans an editor on the tty.
 - `plugin/index.ts` — opencode server plugin. Thin wiring of tool registration, slash commands, system prompt injection, `chat.message` hook (with synthetic-prompt guard), `exitPlanMode` build-model resolution. Bun runtime.
+- `plugin/review-helper.ts` — `runReviewHelper`: spawns the helper (node:child_process), collects stdout/stderr, and on `ToolContext.abort` kills the process (SIGTERM → SIGKILL after 2s) and THROWS — abort must never resolve with empty stdout, because the tool path treats empty output as "plan approved".
 - `plugin/tui-plugin.tsx` — TUI-side plugin. Explicit picker-event tracking, home-draft flush via `mergeHomeFlush`, sidebar model block, serialized metadata writes.
 - `plugin/model-store.ts` — `updateRecord` (single GET → mutate → PUT), `captureImplicit`, `writePicker`, `writeCommand`, `mergeHomeFlush`, `readRecord`. Legacy `planReviewDeferredPicks` read as one-shot fallback; next write migrates.
 - `plugin/resolution.ts` — `exitPlanMode`, `resolveBuildModel`, `getBuildAgentModel`, `getGlobalModel`, `getSessionHistoryBuildMessage`, `listAvailableModels`, `formatProviderList`, `parseModelString`.
 - `plugin/system-prompt.ts` — `systemTransform`, `messagesTransform`.
 - `plugin/commands.ts` — `handleSetBuildModel`, `handlePlanDiag`, `handlePlanReview` (`/set-build-model` writes `pinned: true`).
-- `plugin/install.ts` — `installSelf`, `ensureCommandLinks`, `ensureManagedLink`, `ensureExecutable`, `ensureCommandSymlink`, `SCRIPT_PATH`, `TUI_PLUGIN_PATH`.
+- `plugin/install.ts` — `installSelf`, `ensureCommandLinks`, `ensureManagedLink`, `ensureExecutable`, `ensureCommandSymlink`, `scriptPath` (lazily reads `PLAN_REVIEW_SCRIPT` env at call time), `TUI_PLUGIN_PATH`.
 - `plugin/helpers.ts` — `logged`, `visibleErr`, `withTimeoutSafe`, `log`.
 - `commands/plan-review.md`, `commands/set-build-model.md`, `commands/plan-diag.md` — slash-command bodies. Tell the model what to do when invoked.
 - `tests/plugin-smoke.ts` — 73 end-to-end smoke checks (helper diffs, resolution chain, synthetic-prompt guard 36f, TUI flush semantics, P1–P4 named regressions).

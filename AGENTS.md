@@ -15,6 +15,13 @@ Use `plugin/model-store.ts::v1SdkAdapter(client)` / `v2SdkAdapter(client)` and p
 
 **Fake-client smoke tests don't prove server compatibility** — they accept whatever shape the plugin passes and can't tell if a real hey-api runtime would drop keys. v0.3.0 shipped with two wrong call shapes (top-level `metadata` for v1, `{path:{id}}` for v2) and every smoke check passed. The new `[contract:update-body]` check fixes that by using a v1-shaped fake that mirrors hey-api's `body`-only serialization. Add a new contract test for every new SDK call shape.
 
+## plan_review abort contract (v0.3.3)
+
+- `ToolContext.abort` fires on session interrupt; `review-helper.ts::runReviewHelper` kills the helper on abort (SIGTERM → SIGKILL after 2s) and **throws** — it must NEVER resolve with empty stdout on abort, because empty tool output means "plan approved" and switches the session to the build agent.
+- In-flight guard: a second `plan_review` while an editor is open **throws** (`already in progress`) — any non-empty return value would be misread as a diff feedback. Consequence: BOTH the abort path and the guard path must throw, never return text.
+- The python helper tracks its long-running editor child (`_track_proc`) and kills it on SIGTERM/SIGINT/SIGHUP (exit 128+signo) — killing the helper alone used to orphan vim on the tty and freeze the TUI keyboard (25.09 incident: 7 leaked pairs on ttys048).
+- `PLAN_REVIEW_SCRIPT` is read lazily per call (`install.ts::scriptPath`), so tests can override it after module load.
+
 ## opencode plugin architecture
 
 - **Server plugins**: `opencode.jsonc` → `"plugin": ["package-or-path"]`. Hook: `export default async (ctx) => { return { tool, config, event, ... } }`

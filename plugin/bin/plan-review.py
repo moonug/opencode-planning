@@ -58,6 +58,7 @@ import io
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -147,6 +148,51 @@ def _is_gui_editor(editor: str) -> bool:
     return basename in {"code", "code-insiders", "cursor", "cursor-bin", "subl", "sublime_text"}
 
 
+_current_proc: subprocess.Popen | None = None
+
+
+def _track_proc(proc: subprocess.Popen) -> None:
+    """register the long-running child so signal handlers can kill it."""
+    global _current_proc
+    _current_proc = proc
+
+
+def _untrack_proc() -> None:
+    global _current_proc
+    _current_proc = None
+
+
+def _terminate_child_and_exit(signum, frame) -> None:
+    """kill the tracked editor child, then exit with 128+signum.
+
+    without this, SIGTERM kills the helper but orphans the editor child,
+    which keeps holding the tty and steals keyboard input from the
+    opencode TUI (observed as a frozen pane with invisible stacked vims).
+    poll()-based, safe to reenter from within a blocked proc.wait().
+    """
+    proc = _current_proc
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except (OSError, ProcessLookupError):
+            pass  # child already reaped
+        for _ in range(10):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+    sys.exit(128 + signum)
+
+
+def _install_signal_handlers() -> None:
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, _terminate_child_and_exit)
+
+
 def _sentinel_spawn(
     run_cmd: list[str], editor_cmd: str, filepath: Path
 ) -> int | None:
@@ -164,9 +210,13 @@ def _sentinel_spawn(
     except (subprocess.CalledProcessError, OSError):
         sentinel.unlink(missing_ok=True)
         return None
-    while not sentinel.exists():
-        time.sleep(0.3)
-    sentinel.unlink(missing_ok=True)
+    try:
+        while not sentinel.exists():
+            time.sleep(0.3)
+    finally:
+        # on signal-driven SystemExit mid-poll the overlay editor stays open
+        # in the multiplexer (user-visible, closable) but our sentinel must go.
+        sentinel.unlink(missing_ok=True)
     return 0
 
 
@@ -180,11 +230,15 @@ def _spawn_blocking(editor_cmd: str, filepath: Path) -> int:
     if _is_gui_editor(parts[0]):
         cmd.append("-w")
     try:
-        result = subprocess.run(cmd, stdin=None, stdout=None, stderr=None)
+        proc = subprocess.Popen(cmd)
     except FileNotFoundError:
         print(f"error: editor not found: {parts[0]}", file=sys.stderr)
         return 127
-    return result.returncode
+    _track_proc(proc)
+    try:
+        return proc.wait()
+    finally:
+        _untrack_proc()
 
 
 def open_editor(filepath: Path) -> int:
@@ -204,29 +258,37 @@ def open_editor(filepath: Path) -> int:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ["agtermctl", "session", "overlay", "open",
                  f"{editor_cmd} {shlex.quote(str(filepath))}", *target, "--block"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
+            _track_proc(proc)
+            overlay_code = proc.wait()
         finally:
+            _untrack_proc()
             subprocess.run(
                 ["agtermctl", "session", "status", "active", *target],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-        if result.returncode == 0:
+        if overlay_code == 0:
             return 0
         # fall through on agterm failure
 
     # 2. tmux: display-popup -E blocks natively, no sentinel.
     if os.environ.get("TMUX") and _which("tmux"):
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["tmux", "display-popup", "-E", "-w", "90%", "-h", "90%",
              "-T", "Plan Review", "--",
              "sh", "-c", f"{editor_cmd} {shlex.quote(str(filepath))}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        if result.returncode == 0:
+        _track_proc(proc)
+        try:
+            popup_code = proc.wait()
+        finally:
+            _untrack_proc()
+        if popup_code == 0:
             return 0
         # fall through on tmux failure
 
@@ -272,14 +334,19 @@ def open_editor(filepath: Path) -> int:
         except ValueError:
             parts = ["vi"]
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ["ghostty", "--command"] + parts + [str(filepath)],
                 stdin=None, stdout=None, stderr=None,
             )
         except FileNotFoundError:
-            pass
-        else:
-            if result.returncode == 0:
+            proc = None
+        if proc is not None:
+            _track_proc(proc)
+            try:
+                ghostty_code = proc.wait()
+            finally:
+                _untrack_proc()
+            if ghostty_code == 0:
                 return 0
             # fall through on ghostty failure
 
@@ -365,6 +432,7 @@ def main() -> int:
     if args.test:
         return run_tests()
 
+    _install_signal_handlers()
     use_color = _should_color(args.no_color)
 
     if args.plan_text is not None and args.file is not None:
@@ -664,9 +732,53 @@ def run_tests() -> int:
                 result = _sentinel_spawn(["test-cmd"], "vim", Path("/tmp/fake-plan.md"))
             self.assertIsNone(result)
 
+    class TestSignalHandler(unittest.TestCase):
+        """_terminate_child_and_exit must kill the tracked editor child, not orphan it.
+
+        regression: helper died on SIGTERM leaving vim holding the tty, which
+        froze keyboard input in the opencode TUI (25.09 incident).
+        """
+
+        def test_handler_kills_tracked_child(self) -> None:
+            proc = subprocess.Popen(["sleep", "30"])
+            _track_proc(proc)
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    _terminate_child_and_exit(signal.SIGTERM, None)
+                self.assertEqual(cm.exception.code, 143)
+                self.assertIsNotNone(proc.poll(), "tracked child must be terminated by the handler")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                _untrack_proc()
+
+        def test_handler_escalates_to_sigkill(self) -> None:
+            """child that ignores SIGTERM is SIGKILLed after the grace loop."""
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"]
+            )
+            _track_proc(proc)
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    _terminate_child_and_exit(signal.SIGTERM, None)
+                self.assertEqual(cm.exception.code, 143)
+                self.assertIsNotNone(proc.poll(), "SIGKILL escalation must terminate an SIGTERM-immune child")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                _untrack_proc()
+
+        def test_handler_without_child_exits(self) -> None:
+            _untrack_proc()
+            with self.assertRaises(SystemExit) as cm:
+                _terminate_child_and_exit(signal.SIGTERM, None)
+            self.assertEqual(cm.exception.code, 143)
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for tc in [TestGetDiff, TestColorizeDiff, TestShouldColor, TestBuildEditorCmd, TestIsGuiEditor, TestRunFile, TestReview, TestSentinelSpawn]:
+    for tc in [TestGetDiff, TestColorizeDiff, TestShouldColor, TestBuildEditorCmd, TestIsGuiEditor, TestRunFile, TestReview, TestSentinelSpawn, TestSignalHandler]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

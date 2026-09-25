@@ -14,8 +14,11 @@ function homedir(): string {
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 
-export const SCRIPT_PATH =
-  process.env.PLAN_REVIEW_SCRIPT ?? join(PLUGIN_DIR, "bin", "plan-review.py")
+// Resolved per call, not at import: tests override PLAN_REVIEW_SCRIPT at
+// runtime, and long-running server processes should pick up env changes.
+export function scriptPath(): string {
+  return process.env.PLAN_REVIEW_SCRIPT ?? join(PLUGIN_DIR, "bin", "plan-review.py")
+}
 
 export const TUI_PLUGIN_PATH = join(PLUGIN_DIR, "tui-plugin.tsx")
 
@@ -190,12 +193,13 @@ export function ensureCommandLinks(): void {
 }
 
 export function installSelf(): void {
-  if (!existsSync(SCRIPT_PATH)) {
+  const script = scriptPath()
+  if (!existsSync(script)) {
     throw new Error(
-      `plan-review: helper script not found at ${SCRIPT_PATH}. ` +
+      `plan-review: helper script not found at ${script}. ` +
         `Set PLAN_REVIEW_SCRIPT env var or restore bin/plan-review.py next to the plugin.`
     )
   }
-  ensureExecutable(SCRIPT_PATH)
+  ensureExecutable(script)
   ensureCommandLinks()
 }

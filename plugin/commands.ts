@@ -9,6 +9,7 @@ import {
 } from "./model-store"
 import { formatProviderList, listAvailableModels, parseModelString } from "./resolution"
 import type { ProviderListEntry } from "./resolution"
+import { runReviewHelper } from "./review-helper"
 
 interface CommandEvent {
   type: string
@@ -18,7 +19,6 @@ interface CommandEvent {
 export interface CommandHandlers {
   client: any
   sdk: SdkAdapter
-  $: any
   scriptPath: string
   lastShownModels: Map<string, ProviderListEntry[]>
   onPlanApproved: (sessionID: string, summary: string) => Promise<void>
@@ -60,7 +60,7 @@ export async function handleCommand(
       await logged(h.client, "error", "plan-review: no active session")
       return true
     }
-    await handlePlanReview(h.client, h.$, h.scriptPath, sessionID, rawArgs.trim(), h.onPlanApproved)
+    await handlePlanReview(h.client, h.scriptPath, sessionID, rawArgs.trim(), h.onPlanApproved)
     return true
   }
   return false
@@ -212,7 +212,6 @@ Diagnostic lines \`plan-review: exitPlanMode ...\` and \`plan-review-TUI: ...\` 
 
 async function handlePlanReview(
   client: any,
-  $: any,
   scriptPath: string,
   sessionID: string,
   filePath: string,
@@ -242,7 +241,7 @@ async function handlePlanReview(
     return
   }
   const planContent = readFileSync(absolutePath, "utf8")
-  const diff = await runPlanReview($, scriptPath, planContent)
+  const diff = await runPlanReview(scriptPath, planContent)
   const trimmed = diff.trim()
 
   const feedback = trimmed
@@ -262,7 +261,7 @@ async function handlePlanReview(
   }
 }
 
-async function runPlanReview($: any, scriptPath: string, planText: string): Promise<string> {
+async function runPlanReview(scriptPath: string, planText: string): Promise<string> {
   const { writeFileSync, mkdtempSync, rmSync } = await import("node:fs")
   const { tmpdir } = await import("node:os")
   const { join } = await import("node:path")
@@ -270,7 +269,10 @@ async function runPlanReview($: any, scriptPath: string, planText: string): Prom
   const tmpPath = join(tmpDir, "plan.md")
   writeFileSync(tmpPath, planText, "utf8")
   try {
-    return await $`${scriptPath} --file ${tmpPath}`.text()
+    return await runReviewHelper(scriptPath, tmpPath)
+  } catch (err) {
+    console.error(`plan-review: ${(err as Error)?.message ?? String(err)}`)
+    throw err
   } finally {
     try {
       rmSync(tmpDir, { recursive: true, force: true })

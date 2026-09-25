@@ -3152,47 +3152,157 @@ const logs: any[] = []
 // not be spawned (stalled macfuse/arc mount → ENXIO) and opencode recorded
 // `status: "error"` with an EMPTY message, so neither the model nor the user
 // had anything to act on. runPlanReview must always throw non-empty,
-// actionable text.
+// actionable text. Simulated via PLAN_REVIEW_SCRIPT pointing at a file that
+// exists (installSelf's existsSync check passes) but cannot be exec'd.
 {
-  const runFailure = async (err: unknown): Promise<string> => {
-    const fake$: any = () => ({ text: async () => { throw err } })
-    const failingHooks = await mod.default({
-      client: { app: { log: async () => {} }, session: { prompt: async () => {} } } as any,
-      project: {} as any,
-      directory: "/tmp",
-      worktree: "/tmp",
-      serverUrl: new URL("http://x"),
-      $: fake$,
-    })
-    try {
-      await failingHooks.tool.plan_review.execute(
-        { plan: "x" },
-        { sessionID: "ses_pr_error", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
-      )
-    } catch (e) {
-      return (e as Error)?.message ?? ""
-    }
-    return ""
+  const bogusHelper = "/tmp/pr-smoke-bogus-helper.txt"
+  writeFileSync(bogusHelper, "this is not an executable\n")
+  process.env.PLAN_REVIEW_SCRIPT = bogusHelper
+  let spawnFail = ""
+  try {
+    await hooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_pr_error", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+    )
+  } catch (e) {
+    spawnFail = (e as Error)?.message ?? ""
   }
-
-  const enxio = Object.assign(
-    new Error("ENXIO: no such device or address, lstat '/Users/x/arcadia-wt/ghostinvship/junk/moonug'"),
-    { code: "ENXIO" },
-  )
-  const enxioText = await runFailure(enxio)
-  if (!enxioText.includes("plan-review helper failed")) {
-    throw new Error(`[PR-readable-error] helper failure not described: "${enxioText}"`)
+  if (!spawnFail.includes("plan-review helper failed")) {
+    throw new Error(`[PR-readable-error] helper failure not described: "${spawnFail}"`)
   }
-  if (!enxioText.includes("ENXIO")) throw new Error(`[PR-readable-error] underlying errno missing: "${enxioText}"`)
-  if (!enxioText.includes("macfuse")) throw new Error(`[PR-readable-error] FUSE hint missing: "${enxioText}"`)
+  if (!/(ENOENT|EACCES|ENOEXEC)/.test(spawnFail)) {
+    throw new Error(`[PR-readable-error] underlying errno missing: "${spawnFail}"`)
+  }
+  if (!spawnFail.includes("macfuse")) throw new Error(`[PR-readable-error] FUSE hint missing: "${spawnFail}"`)
 
-  // The exact defect: an error carrying NO message must still surface text.
-  const nameless = await runFailure(new Error(""))
+  // Helper exits nonzero with EMPTY stderr — "exit code N" must still surface.
+  const failScript = "/tmp/pr-smoke-fail.sh"
+  writeFileSync(failScript, "#!/bin/sh\nexit 3\n")
+  chmodSync(failScript, 0o755)
+  process.env.PLAN_REVIEW_SCRIPT = failScript
+  let nameless = ""
+  try {
+    await hooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_pr_error", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+    )
+  } catch (e) {
+    nameless = (e as Error)?.message ?? ""
+  }
   if (nameless.trim().length === 0) throw new Error("[PR-readable-error] empty error message reached the tool")
   if (!nameless.includes("plan-review helper failed")) {
     throw new Error(`[PR-readable-error] empty-message failure not described: "${nameless}"`)
   }
+  if (!nameless.includes("exit 3")) {
+    throw new Error(`[PR-readable-error] nonzero exit code missing from message: "${nameless}"`)
+  }
+  delete process.env.PLAN_REVIEW_SCRIPT
+  rmSync(bogusHelper, { force: true })
   console.log("[PR-readable-error] helper spawn failures always surface actionable text: ok")
+}
+
+// PR-abort-kill + PR-in-flight-guard. Regression for 25.09 incident
+// (frozen TUI, 7 leaked plan-review.py+vim pairs on one tty): aborted
+// plan_review tool calls must kill the helper process, and a second call
+// while an editor is open must refuse instead of stacking another editor.
+{
+  const sleepHelper = "/tmp/pr-smoke-sleep-helper.sh"
+  writeFileSync(sleepHelper, '#!/bin/sh\n[ -n "$PR_SMOKE_PIDFILE" ] && echo $$ > "$PR_SMOKE_PIDFILE"\nexec sleep 30\n')
+  chmodSync(sleepHelper, 0o755)
+  process.env.PLAN_REVIEW_SCRIPT = sleepHelper
+
+  // Abort kills the helper process.
+  {
+    const pidfile = "/tmp/pr-smoke-abort.pid"
+    rmSync(pidfile, { force: true })
+    process.env.PR_SMOKE_PIDFILE = pidfile
+    const controller = new AbortController()
+    const pending = hooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_pr_abort", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: controller.signal, metadata: () => {}, ask: async () => {} } as any,
+    )
+    let pid = 0
+    for (let i = 0; i < 50 && !pid; i++) {
+      await new Promise((r) => setTimeout(r, 50))
+      try {
+        pid = Number(readFileSync(pidfile, "utf8").trim())
+      } catch {
+        // pidfile not yet written — keep polling
+      }
+    }
+    if (!pid) throw new Error("[PR-abort-kill] helper never started (no pidfile)")
+    controller.abort()
+    let aborted = ""
+    try {
+      await pending
+    } catch (e) {
+      aborted = (e as Error)?.message ?? ""
+    }
+    if (!aborted.includes("aborted")) {
+      throw new Error(`[PR-abort-kill] expected abort rejection, got: "${aborted}"`)
+    }
+    await new Promise((r) => setTimeout(r, 300))
+    let alive = false
+    try {
+      process.kill(pid, 0)
+      alive = true
+    } catch {
+      // process gone — the expected outcome
+    }
+    if (alive) {
+      try {
+        process.kill(pid, "SIGKILL")
+      } catch {
+        // lost the race — already dead
+      }
+      throw new Error(`[PR-abort-kill] helper pid ${pid} still alive after abort`)
+    }
+    console.log("[PR-abort-kill] aborting plan_review kills the helper process: ok")
+  }
+
+  // In-flight guard: second concurrent execute refuses instead of stacking.
+  {
+    const pidfile = "/tmp/pr-smoke-guard.pid"
+    rmSync(pidfile, { force: true })
+    process.env.PR_SMOKE_PIDFILE = pidfile
+    const controller = new AbortController()
+    const first = hooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_pr_guard", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: controller.signal, metadata: () => {}, ask: async () => {} } as any,
+    ).catch((e: unknown) => (e as Error)?.message ?? "")
+    let spawned = false
+    for (let i = 0; i < 50 && !spawned; i++) {
+      await new Promise((r) => setTimeout(r, 50))
+      try {
+        readFileSync(pidfile, "utf8")
+        spawned = true
+      } catch {
+        // pidfile not yet written — keep polling
+      }
+    }
+    if (!spawned) throw new Error("[PR-in-flight-guard] first review never started")
+    const second = await hooks.tool.plan_review.execute(
+      { plan: "x" },
+      { sessionID: "ses_pr_guard2", messageID: "m", agent: "plan", directory: "/tmp", worktree: "/tmp", abort: new AbortController().signal, metadata: () => {}, ask: async () => {} } as any,
+    ).then(() => "resolved", (e: unknown) => (e as Error)?.message ?? "")
+    if (!second.includes("already in progress")) {
+      throw new Error(`[PR-in-flight-guard] expected in-flight refusal, got: "${second}"`)
+    }
+    controller.abort()
+    const firstMsg = await first
+    if (!firstMsg.includes("aborted")) {
+      throw new Error(`[PR-in-flight-guard] first review did not abort: "${firstMsg}"`)
+    }
+    console.log("[PR-in-flight-guard] second plan_review while editor open refuses: ok")
+  }
+
+  delete process.env.PLAN_REVIEW_SCRIPT
+  delete process.env.PR_SMOKE_PIDFILE
+  rmSync("/tmp/pr-smoke-sleep-helper.sh", { force: true })
+  rmSync("/tmp/pr-smoke-abort.pid", { force: true })
+  rmSync("/tmp/pr-smoke-guard.pid", { force: true })
+  rmSync("/tmp/pr-smoke-fail.sh", { force: true })
+  rmSync("/tmp/pr-smoke-bogus-helper.txt", { force: true })
 }
 
 console.log("[OK] all smoke checks passed")

@@ -3,11 +3,12 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { logged, visibleErr } from "./helpers"
-import { installSelf, SCRIPT_PATH } from "./install"
+import { installSelf, scriptPath } from "./install"
 import { captureImplicit, v1SdkAdapter, type SdkAdapter } from "./model-store"
 import type { Agent } from "./model-store"
 import { exitPlanMode } from "./resolution"
 import type { ProviderListEntry } from "./resolution"
+import { runReviewHelper } from "./review-helper"
 import { systemTransform, messagesTransform } from "./system-prompt"
 import { handleCommand } from "./commands"
 
@@ -28,21 +29,13 @@ const TEMP_PREPARE_ERROR =
   "plan-review could not prepare the temp plan file (mkdtemp/writeFileSync failed). " +
   "Check TMPDIR free space and permissions, then retry."
 
-const SPAWN_ERROR_HINT =
-  "If this session lives on an arc worktree mount (arcadia-wt), the macfuse (FUSE) " +
-  "mount may be stalled — check `ls` on the project directory and retry."
+// The plan_review editor attaches to the TUI's tty, so only one review can be
+// usable at a time per opencode process. Without the guard, concurrent or
+// repeated invocations stack invisible editors on the tty and steal keyboard
+// input from the TUI (25.09 incident).
+let reviewInFlight: { sessionID: string } | null = null
 
-function describeHelperFailure(err: unknown): string {
-  const e = err as (Error & { code?: string | number; exitCode?: number }) | undefined
-  const message = e?.message && e.message.length > 0 ? e.message : String(err)
-  const parts = [`plan-review helper failed: ${message}`]
-  if (e?.code !== undefined) parts.push(`(code ${e.code})`)
-  if (e?.exitCode !== undefined && e.exitCode !== 0) parts.push(`(exit ${e.exitCode})`)
-  parts.push(SPAWN_ERROR_HINT)
-  return parts.join(" ")
-}
-
-async function runPlanReview($: any, planText: string): Promise<string> {
+async function runPlanReview(planText: string, signal?: AbortSignal): Promise<string> {
   let tmpDir: string
   let tmpPath: string
   try {
@@ -54,15 +47,10 @@ async function runPlanReview($: any, planText: string): Promise<string> {
     throw new Error(`${TEMP_PREPARE_ERROR} Underlying error: ${(err as Error)?.message ?? String(err)}`)
   }
   try {
-    return await $`${SCRIPT_PATH} --file ${tmpPath}`.text()
+    return await runReviewHelper(scriptPath(), tmpPath, signal)
   } catch (err) {
-    // Never let the tool surface an empty error: opencode records
-    // `status: "error"` with whatever message we throw, and an empty string
-    // gives the model (and the user) nothing to act on. Spawn failures on
-    // stalled arc FUSE mounts are the known case.
-    const described = describeHelperFailure(err)
-    console.error(`plan-review: ${described}`)
-    throw new Error(described)
+    console.error(`plan-review: ${(err as Error)?.message ?? String(err)}`)
+    throw err
   } finally {
     try {
       rmSync(tmpDir, { recursive: true, force: true })
@@ -74,7 +62,7 @@ async function runPlanReview($: any, planText: string): Promise<string> {
   }
 }
 
-export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
+export const PlanReviewPlugin: Plugin = async ({ client, serverUrl }) => {
   await logged(client, "info", `plan-review: plugin init v${VERSION} build=v${VERSION}`)
   await logged(
     client,
@@ -126,26 +114,36 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       ),
     },
     async execute(args, context) {
-      const result = await runPlanReview($, args.plan)
-      const trimmed = result.trim()
-      if (!trimmed) {
-      const exit = await exitPlanMode(
-        client,
-        sdk,
-        log,
-        syntheticPrompt,
-        context.sessionID,
-        "User closed editor without changes."
+      if (reviewInFlight) {
+        throw new Error(
+          `plan_review already in progress (session ${reviewInFlight.sessionID}) — close that editor first`
         )
-        if (exit.status === "switched") {
-          return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
-        }
-        if (exit.status === "no_model") {
-          return "Plan approved by user, but no build model resolved. See the message above for manual switch instructions. Do NOT proceed until the user has switched."
-        }
-        return `Plan approved by user, but failed to switch to build agent: ${exit.error}. Run \`/agent build\` manually before proceeding.`
       }
-      return FEEDBACK_HEADER + result + REVISION_PROMPT
+      reviewInFlight = { sessionID: context.sessionID }
+      try {
+        const result = await runPlanReview(args.plan, context.abort)
+        const trimmed = result.trim()
+        if (!trimmed) {
+        const exit = await exitPlanMode(
+          client,
+          sdk,
+          log,
+          syntheticPrompt,
+          context.sessionID,
+          "User closed editor without changes."
+          )
+          if (exit.status === "switched") {
+            return `Plan reviewed, no changes. Approved by user. Switched to build agent (${exit.target.providerID}/${exit.target.modelID}).`
+          }
+          if (exit.status === "no_model") {
+            return "Plan approved by user, but no build model resolved. See the message above for manual switch instructions. Do NOT proceed until the user has switched."
+          }
+          return `Plan approved by user, but failed to switch to build agent: ${exit.error}. Run \`/agent build\` manually before proceeding.`
+        }
+        return FEEDBACK_HEADER + result + REVISION_PROMPT
+      } finally {
+        reviewInFlight = null
+      }
     },
   })
 
@@ -247,8 +245,7 @@ export const PlanReviewPlugin: Plugin = async ({ $, client, serverUrl }) => {
       const handled = await handleCommand(e, {
         client,
         sdk,
-        $,
-        scriptPath: SCRIPT_PATH,
+        scriptPath: scriptPath(),
         lastShownModels,
         onPlanApproved,
       })
